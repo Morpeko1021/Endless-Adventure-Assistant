@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.94.1
+// @version      0.94.2
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -5061,7 +5061,7 @@ function createFarmAdapter(host) {
 }
 
 
-// 由自動戰鬥正式v2.6.3移植；原始SHA-256 7682ed3947a6d606bf9387cd9b8191315bdddfe34da1606fbe66133a459460eb
+// 由自動戰鬥正式v2.6.4移植；原始SHA-256 03d27726e7fada4ef1fda1c75a0aa14baee089ee2532f77d2a3c92cdc0af1f49
 // 保留全部戰鬥模組；儲存／排程／操作權／交接由整合控制器接管。
 function createBattleAdapter(host) {
   function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
@@ -5074,7 +5074,7 @@ const setInterval=(fn,ms)=>host.interval(fn,ms),clearInterval=id=>host.cancel(id
 let integratedContext=null,integratedPausing=false,integratedFollowWorld=null;
   if (window.top !== window) return;
   const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const RUNTIME_VERSION = '2.6.3';
+  const RUNTIME_VERSION = '2.6.4';
   const PAGE_LOAD_ID = Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
   let resourceStage=0;
   let phaseSegment=0;
@@ -6362,7 +6362,7 @@ function 建立隊員移動({now=Date.now}={}){
     if(death){run.deathRefreshCount=Number(run.deathRefreshCount||0)+1;run.lastDeathRefreshRevive=run.reviveCount;}else run.faultRefreshCount++;
     diagnosticEvent('準備重新整理',{reason},true);pauseFight('recover',reason);run.refreshCount=Number(run.refreshCount||0)+1;run.lastRefreshAt=Date.now();recoveryLog('重新整理：'+reason);
     if(!saveRecovery()){stop('錯誤：無法保存恢復紀錄，取消重新整理');return}
-    reloading=true;arrivalAuto.cancel();guildMonitor.reset();cancelMovePair();detachKillCounter();stopRunResources();host.reload({kind:'battle',characterId:integratedContext.characterId,runId:integratedContext.runId,sourceVersion:'2.6.3',sourceRecovery:JSON.parse(sessionStorage.getItem(RECOVERY_KEY)||'null')});
+    reloading=true;arrivalAuto.cancel();guildMonitor.reset();cancelMovePair();detachKillCounter();stopRunResources();host.reload({kind:'battle',characterId:integratedContext.characterId,runId:integratedContext.runId,sourceVersion:'2.6.4',sourceRecovery:JSON.parse(sessionStorage.getItem(RECOVERY_KEY)||'null')});
   }
   function beginNoExpRecovery(){
     const target={...run.target};
@@ -6468,7 +6468,7 @@ function 建立隊員移動({now=Date.now}={}){
   }
   const nativeChannels=createSourceNativeChannelAdapter({host,kind:'battle',key:PREFIX+'-native-channel-v1',reconcileExternal:(record,options)=>record.kind==='native-respawn'?reconcileNativeRespawn(record,options):nativePartyGoToProof(record,options.world),getContext:()=>integratedContext,getWorld:()=>PAGE.__world,isRunning:()=>Boolean(run?.running),document,page:PAGE,requestMap:()=>key('KeyM','m'),now:()=>Date.now()});
   return {
-    kind:'battle',sourceVersion:'2.6.3',selfDriven:true,observe:observeIntegrated,validate,
+    kind:'battle',sourceVersion:'2.6.4',selfDriven:true,observe:observeIntegrated,validate,
     consumables:nativeConsumables,settings:openSettings,records:openRecords,getSettings:()=>structuredClone(settings),
     manualCombat:{
       begin(context){host.assert(context);this.previousRun=run;this.previousContext=integratedContext;integratedContext=context;run={running:false,message:'',phase:'manual-skills'};guildMonitor.reset();battleTactics.reset();},
@@ -6478,9 +6478,9 @@ function 建立隊員移動({now=Date.now}={}){
     },
     tick:()=>{tick();host.observed(observeIntegrated());},
     start(context){validate(context.settings);integratedContext=context;integratedPausing=false;host.assert(context);settings=normalizeSettings({...settings,...context.settings});saveSettings();nativePotionFlow=null;nativePotionBusy=false;nativePotionMissingAt=0;start();if(!run?.running)throw new Error(run?.reason||'戰鬥未啟動：HUD或設定尚未就緒');run.character=PAGE.__world.player.name;host.observed(observeIntegrated());},
-    pause(context){host.assert(context,{allowPending:nativeChannels.hasPending()});integratedPausing=true;if(!pauseStep())return {safe:false};if(!saveRecovery(true))throw new Error('戰鬥快照未保存');const sourceRecovery=JSON.parse(sessionStorage.getItem(RECOVERY_KEY));stopRunResources();detachKillCounter();run.running=false;return {safe:true,checkpointId:context.runId+'-battle-'+Date.now(),sourceVersion:'2.6.3',sourceRecovery};},
+    pause(context){host.assert(context,{allowPending:nativeChannels.hasPending()});integratedPausing=true;if(!pauseStep())return {safe:false};if(!saveRecovery(true))throw new Error('戰鬥快照未保存');const sourceRecovery=JSON.parse(sessionStorage.getItem(RECOVERY_KEY));stopRunResources();detachKillCounter();run.running=false;return {safe:true,checkpointId:context.runId+'-battle-'+Date.now(),sourceVersion:'2.6.4',sourceRecovery};},
     stop(context,reason){integratedPausing=false;stop(reason,{manual:true});if(run){finishReportStats(run);const report=document.getElementById(ID+'-report');if(report?.dataset.reportKey===reportKey(run))showReport(run);}cancelMovePair();detachKillCounter();stopRunResources();host.cancelAll();host.observed(observeIntegrated());},
-    resume(context,checkpoint){if(checkpoint.sourceVersion!=='2.6.3'||!checkpoint.sourceRecovery)throw new Error('戰鬥接續來源版本或快照無效');integratedContext=context;integratedPausing=false;host.assert(context);nativePotionFlow=null;nativePotionBusy=false;nativePotionMissingAt=0;if(checkpoint.settingsRebased){const previous=checkpoint.settingsRebase.previousSettings,next=checkpoint.sourceRecovery.settings,data=checkpoint.sourceRecovery.data;data.role=next.level!=='current'&&next.role==='member'?'member':'leader';if(['level','destination','branch','role','memberMode','autoFollowLeader'].some(key=>previous[key]!==next[key])){data.target=structuredClone(LEVELS.find(item=>item.lv===Number(next.level))||LEVELS[0]);data.phase='navigate';data.worldRecovery=null;data.noExpRecovery=null;data.autoRest=null;data.recoveryHome=false;data.nativeFollowOwned=false;if(next.level==='current'){data.currentLocation=locationKey(readHud());data.currentRegion=PAGE.__world?.regionId||'';data.currentInstance=PAGE.__world?.instanceId;}}}sessionStorage.setItem(RECOVERY_KEY,JSON.stringify(checkpoint.sourceRecovery));restoreRecovery();if(!run?.running)throw new Error('戰鬥接續未啟動');},
+    resume(context,checkpoint){if(checkpoint.sourceVersion!=='2.6.4'||!checkpoint.sourceRecovery)throw new Error('戰鬥接續來源版本或快照無效');integratedContext=context;integratedPausing=false;host.assert(context);nativePotionFlow=null;nativePotionBusy=false;nativePotionMissingAt=0;if(checkpoint.settingsRebased){const previous=checkpoint.settingsRebase.previousSettings,next=checkpoint.sourceRecovery.settings,data=checkpoint.sourceRecovery.data;data.role=next.level!=='current'&&next.role==='member'?'member':'leader';if(['level','destination','branch','role','memberMode','autoFollowLeader'].some(key=>previous[key]!==next[key])){data.target=structuredClone(LEVELS.find(item=>item.lv===Number(next.level))||LEVELS[0]);data.phase='navigate';data.worldRecovery=null;data.noExpRecovery=null;data.autoRest=null;data.recoveryHome=false;data.nativeFollowOwned=false;if(next.level==='current'){data.currentLocation=locationKey(readHud());data.currentRegion=PAGE.__world?.regionId||'';data.currentInstance=PAGE.__world?.instanceId;}}}sessionStorage.setItem(RECOVERY_KEY,JSON.stringify(checkpoint.sourceRecovery));restoreRecovery();if(!run?.running)throw new Error('戰鬥接續未啟動');},
     reconcile(pending){if(pending?.kind==='native-battle-guild')return guildMonitor.reconcile(pending);if(pending?.kind==='dungeon-respawn-journal'&&pending.taskKind==='battle')return dungeonRespawnSource(pending.sourceRole)?.reconcile()??{confirmed:false};if(pending?.kind==='native-manual-item'&&pending.sourceRole==='battle'){if(nativePotionFlow)return nativePotionFlow.reconcile(pending);const confirmed=nativePotionProof(pending,PAGE.__world);if(confirmed)host.pending(null);return {confirmed,evidence:confirmed?'原生補品扣量與冷卻已確認':null};}if(pending?.kind==='native-channel-journal'||nativeChannels.hasPending())return nativeChannels.reconcile(pending);if(!pending)return {confirmed:true};if(pending.kind!=='exp-scroll')return {confirmed:false};const w=PAGE.__world;if(w?.charId!==pending.characterId)return {confirmed:false};const stock=expScrollMonitor.inventory(w);const confirmed=stock&&stock.account===pending.account-1&&stock.other===pending.other&&Array.isArray(w.buffs)&&w.buffs.some(b=>b.sourceSkillId==='consumable:exp_scroll_60'&&b.effectType==='buff_exp_gain'&&Number(b.value)===1&&Number(b.expire)>Date.now());if(confirmed)host.pending(null);return {confirmed:Boolean(confirmed),evidence:confirmed?'卷軸扣量及原生增益雙確認':null};},
     result:()=>({confirmed:false,reason:run?.reason??null,report:run?{...observeIntegrated().result,items:[...run.items],reportStats:reportStatsSummary(run.reportStats),startedAt:run.startedAt,endedAt:run.endedAt??null}:null})
   };
@@ -12814,8 +12814,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.94.1';
-const RUNTIME_VERSION='0.94.1';
+const SCRIPT_VERSION='0.94.2';
+const RUNTIME_VERSION='0.94.2';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
