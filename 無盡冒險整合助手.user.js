@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.94.2
+// @version      0.95.0
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -1786,6 +1786,11 @@ function normalizeNativeItemNames(data){
 }
 
 // 從原戰鬥公會監控抽出同一排程；所有來源共用原生交易保存。
+const MANUAL_AUTO_GUILD_SKILL_IDS=Object.freeze(['guild_battle_banner','guild_guard_oath','guild_rally_call','guild_adventure_guidance','guild_rest_breath','guild_expedition_ready']);
+function readNativeManualGuildSkills(getWorld){
+  const world=getWorld?.();if(!world?.charId||!world.player||typeof world._resolveSkillRef!=='function')return [];
+  const rows=[];for(const id of MANUAL_AUTO_GUILD_SKILL_IDS){let skill;try{skill=world._resolveSkillRef(id);}catch{continue;}if(world!==getWorld()||skill?.isGuildSkill!==true||!Number.isFinite(Number(skill.rank))||!(Number(skill.rank)>0))continue;rows.push({id,name:typeof skill.name==='string'&&skill.name?skill.name:id,rank:Number(skill.rank),available:true});}return rows;
+}
 function createNativeBattleGuildMonitor({host,context,getWorld,skillIds,now=Date.now,random=Math.random,blocked=()=>false}){
   const states=new Map();let owner=null,identity='',lastSent=-Infinity,operation=null,epoch=0;
   function reset(){epoch++;states.clear();owner=null;identity='';lastSent=-Infinity;}
@@ -1795,7 +1800,9 @@ function createNativeBattleGuildMonitor({host,context,getWorld,skillIds,now=Date
     const pending=host.currentPending();if(pending){if(pending.kind==='native-battle-guild')reconcile(pending);return Boolean(host.currentPending());}
     if(!w?.player||w!==getWorld()||typeof w._resolveSkillRef!=='function'||typeof w.prepareSkill!=='function')return false;
     const data=w.guildTerritoryContext?.skills||w.player.guildSkills,key=String(w.charId||'')+'|'+JSON.stringify(data?.allocation||{});if(owner!==w||key!==identity){reset();owner=w;identity=key;}
-    const t=now(),ready=[];for(const id of skillIds){let skill;try{skill=w._resolveSkillRef(id);}catch{continue;}if(!skill?.isGuildSkill||!(Number(skill.rank)>0)){states.delete(id);continue;}const cd=Number(w.guildSkillCooldowns?.[id]||w.cooldowns?.[id]||0);if(!Number.isFinite(cd))continue;let state=states.get(id);if(state?.retryAt>t)continue;if(!state||state.cooldown!==cd){state={cooldown:cd,due:Math.max(cd,t)+(1+Math.min(29,Math.floor(random()*30)))*1000};states.set(id,state);}if(cd<=t&&t>=state.due&&!nativeGuildSkillActive(w,id,now))ready.push({id,skill});}
+    const chosenIds=context()?.settings?.manualAuto===true?context().settings.auto?.guildSkillIds??skillIds:skillIds;
+    if(!Array.isArray(chosenIds)||new Set(chosenIds).size!==chosenIds.length||chosenIds.some(id=>!skillIds.includes(id)))return false;
+    const t=now(),ready=[];for(const id of chosenIds){let skill;try{skill=w._resolveSkillRef(id);}catch{continue;}if(!skill?.isGuildSkill||!(Number(skill.rank)>0)){states.delete(id);continue;}const cd=Number(w.guildSkillCooldowns?.[id]||w.cooldowns?.[id]||0);if(!Number.isFinite(cd))continue;let state=states.get(id);if(state?.retryAt>t)continue;if(!state||state.cooldown!==cd){state={cooldown:cd,due:Math.max(cd,t)+(1+Math.min(29,Math.floor(random()*30)))*1000};states.set(id,state);}if(cd<=t&&t>=state.due&&!nativeGuildSkillActive(w,id,now))ready.push({id,skill});}
     if(!allowed||blocked()||w.dead||w.serverAuthoritativeResources!==true||w.isWorldInteractionLocked?.()||w.castingState||w._queuedCast||w.pendingSkill||w._isSilenced?.()||t-lastSent<1000)return false;
     const chosen=ready.find(({skill})=>Number.isFinite(Number(skill.mpCost))&&Number.isFinite(Number(w.player.mp))&&Number(w.player.mp)>=Number(skill.mpCost));if(!chosen)return false;
     const c=context(),ownEpoch=epoch,sourceRole=c.settings?.manualAuto===true?'manual':'battle';
@@ -3307,8 +3314,8 @@ function copyRoutineCheckpoint(checkpoint){const {signal,...context}=checkpoint.
 
 /** 獨立模式的日常交接；所有操作仍經同一個TaskController。 */
 class LocalRoutine {
-  constructor({controller,acquire,settings,save,now=Date.now,uuid=()=>crypto.randomUUID(),restored=null}) {
-    Object.assign(this,{controller,acquire,settings,save,now,uuid});this.busy=false;
+  constructor({controller,acquire,settings,save,now=Date.now,uuid=()=>crypto.randomUUID(),restored=null,captureFarmReturn=()=>null,returnFarmLocation=null}) {
+    Object.assign(this,{controller,acquire,settings,save,now,uuid,captureFarmReturn,returnFarmLocation});this.busy=false;
     this.planStates=structuredClone(restored?.planStates??{});
     const restoredState=restored?structuredClone(restored):null;if(restoredState){delete restoredState.planStates;if(!restoredState.planId&&/^方案[123]$/.test(restoredState.planLabel??''))restoredState.planId='plan-'+(Number(restoredState.planLabel.slice(-1))-1);}
     this.restoredWasEnabled=restored?.enabled===true;
@@ -3322,19 +3329,28 @@ class LocalRoutine {
   validateFarmInterrupt(value){if(value===undefined)return;if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['battle','dungeon','boss'].includes(k))||Object.values(value).some(v=>typeof v!=='boolean'))throw new ControlError('invalid_routine','種植插隊設定無效');}
   allowsFarm(){const kind=this.state.options?.primaryKind;return this.state.options?.farmEnabled===true&&(kind==='idle'||['battle','dungeon','boss'].includes(kind)&&this.state.options.farmInterrupt?.[kind]!==false);}
   validate(options){this.validateFarmInterrupt(options?.farmInterrupt);if(!options||!['idle','battle','boss','dungeon','daily','farm'].includes(options.primaryKind)||typeof options.dailyEnabled!=='boolean'||typeof options.farmEnabled!=='boolean')throw new ControlError('invalid_routine','日常流程設定無效');}
-  validateTeam(team){if(!team)return;if(typeof team!=='object'||Array.isArray(team)||Object.keys(team).some(k=>!['ensure','rendezvous'].includes(k))||team.ensure?.action!=='ensure'||team.rendezvous&&team.rendezvous.action!=='rendezvous')throw new ControlError('invalid_routine','日常隊伍設定無效');const adapter=this.controller().adapters.get('party');if(!adapter)throw new ControlError('unsupported_task','隊伍功能尚未接入');adapter.validate(team.ensure);if(team.rendezvous)adapter.validate(team.rendezvous);}
+  validateTeam(team){if(!team)return;if(typeof team!=='object'||Array.isArray(team)||Object.keys(team).some(k=>!['ensure','rendezvous'].includes(k))||!['ensure','assemble'].includes(team.ensure?.action)||team.rendezvous&&team.rendezvous.action!=='rendezvous')throw new ControlError('invalid_routine','日常隊伍設定無效');const adapter=this.controller().adapters.get('party');if(!adapter)throw new ControlError('unsupported_task','隊伍功能尚未接入');adapter.validate(team.ensure);if(team.rendezvous)adapter.validate(team.rendezvous);}
   expectedKind(){return this.state.phase==='primary'?this.state.options.primaryKind:this.state.phase==='team'?'party':this.state.phase;}
+  knownGardenDue(){const due=this.controller().adapters.get('farm')?.observe()?.dueAt,saved=this.state.farmDueAt;return Number.isFinite(due)&&due>0?due:Number.isFinite(saved)&&saved>0?saved:null;}
   async beginPlan(steps,{farmEnabled=false,team=null,planId=null,farmInterrupt=undefined}={}){
     validatePlanSteps(steps);this.validateFarmInterrupt(farmInterrupt);if(planId!==null&&!/^plan-[012]$/.test(planId))throw new ControlError('invalid_plan','方案識別無效');const c=this.controller();if(c.mode!=='standalone')throw new ControlError('managed_routine','核心模式由核心安排交接');if(c.active||c.cleanup||c.pending)throw new ControlError('task_busy','請先停止並核對目前任務');this.validateTeam(team);
+    farmEnabled=farmEnabled||steps.some(step=>step.kind==='farm');
+    const knownDue=farmEnabled?this.knownGardenDue():null;
     const stepSettings=steps.map(step=>{const value=planStepSettings(step,this.settings(step.kind));c.adapters.get(step.kind).validate(value);return value;});
     const settings={};for(let i=0;i<steps.length;i++)settings[steps[i].kind]=structuredClone(stepSettings[i]);if(farmEnabled){settings.farm=this.settings('farm');c.adapters.get('farm').validate(settings.farm);}
-    this.archivePlan();c.manualPause=false;c.persist();this.state={planId,planLabel:planId?'方案'+(Number(planId.slice(5))+1):null,enabled:true,phase:'primary',options:{primaryKind:steps[0].kind,dailyEnabled:false,farmEnabled,team,farmInterrupt:structuredClone(farmInterrupt)},steps:structuredClone(steps),stepSettings,stepIndex:0,settings,teamStage:null,checkpoint:null,farmDueAt:null,lastDailyDay:taskDay(this.now()),message:'方案步驟1／'+steps.length};this.persist();await this.tick();
+    this.archivePlan();c.manualPause=false;c.persist();this.state={planId,planLabel:planId?'方案'+(Number(planId.slice(5))+1):null,enabled:true,phase:'primary',options:{primaryKind:steps[0].kind,dailyEnabled:false,farmEnabled,team,farmInterrupt:structuredClone(farmInterrupt)},steps:structuredClone(steps),stepSettings,stepIndex:0,settings,teamStage:team?'ensure':null,checkpoint:null,farmDueAt:knownDue,lastDailyDay:taskDay(this.now()),message:'方案步驟1／'+steps.length};this.persist();await this.tick();
   }
   async begin(options){this.validate(options);const c=this.controller();if(c.mode!=='standalone')throw new ControlError('managed_routine','核心模式由核心安排交接');if(c.active||c.cleanup||c.pending)throw new ControlError('task_busy','請先停止並核對目前任務');
     this.validateTeam(options.team);const snapshots={};for(const kind of ['daily','farm',options.primaryKind])if(kind!=='idle'){const value=this.settings(kind);c.adapters.get(kind).validate(value);snapshots[kind]=structuredClone(value);}
     this.archivePlan();c.manualPause=false;c.persist();this.state={enabled:true,phase:options.dailyEnabled?'daily':'primary',options:structuredClone(options),settings:snapshots,teamStage:options.team?'ensure':null,checkpoint:null,farmDueAt:null,lastDailyDay:options.dailyEnabled?null:taskDay(this.now()),message:'日常流程已啟動'};this.persist();await this.tick();
   }
   suspend(reason='使用者暫停日常流程'){this.state.enabled=false;this.state.message=reason;this.persist();}
+  adoptManualAuto({farmEnabled=false,farmInterrupt=undefined}={}){
+    const c=this.controller(),active=c.active;this.validateFarmInterrupt(farmInterrupt);
+    if(!farmEnabled)return false;
+    if(c.mode!=='standalone'||c.manualPause||c.pending||c.cleanup||active?.kind!=='battle'||active.context.settings.manualAuto!==true)throw new ControlError('task_busy','自動戰鬥背景種植須核對目前執行');
+    const farm=this.settings('farm'),knownDue=this.knownGardenDue(),lastFarmDueAt=this.state.lastFarmDueAt;c.adapters.get('farm').validate(farm);this.archivePlan();this.state={enabled:true,phase:'primary',options:{primaryKind:'battle',dailyEnabled:false,farmEnabled:true,farmInterrupt:structuredClone(farmInterrupt),team:null},settings:{battle:structuredClone(active.context.settings),farm:structuredClone(farm)},currentRun:{kind:'battle',runId:active.context.runId,characterId:active.context.characterId},checkpoint:null,farmDueAt:knownDue,lastFarmDueAt,lastDailyDay:taskDay(this.now()),message:'自動戰鬥已接入背景種植'};this.persist();return true;
+  }
   observe(){return structuredClone(this.state);}
   settingsCheckpointState(checkpoint){if(!this.state.options)return null;const saved=this.state.checkpoint,current=this.state.currentRun;const matches=value=>value?.context?.runId===checkpoint.context.runId&&value.kind===checkpoint.kind&&value.context.characterId===checkpoint.context.characterId;const currentMatches=current?.runId===checkpoint.context.runId&&current.kind===checkpoint.kind&&current.characterId===checkpoint.context.characterId;if(!currentMatches&&!matches(saved))return null;const next=structuredClone(this.state);next.settings[checkpoint.kind]=structuredClone(checkpoint.context.settings);if(next.steps&&next.steps[next.stepIndex]?.kind===checkpoint.kind&&(next.phase==='primary'||matches(saved)))next.stepSettings[next.stepIndex]=structuredClone(checkpoint.context.settings);if(matches(saved))next.checkpoint=copyRoutineCheckpoint(checkpoint);if(matches(next.resumeCheckpoint))next.resumeCheckpoint=copyRoutineCheckpoint(checkpoint);next.message='安全接續設定已同步，原執行與成果保留';return next;}
   rememberGarden(dueAt){if(this.state.enabled&&this.state.phase!=='farm'&&Number.isFinite(dueAt)&&dueAt>0&&dueAt>(this.state.lastFarmDueAt??0)&&dueAt!==this.state.farmDueAt){this.state.farmDueAt=dueAt;this.persist();}}
@@ -3353,37 +3369,42 @@ class LocalRoutine {
   }
   async completed(kind,result){if(!this.state.enabled)return;const expected=this.expectedKind();if(kind!==expected)return;
     if(!result.confirmed){this.suspend('流程未確認完成，等待使用者核對');return;}
+    if(kind==='farm'&&Number.isFinite(result.dueAt)&&result.dueAt>this.now()){this.state.lastFarmDueAt=this.state.farmDueAt??this.state.lastFarmDueAt;this.state.nextFarmDueAt=result.dueAt;}
     this.state.currentRun=null;
     if(this.state.steps&&this.state.phase==='primary'){
-      this.state.stepIndex++;this.state.checkpoint=null;
-      if(this.state.stepIndex>=this.state.steps.length){this.state.phase='completed';this.suspend('方案已完成全部確認步驟');return;}
+      this.state.stepIndex++;this.state.checkpoint=null;if(kind==='farm'&&this.state.nextFarmDueAt){this.state.farmDueAt=this.state.nextFarmDueAt;this.state.nextFarmDueAt=null;}
+      if(this.state.stepIndex>=this.state.steps.length){if(this.state.options.farmEnabled){this.state.options.primaryKind='idle';this.state.phase='primary';this.state.backgroundOnly=true;this.state.message='方案已完成，待命背景種植直到人工停止';this.persist();}else{this.state.phase='completed';this.suspend('方案已完成全部確認步驟');}return;}
       this.state.options.primaryKind=this.state.steps[this.state.stepIndex].kind;this.state.message=`方案步驟${this.state.stepIndex+1}／${this.state.steps.length}`;this.persist();return;
     }
     if(kind==='daily'){if(result.taskDay!==taskDay(this.now())){this.state.phase='daily';this.state.message='舊任務日完成，接著處理新任務日';}else{this.state.lastDailyDay=result.taskDay;this.state.phase='primary';this.state.message='每日完成，返回主任務';}}
-    else if(kind==='farm'){this.state.phase='primary';this.state.lastFarmDueAt=this.state.farmDueAt;this.state.farmDueAt=null;this.state.message='種植完成，返回主任務';}
+    else if(kind==='farm'){this.state.phase='primary';this.state.lastFarmDueAt=this.state.farmDueAt;this.state.farmDueAt=this.state.nextFarmDueAt??null;this.state.nextFarmDueAt=null;this.state.message='種植完成，返回主任務';}
     else if(kind==='party'){if(this.state.teamStage==='ensure'&&this.state.options.team.rendezvous){this.state.teamStage='rendezvous';this.state.message='隊伍已確認，前往會合位置';}else{this.state.teamStage=null;this.state.phase='primary';this.state.message='隊伍與會合已確認，返回主任務';}}
     else {this.suspend('主任務已完成設定目標');return;}
-    if(['daily','farm'].includes(kind)&&this.state.phase==='primary'&&this.state.options.team)this.state.teamStage='ensure';this.persist();
+    if(['daily','farm'].includes(kind)&&this.state.phase==='primary'&&this.state.options.team){const team=this.state.options.team;this.state.teamStage=kind==='farm'&&team.ensure.action==='assemble'?(team.rendezvous?'rendezvous':null):'ensure';}this.persist();
   }
   async tick(){if(this.busy||!this.state.enabled)return;this.busy=true;try{const c=this.controller();if(c.mode!=='standalone'||c.manualPause){this.suspend(c.manualPause?'人工停止':'核心模式接管日常安排');return;}if(c.cleanup){this.state.message='等待原執行收尾';return;}if(c.pending){this.state.message='等待未明操作核對';return;}
     const s=this.state,day=taskDay(this.now());
     const nextDaily=s.options.dailyEnabled&&s.lastDailyDay!==day;
     const farmDue=this.allowsFarm()&&Number.isFinite(s.farmDueAt)&&s.farmDueAt<=this.now();
     if(s.phase==='primary'&&c.active&&(nextDaily||farmDue)){
+      const manualFarm=farmDue&&!nextDaily&&c.active.context.settings.manualAuto===true;
+      const returnLocation=manualFarm?this.captureFarmReturn():null;
+      if(manualFarm&&(!returnLocation||typeof this.returnFarmLocation!=='function'))throw new ControlError('unknown_location','自動戰鬥種植插隊尚未確認返回地圖／分線／房間');
       const checkpoint=await c.pause({reason:nextDaily?'08:00每日交接':'種植到期插隊',boundary:'safe'});
       if(!checkpoint){s.message=c.active?.kind==='dungeon'?'副本結算後再交接':'等待主任務安全點';return;}
       const {signal,...savedContext}=checkpoint.context;
-      s.checkpoint=structuredClone({...checkpoint,context:savedContext});s.phase=nextDaily?'daily':'farm';s.message=nextDaily?'處理新任務日':'種植插隊';this.persist();
+      s.checkpoint=structuredClone({...checkpoint,context:savedContext});if(manualFarm)s.farmReturnLocation=structuredClone(returnLocation);s.phase=nextDaily?'daily':'farm';s.message=nextDaily?'處理新任務日':'種植插隊';this.persist();
     }
     if(c.active)return;
     if(s.phase==='primary'&&nextDaily){s.phase='daily';this.persist();}
     else if(s.phase==='primary'&&farmDue){s.phase='farm';s.message='待命期間種植到期';this.persist();}
     if(s.phase==='primary'&&s.teamStage){s.phase='team';s.message='日常交接後核對指定隊伍';this.persist();}
     if(s.phase==='team'){await this.start('party',structuredClone(s.options.team[s.teamStage]));return;}
-    if(s.phase==='primary'&&s.checkpoint){c.checkpoint=structuredClone(s.checkpoint);c.persist();await this.acquire();await c.resume();s.currentRun={kind:c.active.kind,runId:c.active.context.runId,characterId:c.active.context.characterId};s.checkpoint=null;this.persist();return;}
+    if(s.phase==='primary'&&s.checkpoint){if(s.checkpoint.context.settings.manualAuto===true){if(!s.farmReturnLocation||typeof this.returnFarmLocation!=='function')throw new ControlError('unknown_location','原自動戰鬥返回位置未確認');const returned=await this.returnFarmLocation(structuredClone(s.farmReturnLocation),copyRoutineCheckpoint(s.checkpoint));if(this.controller()!==c||c.manualPause||c.pending||c.cleanup||c.active)throw new ControlError('task_busy','返回確認期間操作或角色已變');if(returned!==true&&returned?.confirmed!==true)throw new ControlError('unknown_location','原自動戰鬥地圖／分線／房間尚未確認返回');s.farmReturnLocation=null;this.persist();}c.checkpoint=structuredClone(s.checkpoint);c.persist();await this.acquire();await c.resume();s.currentRun={kind:c.active.kind,runId:c.active.context.runId,characterId:c.active.context.characterId};s.checkpoint=null;this.persist();return;}
     const kind=s.phase==='primary'?s.options.primaryKind:s.phase;if(kind==='idle'){s.message='每日已完成，待命';return;}await this.start(kind,s.steps&&s.phase==='primary'?structuredClone(s.stepSettings[s.stepIndex]):undefined);
   }catch(error){this.suspend('日常交接停止：'+error.message);throw error;}finally{this.busy=false;}}
 }
+
 
 
 
@@ -3412,8 +3433,10 @@ function validateCommand(command, controller, {now=Date.now(), capabilities=COMM
     if(!capabilities.includes(MANUAL_AUTO_CAPABILITY))throw new ControlError('unsupported_capability','未宣告核心快捷AUTO能力');
     try{validateManualAuto(manual.auto);}catch{throw new ControlError('invalid_payload','核心AUTO設定快照格式無效');}
   }
+  const manualTask=manualTaskStart(command);
+  if(manualTask){const value=command.payload.manualTask;if(!capabilities.includes(MANUAL_TASK_CAPABILITY))throw new ControlError('unsupported_capability','未宣告人工核心任務能力');if(!value||typeof value!=='object'||Array.isArray(value)||value.schemaVersion!==1||Object.keys(value).some(key=>!['schemaVersion','settings'].includes(key))||!value.settings||typeof value.settings!=='object'||Array.isArray(value.settings))throw new ControlError('invalid_payload','人工任務快照格式無效');const adapter=controller.adapters.get(command.payload.taskKind);if(!adapter)throw new ControlError('unsupported_task','人工任務尚未接入');try{adapter.validate(value.settings);}catch{throw new ControlError('invalid_payload','人工任務設定無效');}}
   if(command.leaseId !== controller.lease?.leaseId) throw new ControlError('wrong_lease','指令操作權不符');
-  controller.assertAuthority(null,{allowPending:command.type==='task.reconcile' || command.type==='task.stop',allowSettlement:command.type==='task.stop'||command.type==='task.reconcile',allowCleanup:['task.stop','task.reconcile','config.apply'].includes(command.type),allowManualPause:manualAutoStart||['task.resume','task.reconcile','config.apply','task.stop'].includes(command.type)});
+  controller.assertAuthority(null,{allowPending:command.type==='task.reconcile' || command.type==='task.stop',allowSettlement:command.type==='task.stop'||command.type==='task.reconcile',allowCleanup:['task.stop','task.reconcile','config.apply'].includes(command.type),allowManualPause:manualAutoStart||manualTask||['task.resume','task.reconcile','config.apply','task.stop'].includes(command.type)});
   if(scenarioRevision !== undefined && (command.type==='config.apply'?command.scenarioRevision<scenarioRevision:command.scenarioRevision!==scenarioRevision)) throw new ControlError('stale_scenario','情境版本不符');
   if(command.type === 'task.start' && (!TASK_KINDS.includes(command.payload.taskKind) || command.payload.taskKind==='idle')) throw new ControlError('unsupported_task','任務種類無效');
   if(command.type === 'task.start' && command.payload.configRevision !== configRevision) throw new ControlError('stale_config','設定版本不符');
@@ -3471,6 +3494,38 @@ function createCoreTransport(request,{timeout=4000}={}) {
     if((endpoint==='pair'||endpoint==='register') && parsed.contractVersion!==undefined && parsed.contractVersion!==CONTRACT_VERSION) throw new ControlError('contract_mismatch','通訊協定不相容');
     return parsed;
   };
+}
+
+
+
+const MANUAL_TASK_CAPABILITY='task.start:manual-task:v1';
+const MANUAL_TASK_SCHEMA_VERSION=1;
+const kinds=['daily','battle','dungeon','boss','farm','party'];
+const object=value=>Boolean(value&&typeof value==='object'&&!Array.isArray(value));
+/** 人工操作只提交設定快照；實際副作用仍等可信核心指令。 */
+function validateManualTaskIntent(value){
+  if(!object(value)||!['start','pause','resume','stop','reconcile'].includes(value.action)||Object.keys(value).some(key=>!['schemaVersion','requestId','action','taskKind','settings','steps','options','runId'].includes(key)))throw new ControlError('invalid_manual_task','人工任務格式無效');
+  if(value.schemaVersion!==undefined&&value.schemaVersion!==1)throw new ControlError('invalid_manual_task','人工任務版本不相容');
+  if(typeof value.requestId!=='string'||!value.requestId||value.requestId.length>100)throw new ControlError('invalid_request_id','人工任務識別無效');
+  if(value.runId!==undefined&&(typeof value.runId!=='string'||!value.runId||value.runId.length>200))throw new ControlError('invalid_manual_task','原執行識別無效');
+  if(value.action==='start'){
+    if(value.steps!==undefined){if(!Array.isArray(value.steps)||!value.steps.length||value.steps.length>30||value.taskKind!==undefined||value.settings!==undefined)throw new ControlError('invalid_manual_task','方案需有1至30個步驟');for(const step of value.steps)if(!object(step)||Object.keys(step).some(key=>!['kind','settings'].includes(key))||!kinds.includes(step.kind)||!object(step.settings))throw new ControlError('invalid_manual_task','方案步驟格式無效');}
+    else if(!kinds.includes(value.taskKind)||!object(value.settings))throw new ControlError('invalid_manual_task','缺少任務與設定快照');
+    if(value.options!==undefined&&!object(value.options))throw new ControlError('invalid_manual_task','背景設定格式無效');
+  }else if(['taskKind','settings','steps','options'].some(key=>value[key]!==undefined))throw new ControlError('invalid_manual_task','控制操作不接受新任務設定');
+  if(new TextEncoder().encode(JSON.stringify(value)).length>131072)throw new ControlError('invalid_manual_task','人工任務快照超過128KiB');
+  return value;
+}
+function manualTaskStart(command){return command?.type==='task.start'&&command.payload?.manualTask!==undefined;}
+/** 接收器核對角色、lease、版本後才進入；不修改持久core配置。 */
+async function executeManualTaskStart(controller,command,{acquire=async()=>{}}={}){
+  const manual=command?.payload?.manualTask,kind=command?.payload?.taskKind;
+  if(!manualTaskStart(command)||!object(manual)||manual.schemaVersion!==1||Object.keys(manual).some(key=>!['schemaVersion','settings'].includes(key))||!kinds.includes(kind)||!object(manual.settings))throw new ControlError('invalid_manual_task','核心人工設定快照無效');
+  if(controller.active||controller.cleanup||controller.pending||controller.settlement)throw new ControlError('task_busy','等待原任務停止、收尾與未明結果核對');
+  const adapter=controller.adapters.get(kind);if(!adapter)throw new ControlError('unsupported_task','人工任務尚未接入');adapter.validate(manual.settings);
+  const previous=controller.manualPause;controller.manualPause=false;controller.persist();
+  try{await acquire();return await controller.start(kind,{runId:command.runId,settings:structuredClone(manual.settings)});}
+  catch(error){if(!controller.active){controller.manualPause=previous;controller.persist();}throw error;}
 }
 
 
@@ -3686,6 +3741,7 @@ function showSettingsDraftPanel({document,manager,settings,edit,mountPanel}){
 
 
 
+
 const str=value=>typeof value==='string'&&value.trim()?value.trim():null;
 const num=value=>typeof value==='number'&&Number.isFinite(value)?value:null;
 const bool=value=>typeof value==='boolean'?value:null;
@@ -3708,9 +3764,10 @@ function observeSnapshot(world,{controller,now=Date.now(),connection='unknown',v
   }catch{}}
   const members=Array.isArray(world?.party?.members)?world.party.members.map(m=>({characterId:str(m.characterId),name:str(m.name),online:bool(m.online),dead:bool(m.dead),regionId:str(m.regionId),channelId:m.channelId??null,instanceId:str(m.instanceId)})):[];
   let observed=null;try{observed=task?.adapter.observe();}catch{}
+  const room=readNativeRiftRoom(world?.instanceId);
   return {
     identity,
-    location:{regionId:str(world?.regionId),regionName:str(world?.region?.name),channelId:world?.channelId??null,instanceId:str(world?.instanceId),x:num(world?.player?.x),y:num(world?.player?.y)},
+    location:{regionId:str(world?.regionId),regionName:str(world?.region?.name),channelId:world?.channelId??null,instanceId:str(world?.instanceId),...(room&&room.regionId===world?.regionId&&Number.isInteger(room.room)&&room.room>0?{roomNumber:room.room}:{}),x:num(world?.player?.x),y:num(world?.player?.y)},
     game:{connection:['connected','disconnected','unknown'].includes(connection)?connection:'unknown',dead:bool(world?.dead),interactionLocked:locked,verification:bool(verification)},
     control:{mode:controller?.mode||'standalone',owner:active?(controller?.mode==='managed'?'core':'local'):null,manualPause:controller?.manualPause??false,leaseId:controller?.lease?.leaseId??null},
     task:{runId:task?.context.runId??null,kind:task?.kind??'idle',state:controller?.state??'idle',phase:observed?.phase??null,message:observed?.message??null,checkpointId:controller?.checkpoint?.checkpointId??null,pendingAction:controller?.pending??null},
@@ -3802,20 +3859,22 @@ function assistantDockGeometry({viewportWidth,logoLeft,expanded,expandedWidth=60
 function createCompactAssistantPanel({document,anchor,heading,status,metrics,message,buttons,onError,readDockRightBoundary=()=>null,readDockWidth=()=>null,writeDockWidth=()=>{},defaultDockWidth=600,setTimer=setTimeout,clearTimer=clearTimeout}) {
   const make=(tag,text,css='')=>{const el=document.createElement(tag);if(text)el.textContent=text;el.style.cssText=css;return el;};
   const dock=make('section',null,'position:fixed;left:14px;right:auto;top:14px;z-index:2147483645;display:flex;align-items:center;box-sizing:border-box;width:32px;max-width:calc(100vw - 28px);height:32px;padding:0;overflow:hidden;transition:width .18s ease;background:#173c60;color:#fff;border:1px solid #a4cce9;border-radius:5px;font:12px/1.4 system-ui;touch-action:none');dock.id=anchor.id+'-dock';
-  const style=make('style');style.textContent=`#${anchor.id}[hidden],#${anchor.id} [hidden],#${dock.id} [hidden]{display:none!important}#${anchor.id} button,#${anchor.id} select,#${dock.id} button{font:inherit;min-height:32px;box-sizing:border-box}#${anchor.id} button,#${dock.id} button{color:#fff;background:#245987;border:1px solid #a4cce9;border-radius:4px;padding:5px 8px;cursor:pointer}#${anchor.id} select{max-width:100%;background:#173c60;color:#fff;border:1px solid #a4cce9}#${anchor.id} input,#${anchor.id} textarea{max-width:100%;box-sizing:border-box}#${anchor.id} .assistant-functions{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin-top:12px}#${anchor.id} .assistant-functions button{padding:6px 2px}#${anchor.id} .assistant-info{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(155px,1fr);gap:14px;margin-top:12px}#${anchor.id} .assistant-content{height:210px;max-height:none;min-height:80px;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;margin-top:10px}#${anchor.id} .assistant-inline-panel{position:static!important;inset:auto!important;transform:none!important;margin:0!important;width:100%!important;max-width:none!important;min-width:0!important;height:auto!important;min-height:0!important;max-height:none!important;overflow:visible!important;resize:none!important;box-shadow:none!important;box-sizing:border-box!important;display:block!important;background:transparent!important;padding:0!important;border:0!important}#${anchor.id} .assistant-inline-panel>form,#${anchor.id} .assistant-inline-panel>[data-assistant-overlay-body]{width:100%!important;max-width:none!important;max-height:none!important;overflow:visible!important;box-sizing:border-box!important}#${dock.id} .assistant-dock-info{display:flex;flex:1 1 0;align-items:center;justify-content:flex-end;gap:9px;min-width:0;max-width:0;opacity:0;overflow:hidden;transition:opacity .18s ease;white-space:nowrap}#${dock.id}[data-expanded="true"] .assistant-dock-info{max-width:none;opacity:1;padding:0 5px 0 7px}#${dock.id} .assistant-dock-state{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 0}#${dock.id} [data-assistant-logo]{width:30px;min-width:30px;height:30px;min-height:30px;padding:2px;border:0;background:transparent;cursor:grab;flex:0 0 30px}@media(max-width:560px){#${anchor.id} .assistant-info{grid-template-columns:1fr}#${anchor.id} .assistant-functions{grid-template-columns:repeat(2,minmax(0,1fr))}#${anchor.id} .assistant-content{max-height:none}}`;
-  const expanded=make('div'),titleRow=make('div',null,'display:flex;align-items:center;justify-content:space-between;gap:12px'),close=make('button','×');close.title='關閉助手介面';close.setAttribute('aria-label','關閉助手介面');
-  const info=make('div');info.className='assistant-info';const left=make('div'),right=make('div'),actions=make('div',null,'display:flex;gap:6px;flex-wrap:wrap;margin-top:12px');
+  const style=make('style');style.textContent=`#${anchor.id}[hidden],#${anchor.id} [hidden],#${dock.id} [hidden]{display:none!important}#${anchor.id} button,#${anchor.id} select,#${dock.id} button{font:inherit;min-height:32px;box-sizing:border-box}#${anchor.id} button,#${dock.id} button{color:#fff;background:#245987;border:1px solid #a4cce9;border-radius:4px;padding:5px 8px;cursor:pointer}#${anchor.id} select{max-width:100%;background:#173c60;color:#fff;border:1px solid #a4cce9}#${anchor.id} input,#${anchor.id} textarea{max-width:100%;box-sizing:border-box}#${anchor.id} .assistant-functions{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin-top:12px}#${anchor.id} .assistant-functions button{padding:6px 2px}#${anchor.id} .assistant-info{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(155px,1fr);gap:14px;margin-top:12px}#${anchor.id} .assistant-content{height:210px;max-height:none;min-height:80px;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;margin-top:10px}#${anchor.id} .assistant-inline-panel{position:static!important;inset:auto!important;transform:none!important;margin:0!important;width:100%!important;max-width:none!important;min-width:0!important;height:auto!important;min-height:0!important;max-height:none!important;overflow:visible!important;resize:none!important;box-shadow:none!important;box-sizing:border-box!important;display:block!important;background:transparent!important;padding:0!important;border:0!important;overflow-wrap:anywhere}#${anchor.id} .assistant-inline-panel>form,#${anchor.id} .assistant-inline-panel>[data-assistant-overlay-body]{width:100%!important;max-width:none!important;max-height:none!important;overflow:visible!important;box-sizing:border-box!important}#${dock.id} .assistant-dock-info{display:flex;flex:1 1 0;align-items:center;justify-content:flex-end;gap:9px;min-width:0;max-width:0;opacity:0;overflow:hidden;transition:opacity .18s ease;white-space:nowrap}#${dock.id}[data-expanded="true"] .assistant-dock-info{max-width:none;opacity:1;padding:0 5px 0 7px}#${dock.id} .assistant-dock-state{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 0}#${dock.id} [data-assistant-logo]{width:30px;min-width:30px;height:30px;min-height:30px;padding:2px;border:0;background:transparent;cursor:grab;flex:0 0 30px}@media(max-width:560px){#${anchor.id} .assistant-info{grid-template-columns:1fr}#${anchor.id} .assistant-functions{grid-template-columns:repeat(2,minmax(0,1fr))}#${anchor.id} .assistant-content{max-height:none}}`;
+  style.textContent+=`#${anchor.id}{font-size:13px;line-height:1.4}#${anchor.id} button,#${anchor.id} select{min-height:26px;margin:0;padding:3px 6px}#${anchor.id} .assistant-functions{grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;margin-top:8px}#${anchor.id} .assistant-functions button{font-size:12px;min-height:28px;padding:3px 1px;white-space:nowrap}#${anchor.id} .assistant-info{display:block;margin-top:6px}#${anchor.id} .assistant-content{height:300px;margin-top:6px}#${anchor.id} .assistant-panel-header{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:0 0 8px}#${anchor.id} .assistant-panel-header strong{font-size:14px;line-height:1.3;color:#fff}#${anchor.id} .assistant-panel-header-actions{display:flex;gap:4px;align-items:center;flex:0 0 auto}#${anchor.id} .assistant-drawer-controls{align-items:center;margin-top:6px}#${anchor.id} .assistant-drawer-controls>label{display:inline-flex;align-items:center;justify-content:center;gap:3px;margin:0;font-size:11px;line-height:1.15;min-height:14px}#${anchor.id} input[type=checkbox]{width:13px;height:13px;margin:0;vertical-align:middle;flex:0 0 auto}#${anchor.id} .assistant-inline-panel label{font-size:12px}#${anchor.id} .assistant-inline-panel [data-assistant-check-row]{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:6px!important;min-height:14px;margin:4px 0!important}#${anchor.id} .assistant-inline-panel>form,#${anchor.id} .assistant-inline-panel>[data-assistant-overlay-body]{padding:0!important;background:transparent!important;border:0!important;border-radius:0!important}@media(max-width:380px){#${anchor.id} .assistant-functions{grid-template-columns:repeat(3,minmax(0,1fr))}}`;
+  const expanded=make('div'),titleRow=make('div',null,'display:flex;align-items:center;justify-content:space-between;gap:8px'),close=make('button','×');close.title='關閉助手介面';close.setAttribute('aria-label','關閉助手介面');
+  const info=make('div');info.className='assistant-info';const left=make('div'),right=make('div'),actions=make('div',null,'display:flex;gap:4px;flex-wrap:wrap;margin-top:6px');
   const choice=make('select');choice.title='執行方案';choice.setAttribute('aria-label','執行方案');for(const [value,label]of [['daily','每日任務'],['battle','刷怪練等'],['dungeon','連刷副本'],['boss','野王狩獵'],['farm','自動種植']]){const opt=make('option',label);opt.value=value;choice.append(opt);}
-  const choiceLabel=make('label','執行方案：');choiceLabel.append(choice);right.append(choiceLabel,actions);left.append(status,metrics);info.append(left,right);
-  const functions=make('div');functions.className='assistant-functions';titleRow.append(heading,close);expanded.append(titleRow,info,functions,message);
+  const choiceLabel=make('label','執行方案：');choiceLabel.append(choice);right.append(choiceLabel,actions);left.append(status,message,metrics);info.append(left,right);
+  Object.assign(heading.style,{fontSize:'16px',color:'#fff',lineHeight:'1.3'});Object.assign(status.style,{fontSize:'16px',color:'#fff',lineHeight:'1.35'});Object.assign(message.style,{fontSize:'11px',lineHeight:'1.35',margin:'4px 0'});
+  const functions=make('div');functions.className='assistant-functions';titleRow.append(heading,close);expanded.append(titleRow,info,functions);
   const logo=make('button'),barInfo=make('div'),character=make('span'),barText=make('span'),auto=make('button','AUTO OFF');logo.innerHTML='<svg viewBox="0 0 32 32" width="25" height="25" aria-hidden="true" focusable="false"><circle cx="16" cy="16" r="13" fill="#153a59" stroke="#c2e9ff" stroke-width="1.5"/><path d="M21 8 18 18 8 21 14 14Z" fill="#f6d58a"/><path d="M11 24 14 14 24 11 18 18Z" fill="#82ceeb"/><circle cx="16" cy="16" r="2" fill="#fff"/></svg>';logo.style.cssText='margin:0;box-sizing:border-box';logo.setAttribute('data-assistant-logo','');logo.title='開啟整合助手；拖動可調整位置';logo.setAttribute('aria-label','開啟整合助手');barInfo.className='assistant-dock-info';barText.className='assistant-dock-state';character.style.cssText='flex:0 1 140px;max-width:140px;min-width:0;overflow:hidden;text-overflow:ellipsis';auto.style.cssText='margin:0;box-sizing:border-box;min-height:26px;width:88px;min-width:0;max-width:88px;padding:2px 4px;flex:0 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';auto.title='在目前地圖啟用或停止助手自動攻擊';barInfo.append(character,barText,auto);dock.append(logo,barInfo);
   const drawer=make('section',null,'margin-top:12px;padding-top:10px;border-top:1px solid #8ebade'),drawerHeading=make('strong'),drawerClose=make('button','關閉設定'),drawerControls=make('div',null,'display:flex;flex-wrap:wrap;gap:6px;margin-top:10px'),drawerBody=make('div');drawerBody.className='assistant-content';drawerBody.id=anchor.id+'-content';drawerClose.style.marginLeft='12px';drawer.append(drawerHeading,drawerClose,drawerControls,drawerBody);expanded.append(drawer);drawer.hidden=true;
-  buttons.hidden=true;anchor.replaceChildren(style,expanded,buttons);document.documentElement.append(dock);
-  Object.assign(anchor.style,{width:'min(700px,calc(100vw - 40px))',maxWidth:'calc(100vw - 40px)',padding:'14px',height:'480px',maxHeight:'min(85vh,calc(100vh - 28px))',overflow:'auto',scrollbarGutter:'stable',boxSizing:'border-box'});
+  drawerControls.className='assistant-drawer-controls';buttons.hidden=true;anchor.replaceChildren(style,expanded,buttons);document.documentElement.append(dock);
+  Object.assign(anchor.style,{width:'min(470px,calc(100vw - 28px))',maxWidth:'calc(100vw - 28px)',padding:'10px',height:'auto',maxHeight:'min(85vh,calc(100vh - 28px))',overflow:'auto',scrollbarGutter:'stable',boxSizing:'border-box'});
   const savedDockWidth=readDockWidth(),requestedDockWidth=Number.isFinite(savedDockWidth)&&savedDockWidth>=32?savedDockWidth:defaultDockWidth;
   if(savedDockWidth===null||savedDockWidth===undefined)writeDockWidth(requestedDockWidth);
   let effectiveDockWidth=requestedDockWidth,cachedDockBoundary=null;
-  let dragPointer=null;let open=false,running=false,hovered=false,dragging=false,enterTimer=null,leaveTimer=null,currentSource=null,currentPanel=null,currentDispose=null;const registry=new Map();
+  let dragPointer=null;let open=false,running=false,hovered=false,dragging=false,enterTimer=null,leaveTimer=null,currentSource=null,currentPanel=null,currentDispose=null,selectedFeature=null;const registry=new Map(),preparedCloses=new WeakSet();
   const invoke=handler=>Promise.resolve().then(handler).catch(error=>onError?.(error));
   const cancelHover=()=>{if(enterTimer!==null)clearTimer(enterTimer);if(leaveTimer!==null)clearTimer(leaveTimer);enterTimer=leaveTimer=null;};
   const viewport=()=>({width:Number(document.defaultView?.innerWidth)||(typeof innerWidth==='number'?innerWidth:1000),height:Number(document.defaultView?.innerHeight)||(typeof innerHeight==='number'?innerHeight:800)});
@@ -3835,15 +3894,27 @@ function createCompactAssistantPanel({document,anchor,heading,status,metrics,mes
     return geometry;
   }
   function clampPosition(panel){if(panel.hidden)return;if(panel===dock){fitDock({dragging:false});return;}const size=viewport(),rect=panel.getBoundingClientRect();if(!Number.isFinite(rect.left)||!Number.isFinite(rect.top)||!rect.width||!rect.height)return;const left=Math.max(0,Math.min(rect.left,Math.max(0,size.width-rect.width))),top=Math.max(0,Math.min(rect.top,Math.max(0,size.height-rect.height)));if(left!==rect.left){if(panel.style.right&&panel.style.right!=='auto')panel.style.right=Math.max(0,size.width-left-rect.width)+'px';else panel.style.left=left+'px';}if(top!==rect.top){if(panel.style.bottom&&panel.style.bottom!=='auto')panel.style.bottom=Math.max(0,size.height-top-rect.height)+'px';else panel.style.top=top+'px';}}
-  function fitContent(){if(!open)return;const size=viewport(),cap=Math.min(size.height*.85,size.height-28);if(!drawer.hidden){const upper=Math.max(0,drawerBody.getBoundingClientRect().top-anchor.getBoundingClientRect().top),height=Math.max(480,Math.ceil((upper+210+15)/10)*10),remaining=Math.floor(Math.min(height,cap)-upper-15);anchor.style.height=height+'px';drawerBody.style.minHeight='0';drawerBody.style.height=Math.min(210,Math.max(remaining<48?80:0,remaining))+'px';drawerBody.style.maxHeight=drawerBody.style.height;anchor.style.overflow=remaining<48?'auto':'hidden';}else{anchor.style.height='480px';anchor.style.overflow='auto';}clampPosition(anchor);}
+  function fitContent(){if(!open)return;const size=viewport(),cap=Math.min(size.height*.85,size.height-28);if(!drawer.hidden){const upper=Math.max(0,drawerBody.getBoundingClientRect().top-anchor.getBoundingClientRect().top),height=Math.ceil((upper+300+12)/10)*10,remaining=Math.floor(Math.min(height,cap)-upper-12);anchor.style.height=height+'px';drawerBody.style.minHeight='0';drawerBody.style.height=Math.min(300,Math.max(remaining<48?80:0,remaining))+'px';drawerBody.style.maxHeight=drawerBody.style.height;anchor.style.overflow=remaining<48?'auto':'hidden';}else{anchor.style.height='auto';anchor.style.overflow='auto';}clampPosition(anchor);}
   function updateVisibility(){anchor.hidden=!open;dock.dataset.expanded=String(running||hovered||dragging);logo.setAttribute('aria-expanded',String(open));logo.setAttribute('aria-label',open?'關閉整合助手':'開啟整合助手');barInfo.setAttribute('aria-hidden',String(!running&&!hovered&&!dragging));auto.tabIndex=running||hovered||dragging?0:-1;fitContent();fitDock();}
+  function refreshContent(){if(!open||drawer.hidden||!currentPanel?.isConnected||currentPanel.parentNode!==drawerBody)return;try{currentPanel.assistantRefresh?.();}catch{}}
   function clearMounted(){const dispose=currentDispose;currentDispose=null;currentPanel=null;drawerBody.replaceChildren();dispose?.();}
-  function closeContent(){clearMounted();drawer.hidden=true;currentSource=null;fitContent();}
+  function closeContent(){clearMounted();drawer.hidden=true;drawerHeading.hidden=false;drawerClose.hidden=false;currentSource=null;selectedFeature=null;fitContent();}
   function add(container,label,handler){const b=make('button',label);b.addEventListener('click',()=>invoke(handler));container.append(b);return b;}
   function register(label,element){registry.set(label,element);}
-  const defaultEditors={'每日任務':'每日設定','刷怪練等':'戰鬥設定','連刷副本':'副本設定','野王狩獵':'野王設定','自動種植':'種植設定','AUTO 設定':'AUTO設定入口','方案流程':'編輯三套方案','設定備份':'資料與備份','模式設定':'功能接入狀態'};
-  function showGroup(title,labels){drawerHeading.textContent=title;drawerControls.replaceChildren();clearMounted();currentSource=null;for(const label of labels){const el=registry.get(label);if(el)drawerControls.append(el);}drawer.hidden=false;const editor=registry.get(defaultEditors[title]);if(editor)editor.click();fitContent();}
+  const defaultEditors={'每日任務':'每日設定','刷怪練等':'戰鬥設定','連刷副本':'副本設定','野王狩獵':'野王設定','自動種植':'種植設定','自動戰鬥':'自動戰鬥設定','AUTO 設定':'自動戰鬥設定','方案流程':'編輯三套方案','設定備份':'資料與備份','模式設定':'功能接入狀態'};
+  function showGroup(title,labels){selectedFeature=title;drawerHeading.textContent=title;drawerHeading.hidden=false;drawerClose.hidden=false;drawerControls.replaceChildren();clearMounted();currentSource=null;for(const label of labels){const el=registry.get(label);if(el)drawerControls.append(el);}drawer.hidden=false;const editor=registry.get(defaultEditors[title]);if(editor)editor.click();fitContent();}
   function feature(label,labels){return add(functions,label,()=>showGroup(label,labels));}
+  function preparePanelHeader(panel,title){
+    const body=panel.querySelector('form')??panel,existingHeader=panel.querySelector('[data-assistant-panel-header]'),existing=[...panel.querySelectorAll('button')].filter(el=>!el.closest('[data-assistant-panel-header]')),save=existing.find(el=>el.hasAttribute('data-assistant-save')||/^(?:保存|儲存)/.test(el.textContent.trim())),cancel=existing.find(el=>el.hasAttribute('data-assistant-close')||/^(?:取消|關閉(?:設定)?|×|✕)$/.test(el.textContent.trim()));
+    const header=existingHeader??make('div'),name=existingHeader?.querySelector('strong')??make('strong',title||'功能設定'),controls=existingHeader?.querySelector('.assistant-panel-header-actions')??make('div');header.className='assistant-panel-header';header.setAttribute('data-assistant-panel-header','');controls.className='assistant-panel-header-actions';
+    for(const heading of panel.querySelectorAll('h2,h3,strong'))if(heading!==name&&(heading.textContent.trim()===title||/設定/.test(heading.textContent)&&heading===panel.querySelector('h2,h3,strong')))heading.hidden=true;
+    const first=body.firstElementChild;if(first&&first.textContent.trim()===title&&!first.querySelector('input,select,button'))first.hidden=true;
+    // 不替換來源按鈕：保留onclick／事件及表單submit驗證；submit按鈕仍在原form內。
+    if(save){save.textContent='保存';save.setAttribute('data-assistant-save','');controls.prepend(save);}
+    const previousClose=controls.querySelector('[data-assistant-close]'),closeButton=cancel??previousClose??make('button','關閉');if(cancel&&previousClose&&previousClose!==cancel)previousClose.remove();closeButton.type='button';closeButton.textContent='關閉';closeButton.setAttribute('data-assistant-close','');if(!cancel&&!previousClose)closeButton.onclick=closeContent;else if(cancel&&!preparedCloses.has(cancel)){preparedCloses.add(cancel);closeButton.addEventListener('click',()=>Promise.resolve().then(()=>{if(currentPanel===panel&&!panel.parentNode)closeContent();}));}controls.append(closeButton);header.append(name,controls);if(!existingHeader)body.prepend(header);
+    for(const label of panel.querySelectorAll('label'))if(label.querySelector('input[type=checkbox]'))label.setAttribute('data-assistant-check-row','');
+    drawerHeading.hidden=true;drawerClose.hidden=true;
+  }
   function mountPanel(panel,{title,source,background=false,onClose,dispose}={}){
     if(background&&(!open||drawer.hidden||currentSource!==source||currentPanel?.id!==panel.id||currentPanel?.parentNode!==drawerBody))return panel;
     panel.classList?.add('assistant-inline-panel');panel.setAttribute('data-assistant-inline','');Object.assign(panel.style,{position:'static',inset:'auto',left:'auto',right:'auto',top:'auto',bottom:'auto',transform:'none',margin:'0',width:'100%',maxWidth:'none',minWidth:'0',height:'auto',maxHeight:'none',overflow:'visible',resize:'none',boxShadow:'none',boxSizing:'border-box'});
@@ -3851,7 +3922,8 @@ function createCompactAssistantPanel({document,anchor,heading,status,metrics,mes
     // 遮罩的直接內容也回到一般版面；不改欄位及其保存回呼。
     for(const child of panel.children??[]){if(child.tagName?.toLowerCase()==='form'||child.style?.maxHeight&&child.style?.overflow==='auto'){child.setAttribute?.('data-assistant-overlay-body','');Object.assign(child.style,{width:'100%',maxWidth:'none',maxHeight:'none',overflow:'visible',boxSizing:'border-box'});}}
     if(title)drawerHeading.textContent=title;else if(drawer.hidden)drawerHeading.textContent=panel.getAttribute?.('aria-label')||'功能內容';
-    if(currentPanel!==panel)clearMounted();drawer.hidden=false;currentSource=source??null;currentPanel=panel;currentDispose=onClose??dispose??null;drawerBody.replaceChildren(panel);drawerBody.scrollTop=0;fitContent();return panel;
+    const panelTitle=title??panel.querySelector('h2,h3,strong')?.textContent??drawerHeading.textContent;preparePanelHeader(panel,panelTitle);
+    if(currentPanel!==panel)clearMounted();drawer.hidden=false;currentSource=source??null;currentPanel=panel;currentDispose=onClose??dispose??null;drawerBody.replaceChildren(panel);drawerBody.scrollTop=0;fitContent();Promise.resolve().then(()=>{if(currentPanel===panel&&panel.parentNode===drawerBody){preparePanelHeader(panel,panelTitle);fitContent();}});return panel;
   }
   close.onclick=()=>{open=false;updateVisibility();};logo.onclick=()=>{open=!open;updateVisibility();};drawerClose.onclick=closeContent;
   dock.addEventListener('mouseenter',()=>{cancelHover();hovered=true;updateVisibility();});
@@ -3867,8 +3939,8 @@ function createCompactAssistantPanel({document,anchor,heading,status,metrics,mes
   for(const type of ['pointerup','pointercancel'])logo.addEventListener(type,()=>{dragPointer=null;},true);
   function saveDockPosition(save){const size=viewport(),leftStyle=Number.parseFloat(dock.style.left),rightStyle=Number.parseFloat(dock.style.right),topStyle=Number.parseFloat(dock.style.top),bottomStyle=Number.parseFloat(dock.style.bottom),left=Number.isFinite(leftStyle)?leftStyle:size.width-(Number.isFinite(rightStyle)?rightStyle:14)-32,top=Number.isFinite(topStyle)?topStyle:size.height-(Number.isFinite(bottomStyle)?bottomStyle:14)-32,right=Math.max(0,size.width-left-32),bottom=Math.max(0,size.height-top-32);save({...(left<=right?{left:Math.max(0,left)}:{right}),...(top<=bottom?{top:Math.max(0,top)}:{bottom})});}
   const resizeHandler=()=>{fitContent();fitDock({dragging:false,refreshBoundary:true,restoreWidth:true});};document.defaultView?.addEventListener?.('resize',resizeHandler);
-  auto.onclick=()=>invoke(()=>showGroup('AUTO 設定',['AUTO設定入口']));updateVisibility();
-  return {dock,logo,choice,register,showGroup,feature,mountPanel,closeContent,fitContent,fitDock,clampPosition,saveDockPosition,dispose(){cancelHover();clearMounted();document.defaultView?.removeEventListener?.('resize',resizeHandler);dock.remove();},isOpen:()=>open,setDragging(value){dragging=Boolean(value);dock.style.transition=dragging?'none':'width .18s ease';if(dragging)cancelHover();updateVisibility();},execute(label){const action=registry.get(label);if(!action)throw new Error('功能入口尚未接入');action.click();},action:(label,handler)=>add(actions,label,handler),setAutoAction(handler){auto.onclick=()=>invoke(handler);},update({active,characterName,plan,state,autoLabel='AUTO OFF',autoDisabled=false,autoTitle='在目前地圖啟用或停止助手自動攻擊'}){auto.textContent=autoLabel;auto.disabled=autoDisabled;auto.title=autoTitle;running=active;character.textContent=characterName||'等待角色';character.title=character.textContent;barText.textContent=`方案：${plan}｜狀態：${state}`;barText.title=barText.textContent;updateVisibility();},closeRolePanels:closeContent,reserved(){const el=make('span');el.setAttribute('aria-hidden','true');functions.append(el);}};
+  auto.onclick=()=>invoke(()=>showGroup('自動戰鬥',['自動戰鬥設定']));updateVisibility();
+  return {dock,logo,choice,register,showGroup,feature,currentFeature:()=>selectedFeature,mountPanel,closeContent,fitContent,fitDock,clampPosition,saveDockPosition,dispose(){cancelHover();clearMounted();document.defaultView?.removeEventListener?.('resize',resizeHandler);dock.remove();},isOpen:()=>open,setDragging(value){dragging=Boolean(value);dock.style.transition=dragging?'none':'width .18s ease';if(dragging)cancelHover();updateVisibility();},execute(label){const action=registry.get(label);if(!action)throw new Error('功能入口尚未接入');action.click();},action:(label,handler)=>add(actions,label,handler),setAutoAction(handler){auto.onclick=()=>invoke(handler);},update({active,characterName,plan,state,autoLabel='AUTO OFF',autoDisabled=false,autoTitle='在目前地圖啟用或停止助手自動攻擊'}){auto.textContent=autoLabel;auto.disabled=autoDisabled;auto.title=autoTitle;running=active;character.textContent=characterName||'等待角色';character.title=character.textContent;barText.textContent=`方案：${plan}｜狀態：${state}`;barText.title=barText.textContent;updateVisibility();refreshContent();},closeRolePanels:closeContent,reserved(){}};
 }
 
 
@@ -3957,6 +4029,7 @@ function createExtensionCoreTransport(target,{timeout=4000,probeTimeout=900,setT
 
 
 
+
 function coreReceiptBatch(receipts){
   const batch=[];let bytes=2;
   for(const receipt of receipts){let wire=receipt;if(new TextEncoder().encode(JSON.stringify(wire)).length>65536){const result={detailsOmitted:true};for(const key of ['checkpointId','safe','runId','prepared','reloadConfirmed','resumed','configRevision','scenarioRevision'])if(['string','number','boolean'].includes(typeof receipt.result?.[key]))result[key]=receipt.result[key];wire={commandId:receipt.commandId,state:receipt.state,reasonCode:receipt.reasonCode,message:String(receipt.message??'').slice(0,4096),result};}
@@ -3970,7 +4043,7 @@ class CoreSession {
   constructor({transport,controller,receiver,identity,snapshot,pairingStore,scriptVersion,runtimeVersion,capabilities,results=null,now=Date.now}) {
     Object.assign(this,{transport,controller,receiver,identity,snapshot,pairingStore,scriptVersion,runtimeVersion,capabilities,results,now});
     this.pairing=pairingStore?.get()??null;this.registered=false;this.busy=false;this.sequence=0;this.lastValidAt=null;this.retryAt=0;this.failures=0;this.error=null;this.receipts=[];this.acknowledgedReceipts=new Map();
-    this.connectionRevision=0;this.bridge=transport.kind==='extension-bridge';this.bridgeAuthorization=null;this.availability={available:false,reason:'missing_extension',message:'未安裝或未載入私人核心擴充'};this.lastProbeAt=null;this.probePromise=null;this.intentBusy=false;this.disposed=false;this.registeredIdentity=null;
+    this.connectionRevision=0;this.bridge=transport.kind==='extension-bridge';this.bridgeAuthorization=null;this.availability={available:false,reason:'missing_extension',message:'未安裝或未載入私人核心擴充'};this.lastProbeAt=null;this.probePromise=null;this.intentBusy=false;this.disposed=false;this.registeredIdentity=null;this.exchangeWaiters=[];this.manualTaskRequest=null;this.manualTaskResponse=null;this.manualTaskState=null;
   }
   authorization(){return this.bridge?this.bridgeAuthorization:this.pairing;}
   assertConnection(revision,authorization){if(this.disposed||revision!==this.connectionRevision||authorization!==this.authorization()||this.controller.mode!=='managed')throw new ControlError('mode_changed','核心連線已因模式切換取消');}
@@ -4032,7 +4105,7 @@ class CoreSession {
     const pairing=this.pairingStore.get();if(typeof pairing?.clientId!=='string'||!pairing.clientId||typeof pairing?.token!=='string'||!pairing.token)throw new ControlError('not_paired','尚未配對，請先使用「配對核心」');
     this.controller.setManaged(true);this.pairing=pairing;this.connectionRevision++;this.registered=false;this.retryAt=0;this.failures=0;this.error=null;this.lastValidAt=null;
   }
-  status() {const age=this.lastValidAt===null?null:this.now()-this.lastValidAt;return {paired:Boolean(this.bridge?this.bridgeAuthorization:this.pairing),registered:this.registered,age,state:age===null?'unknown':age>15000?'disconnected':age>5000?'stale':'connected',error:this.error,available:this.bridge?this.availability.available:Boolean(this.pairing),reason:this.bridge?this.availability.reason:this.pairing?null:'not_paired',message:this.bridge?this.availability.message:this.pairing?'':'尚未配對',bridgeVersion:this.bridge?this.availability.bridgeVersion??null:null,intentBusy:this.intentBusy};}
+  status() {const age=this.lastValidAt===null?null:this.now()-this.lastValidAt;return {paired:Boolean(this.bridge?this.bridgeAuthorization:this.pairing),registered:this.registered,age,state:age===null?'unknown':age>15000?'disconnected':age>5000?'stale':'connected',error:this.error,available:this.bridge?this.availability.available:Boolean(this.pairing),reason:this.bridge?this.availability.reason:this.pairing?null:'not_paired',message:this.bridge?this.availability.message:this.pairing?'':'尚未配對',bridgeVersion:this.bridge?this.availability.bridgeVersion??null:null,intentBusy:this.intentBusy,manualTask:this.manualTaskState};}
   async pair(code,label) {
     if(this.bridge)throw new ControlError('bridge_required','私人核心使用擴充自動連線，不需要配對');
     if(this.controller.active||this.controller.cleanup)throw new ControlError('running','請先停止並等收尾完成再配對');
@@ -4071,13 +4144,16 @@ class CoreSession {
       const resultPacket=this.results?.packet()??{results:[],resultChunks:[]};
       const exchangeIdentity=this.identity().characterId,exchangeEpoch=this.controller.pageEpoch;
       const result=await this.transport('exchange',{...(!this.bridge?{clientId:authorization.clientId,roleId:this.controller.roleId}:{}),pageEpoch:this.controller.pageEpoch,
-        sequence:++this.sequence,observedAt:this.now(),snapshot:this.snapshot(),receipts:pendingReceipts,...(resultPacket.results.length?{results:resultPacket.results}:{}),...(resultPacket.resultChunks.length?{resultChunks:resultPacket.resultChunks}:{})},this.bridge?null:authorization.token);
+        sequence:++this.sequence,observedAt:this.now(),snapshot:this.snapshot(),receipts:pendingReceipts,...(this.manualTaskRequest?{manualTasks:[this.manualTaskRequest]}:{}),...(resultPacket.results.length?{results:resultPacket.results}:{}),...(resultPacket.resultChunks.length?{resultChunks:resultPacket.resultChunks}:{})},this.bridge?null:authorization.token);
       if(this.identity().characterId!==exchangeIdentity||this.controller.pageEpoch!==exchangeEpoch)throw new ControlError('identity_changed','交換等待期間角色或頁面已改變');
       this.assertConnection(revision,authorization);
       this.controller.bindingState=result.bindingState;
       this.controller.acceptLease(result.lease,result.serverTime);
       this.receiver.synchronizeClock(result.serverTime);
       this.lastValidAt=this.now();this.failures=0;this.retryAt=0;this.error=null;
+      if(Array.isArray(result.capabilities))this.availability.capabilities=result.capabilities;
+      if(result.manualTask!==undefined)this.manualTaskState=result.manualTask;
+      if(this.manualTaskRequest){const response=result.manualTasks?.find(item=>item.requestId===this.manualTaskRequest.requestId);if(response)this.manualTaskResponse=response;else throw new ControlError('unsupported_capability','核心尚未確認人工任務介面');}
       if(result.config!==null&&result.config!==undefined) {
         // 設定必須經接入端validate，不默默覆寫執行快照。
         if(typeof this.applyConfig!=='function')throw new ControlError('config_not_connected','核心設定驗證尚未接入');
@@ -4095,7 +4171,7 @@ class CoreSession {
       this.failures++;this.retryAt=this.now()+Math.min(15000,1000*2**Math.min(this.failures-1,4));
       this.registered=false;
       await this.controller.watchdog();
-    }finally{this.busy=false;}
+    }finally{this.busy=false;for(const resolve of this.exchangeWaiters.splice(0))resolve();}
   }
   async unregister(reason='pagehide') {
     const authorization=this.authorization();this.connectionRevision++;this.registered=false;this.lastValidAt=null;this.registeredIdentity=null;this.controller.lease=null;this.controller.leaseDeadline=0;this.transport.cancel?.('核心連線已因模式或角色切換取消');
@@ -4120,6 +4196,22 @@ class CoreSession {
     const revision=this.connectionRevision,authorization=this.authorization(),characterId=this.identity().characterId,pageEpoch=this.controller.pageEpoch;
     this.intentBusy=true;
     try{const result=await this.transport('manual-auto.intent',{action,requestId,pageEpoch,...(action==='start'?{auto:structuredClone(auto)}:{})});this.assertIdentity(characterId,pageEpoch);this.assertConnection(revision,authorization);return result;}finally{this.intentBusy=false;}
+  }
+  async manualTask(value){
+    const request=structuredClone({...value,schemaVersion:1,requestId:value?.requestId??globalThis.crypto.randomUUID()});validateManualTaskIntent(request);
+    if(!this.bridge||!this.availability.available||!this.registered||this.controller.mode!=='managed')throw new ControlError('core_unavailable','核心不可用，等待連線與角色核對');
+    if(!this.capabilities.includes(MANUAL_TASK_CAPABILITY))throw new ControlError('unsupported_capability','此助手未接入人工核心任務');
+    if(this.intentBusy||this.manualTaskRequest)throw new ControlError('intent_busy','人工操作等待核心確認');
+    const current=this.identity();if(!current.worldReady||this.controller.bindingState!=='bound'||this.controller.boundCharacterId!==current.characterId||this.controller.roleId!==this.bridgeAuthorization?.roleId||this.registeredIdentity?.characterId!==current.characterId||this.registeredIdentity?.pageEpoch!==this.controller.pageEpoch)throw new ControlError('identity_mismatch','原生角色或可信分頁未核對');
+    if(request.action==='start'&&(this.controller.pending||this.controller.cleanup||this.controller.settlement))throw new ControlError('task_busy','收尾或未明結果尚未核對，不能開始新任務');
+    const revision=this.connectionRevision,authorization=this.authorization(),characterId=current.characterId,pageEpoch=this.controller.pageEpoch;this.intentBusy=true;
+    try{
+      while(this.busy)await new Promise(resolve=>this.exchangeWaiters.push(resolve));this.assertIdentity(characterId,pageEpoch);this.assertConnection(revision,authorization);
+      if(this.now()<this.retryAt)throw new ControlError('core_unavailable','核心正在重新連線');this.manualTaskRequest=request;this.manualTaskResponse=null;
+      await this.tick();while(this.busy)await new Promise(resolve=>this.exchangeWaiters.push(resolve));this.assertIdentity(characterId,pageEpoch);this.assertConnection(revision,authorization);
+      const response=this.manualTaskResponse;if(!response)throw new ControlError(this.error?.code??'core_unavailable','核心未確認人工操作，保留原狀態');
+      if(response.error)throw new ControlError(response.error.code,response.error.message);return response.result;
+    }finally{this.intentBusy=false;this.manualTaskRequest=null;this.manualTaskResponse=null;}
   }
   dispose(){if(this.disposed)return;this.disposed=true;this.connectionRevision++;this.registered=false;this.lastValidAt=null;this.registeredIdentity=null;this.controller.lease=null;this.controller.leaseDeadline=0;this.transport.close?.('角色或頁面已離開');}
 }
@@ -4326,15 +4418,20 @@ function nativePartyGoToProof(record,world){
 
 
 class NativePartyGateway {
-  constructor({world,renderer,document,authorize,pending,taskKind='party',now=Date.now,KeyboardEvent=globalThis.KeyboardEvent}){Object.assign(this,{world,renderer,document,authorize,pending,taskKind,now,KeyboardEvent});this.view=createNativePartyView({document,getWorld:world});this.confirmation=createNativeConfirmationView({document,getWorld:world});this.leaveConfirmation=null;this.boundWorld=null;this.off=null;this.invite=null;this.openedAt=-Infinity;this.refresh();}
+  constructor({world,renderer,document,authorize,pending,taskKind='party',now=Date.now,KeyboardEvent=globalThis.KeyboardEvent,onInviteAcknowledged=null}){Object.assign(this,{world,renderer,document,authorize,pending,taskKind,now,KeyboardEvent,onInviteAcknowledged});this.view=createNativePartyView({document,getWorld:world});this.confirmation=createNativeConfirmationView({document,getWorld:world});this.leaveConfirmation=null;this.boundWorld=null;this.off=null;this.invite=null;this.openedAt=-Infinity;this.refresh();}
+  trackInvitation(result,context,world,record){
+    // 送出回呼成功只代表邀請已受理，加入／到齊仍須原生隊伍證據；undefined不當受理。
+    if(typeof result?.then!=='function'){result?.catch?.(()=>{});return;}
+    result.then(value=>{const accepted=value===true||value?.ok===true||value?.success===true;if(!this.onInviteAcknowledged||!accepted||value?.ok===false||value?.success===false||value?.error)return;try{this.guard(context,{allowPending:true});if(this.world()===world&&world.party?.id===record.partyId&&world.party.leaderId===context.characterId)this.onInviteAcknowledged(record);}catch{}},()=>{});
+  }
   refresh(){const world=this.world();if(world===this.boundWorld)return;this.off?.();this.off=null;this.invite=null;this.leaveConfirmation=null;this.openedRemote=null;this.boundWorld=world;if(typeof world?.on==='function')this.off=world.on('partyInvite',value=>{if(world!==this.world()||value?.type!=='invite'||typeof value.fromCharacterId!=='string')return;this.invite={fromCharacterId:value.fromCharacterId,fromName:String(value.fromName??''),fromChannelId:value.fromChannelId??null,receivedAt:this.now()};});}
   guard(context,{city=false,allowPending=false}={}){this.refresh();this.authorize(context,allowPending?{allowPending:true}:{});const world=this.world();if(world!==this.boundWorld||world?.charId!==context?.characterId)throw new ControlError('identity_mismatch','隊伍入口角色或世界已變更');if(world.mode!=='open'||world.dead||world.player?.hp===0||world.isWorldInteractionLocked?.()||world.pendingSkill||world.castingState||world.autoBattle||world.followTarget)throw new ControlError('party_not_ready','目前戰鬥／施法／跟隨或世界狀態不允許隊伍操作');if(city&&!['holy_city','village'].includes(world.regionId))throw new ControlError('party_safe_location','請先在王都或村莊集合，再建立或邀請隊伍');return world;}
   openParty(context){this.guard(context);const entry=this.view.party();if(entry&&typeof entry.props.onClose==='function')return true;if(this.now()-this.openedAt<1200)return false;this.openedAt=this.now();if(typeof entry?.props.onOpen==='function')entry.props.onOpen();else this.view.open();return false;}
   create(context){const world=this.guard(context,{city:true});if(world.party)throw new ControlError('party_exists','目前已有隊伍');const entry=this.view.party();if(!entry){this.openParty(context);return {sent:false,reason:'等待原生建立隊伍入口'};}this.pending({kind:'party-create',taskKind:this.taskKind});this.guard(context,{city:true,allowPending:true});if(this.world()!==world||this.view.party()?.props!==entry.props)throw new ControlError('identity_mismatch','保存後隊伍入口已變');entry.props.onCreate();return {sent:true};}
-  inviteMember(context,characterId){const world=this.guard(context,{city:true});if(world.party?.leaderId!==world.charId)throw new ControlError('party_leader_required','只有原生隊長能邀請');if(typeof characterId!=='string'||!characterId||characterId===world.charId)throw new ControlError('party_target_unknown','指定原生角色ID無效');const remote=world.remotes?.[characterId];if(!remote?.name||remote.regionId&&remote.regionId!==world.regionId){const friend=this.view.friend(characterId);if(!friend){if(this.now()-this.openedAt>=1200){this.openedAt=this.now();const menu=createNativeMenuView({document:this.document,targetId:'friend',verify:()=>this.guard(context,{city:true})});if(!menu.open())menu.prepare();}return {sent:false,reason:'等待指定角色原生好友邀請入口（可跨分線）'};}const partyId=world.party.id;this.pending({kind:'party-invite',taskKind:this.taskKind,targetCharacterId:characterId,partyId,sourceEntry:'native-friend'});this.guard(context,{city:true,allowPending:true});const fresh=this.view.friend(characterId);if(this.world()!==world||world.party?.id!==partyId||!fresh||fresh.entry.props.onInvite!==friend.entry.props.onInvite||fresh.signature!==friend.signature)throw new ControlError('identity_mismatch','保存後好友身分／在線或隊伍已變');const result=fresh.entry.props.onInvite(characterId);result?.catch?.(()=>{});return {sent:true};}if(!characterId||characterId===world.charId||!remote?.name||remote.regionId&&remote.regionId!==world.regionId)throw new ControlError('party_target_unknown','邀請對象缺少目前原生同地圖資料');if(Object.values(world.remotes??{}).filter(value=>value?.name===remote.name).length!==1)throw new ControlError('party_target_ambiguous','原生玩家名稱重複，不能核對名片');
+  inviteMember(context,characterId){const world=this.guard(context,{city:true});if(world.party?.leaderId!==world.charId)throw new ControlError('party_leader_required','只有原生隊長能邀請');if(typeof characterId!=='string'||!characterId||characterId===world.charId)throw new ControlError('party_target_unknown','指定原生角色ID無效');const remote=world.remotes?.[characterId];if(!remote?.name||remote.regionId&&remote.regionId!==world.regionId){const friend=this.view.friend(characterId);if(!friend){if(this.now()-this.openedAt>=1200){this.openedAt=this.now();const menu=createNativeMenuView({document:this.document,targetId:'friend',verify:()=>this.guard(context,{city:true})});if(!menu.open())menu.prepare();}return {sent:false,reason:'等待指定角色原生好友邀請入口（可跨分線）'};}const partyId=world.party.id;this.pending({kind:'party-invite',taskKind:this.taskKind,targetCharacterId:characterId,partyId,sourceEntry:'native-friend'});this.guard(context,{city:true,allowPending:true});const fresh=this.view.friend(characterId);if(this.world()!==world||world.party?.id!==partyId||!fresh||fresh.entry.props.onInvite!==friend.entry.props.onInvite||fresh.signature!==friend.signature)throw new ControlError('identity_mismatch','保存後好友身分／在線或隊伍已變');const result=fresh.entry.props.onInvite(characterId);this.trackInvitation(result,context,world,{kind:'party-invite',targetCharacterId:characterId,partyId});return {sent:true};}if(!characterId||characterId===world.charId||!remote?.name||remote.regionId&&remote.regionId!==world.regionId)throw new ControlError('party_target_unknown','邀請對象缺少目前原生同地圖資料');if(Object.values(world.remotes??{}).filter(value=>value?.name===remote.name).length!==1)throw new ControlError('party_target_ambiguous','原生玩家名稱重複，不能核對名片');
     const renderer=this.renderer();if(renderer?.world!==world||typeof renderer.onRemoteClick!=='function')throw new ControlError('party_entry_unavailable','原生玩家選單入口不可用');
     const entry=this.view.remote(characterId);if(!entry||this.openedRemote?.world!==world||this.openedRemote?.id!==characterId||this.now()-this.openedRemote.at>10000){renderer.onRemoteClick(characterId);this.openedRemote={world,id:characterId,at:this.now()};return {sent:false,reason:'已用原生角色ID開啟玩家選單'};}
-    this.pending({kind:'party-invite',taskKind:this.taskKind,targetCharacterId:characterId,partyId:world.party.id});this.guard(context,{city:true,allowPending:true});if(this.world()!==world||this.view.remote(characterId)?.props!==entry.props)throw new ControlError('identity_mismatch','保存後邀請對象已變');entry.props.onInvite();return {sent:true};
+    this.pending({kind:'party-invite',taskKind:this.taskKind,targetCharacterId:characterId,partyId:world.party.id});this.guard(context,{city:true,allowPending:true});if(this.world()!==world||this.view.remote(characterId)?.props!==entry.props)throw new ControlError('identity_mismatch','保存後邀請對象已變');const result=entry.props.onInvite();this.trackInvitation(result,context,world,{kind:'party-invite',targetCharacterId:characterId,partyId:world.party.id});return {sent:true};
   }
   accept(context,leaderCharacterId){const world=this.guard(context);const invitation=this.invite;if(world.party)throw new ControlError('party_exists','目前已有隊伍，不能直接接受另一隊伍');if(!invitation||invitation.fromCharacterId!==leaderCharacterId||this.now()-invitation.receivedAt>30000) return {sent:false,reason:'等待指定原生隊長邀請事件'};
     const entry=this.view.invitation(invitation);if(!entry)return {sent:false,reason:'等待目前世界中指定ID的原生邀請'};
@@ -4419,12 +4516,23 @@ function createPartyNativeTravel({host,getContext,getWorld,document,page,request
 
 
 
+
+function validatePartyAssemblySettings(value,owner=null){
+  const keys=['action','groupId','leaderCharacterId','members','allowRegroup','role','waitForAll','waitMinutes','purpose','meetingRegionId','meetingChannel'];
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!keys.includes(key))||value.action!=='assemble'||typeof value.groupId!=='string'||!value.groupId||value.groupId.length>100||typeof value.leaderCharacterId!=='string'||!value.leaderCharacterId||!Array.isArray(value.members)||!value.members.length||value.members.length>4||value.members.some(id=>typeof id!=='string'||!id)||new Set(value.members).size!==value.members.length||!value.members.includes(value.leaderCharacterId)||value.allowRegroup!==true||!['leader','member'].includes(value.role)||typeof value.waitForAll!=='boolean'||!Number.isInteger(value.waitMinutes)||value.waitMinutes<1||value.waitMinutes>60||!['battle','dungeon'].includes(value.purpose)||value.meetingRegionId!=='village'||value.meetingChannel!==10)throw new ControlError('invalid_party_members','集合需指定最多四名成員、隊長與CH.10曙光村');
+  if(owner&&(!value.members.includes(owner)||(value.role==='leader')!==(value.leaderCharacterId===owner)))throw new ControlError('party_role_missing','隊伍身分與鎖定隊長不一致');return true;
+}
+function partyAssemblyReady(world,plan){
+  const party=world?.party;if(world?.regionId!=='village'||nativeChannelNumber(world.selfPartyChannelId??world.channelId)!==10||party?.leaderId!==plan.leaderCharacterId||!Array.isArray(party.members)||party.members.length!==plan.members.length||new Set(party.members.map(p=>p.characterId)).size!==party.members.length)return false;
+  return plan.members.every(id=>party.members.some(p=>p.characterId===id&&p.online===true&&p.dead!==true&&p.regionId==='village'&&nativeChannelNumber(p.crossChannel?p.crossChannelId:p.channelId)===10));
+}
 function normalizePartyCommand(payload,action){const leader=payload.leaderCharacterId??payload.leader?.characterId;if(action==='ensure'&&(!leader||!Array.isArray(payload.members)||payload.members.some(member=>typeof member!=='object'||typeof member.characterId!=='string')))throw new ControlError('role_bindings_required','核心隊伍角色需附已核對的原生characterId');return action==='ensure'?{action,groupId:payload.groupId,leaderCharacterId:leader,members:payload.members.map(member=>member.characterId),allowRegroup:payload.allowRegroup===true}:{action,groupId:payload.groupId??'rendezvous',...(payload.location?{location:structuredClone(payload.location)}:{targetCharacterId:payload.targetCharacterId??payload.target?.characterId})};}
 function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardEvent=globalThis.KeyboardEvent,page=null,readWorldState=null}){
-  let context=null,plan=null,state='idle',message='尚未開始隊伍任務',deadline=0,completedAt=null,channelAlias=null,travelDestination=null;
-  const gateway=new NativePartyGateway({world,renderer,document,now,KeyboardEvent,authorize:(ctx,options)=>host.assert(ctx,options),pending:value=>host.pending(value)});
-  const travel=createPartyNativeTravel({host,getContext:()=>context,getWorld:world,document,page,readWorldState,requestMap:()=>gateway.openMap(context),isRunning:()=>['running','waiting','reconciling'].includes(state)&&now()<deadline,verifyOperation:ctx=>gateway.guard(ctx,{allowPending:true}),now});
-  function validate(settings){const keys=['action','groupId','leaderCharacterId','members','allowRegroup','targetCharacterId','timeoutMs','location'];if(!settings||typeof settings!=='object'||Array.isArray(settings)||Object.keys(settings).some(key=>!keys.includes(key))||!['ensure','rendezvous'].includes(settings.action)||typeof settings.groupId!=='string'||!settings.groupId||settings.groupId.length>100)throw new ControlError('invalid_party_plan','隊伍目標格式無效');
+  let context=null,plan=null,state='idle',message='尚未開始隊伍任務',deadline=0,completedAt=null,channelAlias=null,travelDestination=null,assemblyWaitAt=null,departureSeenAt=null,assemblyArrived=false,assemblySearchIndex=0,assemblySearched=new Set(),assemblyInvited=new Set(),assemblyInviteAt=new Map();
+  const gateway=new NativePartyGateway({world,renderer,document,now,KeyboardEvent,authorize:(ctx,options)=>host.assert(ctx,options),pending:value=>host.pending(value),onInviteAcknowledged:record=>{const pending=host.currentPending();if(plan?.action==='assemble'&&pending?.kind==='party-invite'&&pending.partyId===record.partyId&&pending.targetCharacterId===record.targetCharacterId){assemblyInvited.add(record.targetCharacterId);assemblyInviteAt.set(record.targetCharacterId,now());host.pending(null);}}});
+  const travel=createPartyNativeTravel({host,getContext:()=>context,getWorld:world,document,page,readWorldState,requestMap:()=>gateway.openMap(context),isRunning:()=>['running','waiting','reconciling'].includes(state)&&(plan?.action==='assemble'||now()<deadline),verifyOperation:ctx=>gateway.guard(ctx,{allowPending:true}),now});
+  const homeView=createNativeHomeView({document,getWorld:world,characterId:host.characterId,verify:()=>gateway.guard(context,{allowPending:true})});
+  function validate(settings){if(settings?.action==='assemble')return validatePartyAssemblySettings(settings);const keys=['action','groupId','leaderCharacterId','members','allowRegroup','targetCharacterId','timeoutMs','location'];if(!settings||typeof settings!=='object'||Array.isArray(settings)||Object.keys(settings).some(key=>!keys.includes(key))||!['ensure','rendezvous'].includes(settings.action)||typeof settings.groupId!=='string'||!settings.groupId||settings.groupId.length>100)throw new ControlError('invalid_party_plan','隊伍目標格式無效');
     if(settings.action==='ensure'){if(typeof settings.leaderCharacterId!=='string'||!settings.leaderCharacterId||!Array.isArray(settings.members)||!settings.members.length||settings.members.length>4||settings.members.some(id=>typeof id!=='string'||!id)||new Set(settings.members).size!==settings.members.length||!settings.members.includes(settings.leaderCharacterId)||typeof settings.allowRegroup!=='boolean')throw new ControlError('invalid_party_members','需明確原生隊長與最多四名唯一角色');}
     else if(settings.location){const loc=settings.location;if(typeof loc!=='object'||Array.isArray(loc)||Object.keys(loc).some(key=>!['regionId','channelId','instanceId','x','y','radius','roomNumber'].includes(key))||typeof loc.regionId!=='string'||!loc.regionId||!['string','number'].includes(typeof loc.channelId)||!String(loc.channelId)||!Object.hasOwn(loc,'instanceId')||loc.instanceId!==null&&typeof loc.instanceId!=='string'||![loc.x,loc.y].every(value=>typeof value==='number'&&Number.isFinite(value)&&value>=0)||loc.radius!==undefined&&(!Number.isFinite(loc.radius)||loc.radius<1||loc.radius>100)||loc.roomNumber!==undefined&&(!Number.isInteger(loc.roomNumber)||loc.roomNumber<1))throw new ControlError('invalid_rendezvous','固定位置需完整原生地圖／分線／房間與有效座標');}
     else if(typeof settings.targetCharacterId!=='string'||!settings.targetCharacterId)throw new ControlError('invalid_rendezvous','需指定原生會合角色ID');if(settings.timeoutMs!==undefined&&(!Number.isInteger(settings.timeoutMs)||settings.timeoutMs<10000||settings.timeoutMs>600000))throw new ControlError('invalid_party_timeout','隊伍等待期限無效');return true;
@@ -4436,6 +4544,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     if(pending.kind==='party-leave')confirmed=w.party===null;
     if(pending.kind==='party-invite')confirmed=w.party?.id===pending.partyId&&w.party.members?.some(member=>member.characterId===pending.targetCharacterId);
     if(pending.kind==='party-accept')confirmed=w.party?.leaderId===pending.leaderCharacterId&&w.party.members?.some(member=>member.characterId===w.charId);
+    if(pending.kind==='party-home-leave')confirmed=!['player_home','player_home_garden'].includes(w.regionId)&&w.mode==='open'&&w.isWorldInteractionLocked?.()===false;
     if(pending.kind==='party-rendezvous')confirmed=arrivalEvidence(pending);
     if(pending.kind==='party-channel'){if(pending.nativeNavigation){try{const current=readNativeChannelSnapshot(w);confirmed=current.ready&&current.regionId===pending.regionId&&current.channelId===pending.nativeChannelId&&current.instanceId===pending.instanceId;}catch{}}else confirmed=[pending.channelId,pending.nativeChannelId].includes(gateway.readChannel());if(confirmed)channelAlias=gateway.readChannel();}
     if(pending.kind==='party-travel')confirmed=w.regionId===pending.regionId&&!w.isWorldInteractionLocked?.();
@@ -4444,6 +4553,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     if(confirmed)host.pending(null);return {confirmed:Boolean(confirmed),evidence:confirmed?'原生隊伍／場景回讀已確認':null};
   }
   function tick(){if(!context||!['running','waiting','reconciling'].includes(state)||!host.canOperate(context))return;const pending=host.currentPending();if(pending?.kind==='party-travel'&&pending.nativeTravel===true)return travelTick(true);if(travelDestination&&!pending)return travelTick();if(pending){if(!reconcile(pending).confirmed){state='reconciling';message='隊伍操作已送出，等待原生回讀，不重送';if(pending.kind==='party-leave')gateway.confirmLeave(context,pending);return;}}
+    if(plan.action==='assemble'){try{return assemblyTick();}catch(error){if(['party_target_unknown','party_entry_unavailable','party_safe_location','party_not_ready','party_garden_target'].includes(error.code)){state='waiting';message=error.message;}else{state=host.currentPending()?'reconciling':'failed';message=error.message;}return;}}
     if(now()>=deadline){state='failed';message='隊伍目標未於期限內確認，保留目前隊伍';return;}const w=world();
     try{if(plan.action==='rendezvous'){if(plan.location&&w.regionId!==plan.location.regionId&&gateway.readChannel()===String(nativeChannelNumber(plan.location.channelId)))return travelTick();const result=plan.location?gateway.position(context,plan.location,channelAlias):gateway.rendezvous(context,plan.targetCharacterId);if(result.arrived){state='completed';completedAt=now();message=plan.location?'已由原生地圖／分線／房間與座標確認會合':'已由原生地圖／分線／房間確認會合';}else{state='waiting';message=result.reason??'已送出會合操作，等待原生場景';}return;}
       if(groupEvidence()){state='completed';completedAt=now();message='指定原生隊長與全部成員已確認';return;}
@@ -4452,39 +4562,108 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
       else{const result=gateway.accept(context,plan.leaderCharacterId);message=result.reason??'已接受指定隊長，等待原生隊伍';}state='waiting';
     }catch(error){if(['party_target_unknown','party_entry_unavailable','party_safe_location','party_not_ready','party_garden_target'].includes(error.code)){state='waiting';message=error.message;}else{state='failed';message=error.message;}}
   }
-  async function travelTick(readOnly=false){const current=context;if(travel.busy())return;try{travelDestination=plan.location.regionId;let result=readOnly?await travel.reconcile():await travel.travel(travelDestination);if(readOnly&&result.confirmed)result=await travel.travel(travelDestination);if(current!==context||!['running','waiting','reconciling'].includes(state))return;state='waiting';message=result.message??'等待原生世界與伺服器傳送核對';if(result.state==='arrived'){travelDestination=null;return tick();}}catch(error){if(current===context&&['running','waiting','reconciling'].includes(state)){state=host.currentPending()?'reconciling':'failed';message=error.message;}}}
+  function completeAssembly(text){state='completed';completedAt=now();message=text;}
+  function assemblyTick(){
+    const w=gateway.guard(context);state='waiting';
+    const inHome=['player_home','player_home_garden'].includes(w.regionId);
+    if(assemblyArrived&&(w.charId===plan.leaderCharacterId||departureSeenAt===null||inHome)&&(w.regionId!=='village'||gateway.readChannel()!=='10')){assemblyArrived=false;assemblyWaitAt=null;assemblySearched.clear();}
+    if(w.party&&(w.party.leaderId!==plan.leaderCharacterId||w.party.members?.some(p=>!plan.members.includes(p.characterId)))){const result=gateway.leave(context,{allowRegroup:true});message=result.sent?'已要求離開不符隊伍，等待原生確認':'等待原生離隊入口';return;}
+    if(!assemblyArrived){
+      if(['player_home','player_home_garden'].includes(w.regionId)){host.pending({kind:'party-home-leave',taskKind:'party',fromRegionId:w.regionId});if(world()!==w)throw new ControlError('identity_changed','離家前角色世界已更換');homeView.leave();message='已使用庭園頂部離開家園，等待原生返回';return;}
+      if(gateway.readChannel()!=='10'){const result=gateway.switchPosition(context,{channelId:10},'channel');message=result.reason??'等待切換CH.10';return;}
+      if(w.regionId!=='village'){travelDestination='village';void travelTick();message='前往CH.10曙光村集合';return;}
+      assemblyArrived=true;assemblyWaitAt=null;
+    }
+    if(w.charId===plan.leaderCharacterId){
+      if(!w.party){const result=gateway.create(context);message=result.reason??'已建立隊伍，等待原生確認';return;}
+      for(const p of w.party.members??[])assemblyInvited.add(p.characterId);
+      if(partyAssemblyReady(w,plan)){completeAssembly('全員已於CH.10曙光村集合，隊長可以出發');return;}
+      const searched=plan.members.every(id=>assemblyInvited.has(id)||assemblySearched.has(id));
+      if(searched&&assemblyWaitAt===null)assemblyWaitAt=now();
+      if(!plan.waitForAll&&searched&&now()-assemblyWaitAt>=plan.waitMinutes*60000){completeAssembly('集合等待已到，帶目前已確認成員出發');return;}
+      // 只重試已明確受理且逾原邀請有效期的缺席成員；未明邀請仍由pending阻止重送。
+      for(const id of plan.members)if(id!==w.charId&&!w.party.members.some(p=>p.characterId===id)&&assemblyInviteAt.has(id)&&now()-assemblyInviteAt.get(id)>=35000){assemblyInvited.delete(id);assemblyInviteAt.delete(id);}
+      const missing=plan.members.filter(id=>id!==w.charId&&!assemblyInvited.has(id));
+      if(missing.length){const target=missing[assemblySearchIndex++%missing.length],result=gateway.inviteMember(context,target);assemblySearched.add(target);message=result.reason??'已邀請指定成員，等待原生受理或加入';return;}
+      message=plan.waitForAll?'等待所有指定成員到齊；缺員留在曙光村':'等待成員集合，最多'+plan.waitMinutes+'分鐘';return;
+    }
+    if(!w.party){const result=gateway.accept(context,plan.leaderCharacterId);message=result.reason??'已接受指定隊長邀請，等待原生確認';return;}
+    if(plan.purpose==='dungeon'){completeAssembly('已在CH.10曙光村加入指定隊長，等待副本開場');return;}
+    const leader=w.party.members?.find(p=>p.characterId===plan.leaderCharacterId);
+    if(!leader||leader.online!==true||leader.dead===true||!leader.regionId||['player_home','player_home_garden'].includes(leader.regionId)){departureSeenAt=null;message='等待隊長的原生位置';return;}
+    const leaderChannel=nativeChannelNumber(leader.crossChannel?leader.crossChannelId:leader.channelId);if(leaderChannel===null){departureSeenAt=null;message='隊長分線未確認，等待原生位置';return;}
+    const departed=leader.regionId!=='village'||leaderChannel!==10;
+    if(!departed){departureSeenAt=null;message='已集合，等待隊長出發';return;}
+    departureSeenAt??=now();if(now()-departureSeenAt<5000){message='隊長已出發，等待五秒後跟隨';return;}
+    const result=gateway.rendezvous(context,plan.leaderCharacterId);if(result.arrived){completeAssembly('已在隊長出發五秒後依原生位置完成跟隨');return;}message=result.reason??'已前往隊長，等待原生地圖／分線確認';
+  }
+  async function travelTick(readOnly=false){const current=context;if(travel.busy())return;try{travelDestination=plan.action==='assemble'?'village':plan.location.regionId;let result=readOnly?await travel.reconcile():await travel.travel(travelDestination);if(readOnly&&result.confirmed)result=await travel.travel(travelDestination);if(current!==context||!['running','waiting','reconciling'].includes(state))return;state='waiting';message=result.message??'等待原生世界與伺服器傳送核對';if(result.state==='arrived'){travelDestination=null;return tick();}}catch(error){if(current===context&&['running','waiting','reconciling'].includes(state)){state=host.currentPending()?'reconciling':'failed';message=error.message;}}}
   function observe(){gateway.refresh();return {state,phase:plan?.action??'idle',message,runId:context?.runId??null,groupId:plan?.groupId??null,desiredLeaderCharacterId:plan?.leaderCharacterId??null,members:structuredClone(world()?.party?.members??null),pending:host.currentPending()};}
   return {kind:'party',validate,observe,tick,getSettings:()=>plan??{action:'ensure',groupId:'local-'+host.characterId,leaderCharacterId:host.characterId,members:[host.characterId],allowRegroup:false},
-    start(ctx){validate(ctx.settings);host.assert(ctx);if(ctx.settings.action==='ensure'&&!ctx.settings.members.includes(ctx.characterId))throw new ControlError('party_role_missing','目前原生角色不在指定隊伍名單');context=ctx;plan=structuredClone(ctx.settings);channelAlias=null;travelDestination=null;state='running';deadline=now()+(plan.timeoutMs??120000);completedAt=null;gateway.refresh();return tick();},
-    pause(ctx){host.assert(ctx,{allowPending:true});const w=world();if(travel.busy()||host.currentPending()||w?.mode!=='open'||w.autoBattle||w.followTarget||w.castingState||w.pendingSkill||w.isWorldInteractionLocked?.())return {safe:false};state='paused';return {safe:true,checkpointId:ctx.runId+'-party-'+now(),sourceVersion:'1',sourceCheckpoint:{plan:structuredClone(plan),channelAlias,travelDestination,remainingMs:Math.max(0,deadline-now())}};},
+    start(ctx){validate(ctx.settings);host.assert(ctx);if(ctx.settings.action==='assemble')validatePartyAssemblySettings(ctx.settings,ctx.characterId);if(ctx.settings.action==='ensure'&&!ctx.settings.members.includes(ctx.characterId))throw new ControlError('party_role_missing','目前原生角色不在指定隊伍名單');context=ctx;plan=structuredClone(ctx.settings);channelAlias=null;travelDestination=null;assemblyWaitAt=null;departureSeenAt=null;assemblyArrived=false;assemblySearchIndex=0;assemblySearched=new Set();assemblyInvited=new Set();assemblyInviteAt=new Map();state='running';deadline=now()+(plan.timeoutMs??120000);completedAt=null;gateway.refresh();return tick();},
+    pause(ctx){host.assert(ctx,{allowPending:true});const w=world();if(travel.busy()||host.currentPending()||w?.mode!=='open'||w.autoBattle||w.followTarget||w.castingState||w.pendingSkill||w.isWorldInteractionLocked?.())return {safe:false};state='paused';return {safe:true,checkpointId:ctx.runId+'-party-'+now(),sourceVersion:'1',sourceCheckpoint:{plan:structuredClone(plan),channelAlias,travelDestination,assemblyWaitAt,departureSeenAt,assemblyElapsedMs:assemblyWaitAt===null?null:Math.max(0,now()-assemblyWaitAt),departureElapsedMs:departureSeenAt===null?null:Math.max(0,now()-departureSeenAt),assemblyArrived,assemblySearchIndex,assemblySearched:[...assemblySearched],assemblyInvited:[...assemblyInvited],assemblyInviteAges:[...assemblyInviteAt].map(([id,at])=>[id,Math.max(0,now()-at)]),remainingMs:Math.max(0,deadline-now())}};},
     stop(){travel.cancel();travelDestination=null;const pending=host.currentPending();if(gateway.releaseMovement()&&pending?.kind==='party-move')host.pending({...pending,cancelled:true});state='stopped';message='隊伍任務已停止，原生隊伍與未明紀錄保留';},
-    resume(ctx,checkpoint){if(checkpoint.sourceVersion!=='1'||!checkpoint.sourceCheckpoint)throw new ControlError('invalid_party_checkpoint','隊伍接續快照無效');validate(checkpoint.sourceCheckpoint.plan);context=ctx;host.assert(ctx);plan=structuredClone(checkpoint.sourceCheckpoint.plan);channelAlias=checkpoint.sourceCheckpoint.channelAlias??null;travelDestination=checkpoint.sourceCheckpoint.travelDestination??null;deadline=now()+checkpoint.sourceCheckpoint.remainingMs;state='running';gateway.refresh();tick();},
+    resume(ctx,checkpoint){if(checkpoint.sourceVersion!=='1'||!checkpoint.sourceCheckpoint)throw new ControlError('invalid_party_checkpoint','隊伍接續快照無效');const savedPlan=checkpoint.sourceCheckpoint.plan;validate(savedPlan);if(savedPlan.action==='assemble')validatePartyAssemblySettings(savedPlan,ctx.characterId);if(savedPlan.action==='ensure'&&!savedPlan.members.includes(ctx.characterId))throw new ControlError('party_role_missing','目前原生角色不在指定隊伍名單');host.assert(ctx);context=ctx;plan=structuredClone(savedPlan);channelAlias=checkpoint.sourceCheckpoint.channelAlias??null;travelDestination=checkpoint.sourceCheckpoint.travelDestination??null;assemblyWaitAt=Number.isFinite(checkpoint.sourceCheckpoint.assemblyElapsedMs)?now()-checkpoint.sourceCheckpoint.assemblyElapsedMs:checkpoint.sourceCheckpoint.assemblyWaitAt??null;departureSeenAt=Number.isFinite(checkpoint.sourceCheckpoint.departureElapsedMs)?now()-checkpoint.sourceCheckpoint.departureElapsedMs:checkpoint.sourceCheckpoint.departureSeenAt??null;assemblyArrived=checkpoint.sourceCheckpoint.assemblyArrived===true;assemblySearchIndex=checkpoint.sourceCheckpoint.assemblySearchIndex??0;assemblySearched=new Set(checkpoint.sourceCheckpoint.assemblySearched??[]);assemblyInvited=new Set(checkpoint.sourceCheckpoint.assemblyInvited??[]);assemblyInviteAt=new Map((checkpoint.sourceCheckpoint.assemblyInviteAges??[]).filter(([id,age])=>plan.members.includes(id)&&Number.isFinite(age)&&age>=0).map(([id,age])=>[id,now()-age]));deadline=now()+checkpoint.sourceCheckpoint.remainingMs;state='running';gateway.refresh();tick();},
     captureLocation(){const w=world();if(w?.charId!==host.characterId)throw new ControlError('identity_mismatch','記錄位置的原生角色不符');const channel=gateway.readChannel();if(channel===null)throw new ControlError('location_unknown','請先開啟原生地圖讀取目前分線');const location={regionId:w.regionId,channelId:channel,instanceId:w.instanceId||null,x:w.player?.x,y:w.player?.y,radius:30};if(location.instanceId){location.roomNumber=gateway.readRoom();if(location.roomNumber===null)throw new ControlError('location_unknown','目前原生場次不是可記錄的裂痕房間');}validate({action:'rendezvous',groupId:'record-location',location});return location;},
     reconcile,result:()=>({confirmed:state==='completed'&&completedAt!==null,groupId:plan?.groupId??null,completedAt,reason:message,evidence:state==='completed'?message:null}),dispose:()=>{travel.cancel();gateway.stop();}};
 }
 
 
 
-function showPartyPanel({document,world,start,captureLocation,readLocation=()=>null,writeLocation=()=>{},writeRoutineTeam=()=>{},mountPanel}){const current=world();if(!current?.charId)throw new Error('等待原生角色載入');const owner=current.charId;
-  document.getElementById(PREFIX+'-party')?.remove();const panel=document.createElement('section');panel.id=PREFIX+'-party';panel.style.cssText='position:fixed;left:10vw;top:15vh;width:430px;max-width:80vw;max-height:75vh;overflow:auto;z-index:2147483647;background:#17212f;color:white;padding:18px;border:1px solid #8194ad;border-radius:10px;font:14px/1.6 system-ui';
-  const title=document.createElement('strong');title.textContent='指定隊伍與會合';const note=document.createElement('p');note.textContent='依目前原生隊伍與同地圖玩家列出角色；名字只供顯示，操作使用原生角色ID。建隊／邀請請先在王都或村莊集合。';const leader=document.createElement('select');leader.title='指定原生隊長';const destination=document.createElement('select');destination.title='指定會合隊員';const list=document.createElement('div'),status=document.createElement('p'),actions=document.createElement('div');
-  const people=new Map(Object.entries(current.remotes??{}).filter(([,p])=>p?.name).map(([id,p])=>[id,p.name]));for(const member of current.party?.members??[])if(member.characterId&&member.name)people.set(member.characterId,member.name);people.set(owner,current.player?.name??'目前角色');const checks=[];
-  for(const [id,name]of people){for(const select of [leader,destination]){const option=document.createElement('option');option.value=id;option.textContent=name;select.append(option);}const row=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.checked=id===owner;row.textContent=name;row.style.display='block';row.append(check);list.append(row);checks.push({id,check});}leader.value=current.party?.leaderId??owner;destination.value=current.party?.leaderId??owner;
-  const regroup=document.createElement('input');regroup.type='checkbox';const allow=document.createElement('label');allow.textContent='允許先離開不符的舊隊伍再重組';allow.append(regroup);panel.append(title,note,leader,list,allow,destination,status,actions);if(mountPanel)mountPanel(panel);else document.documentElement.append(panel);
-  function button(label,handler){const b=document.createElement('button');b.textContent=label;b.addEventListener('click',()=>Promise.resolve().then(()=>{if(world()?.charId!==owner)throw new Error('角色已切換，請重新開啟队伍視窗');return handler();}).then(result=>status.textContent=typeof result==='string'?result:'隊伍任務已交由主面板處理，成功以原生回讀確認。').catch(error=>status.textContent=error.message));actions.append(b);}
-  button('建立指定隊伍',()=>{const members=[...new Set([owner,leader.value,...checks.filter(item=>item.check.checked).map(item=>item.id)])];return start({action:'ensure',groupId:'local-'+leader.value,leaderCharacterId:leader.value,members,allowRegroup:regroup.checked});});
-  button('保存為日常交接隊伍',()=>{const groupId='local-'+leader.value,members=[...new Set([owner,leader.value,...checks.filter(item=>item.check.checked).map(item=>item.id)])],location=readLocation();writeRoutineTeam({ensure:{action:'ensure',groupId,leaderCharacterId:leader.value,members,allowRegroup:regroup.checked},...(location?{rendezvous:{action:'rendezvous',groupId,location}}:{})});return '已保存指定隊伍與目前已記錄的位置；下次啟動日常流程後，每日或種植完成時先核對隊伍再返場。';});
-  button('取消日常交接隊伍',()=>{writeRoutineTeam(null);return '下次啟動日常不安排隊伍交接，目前日常快照不改動。';});
-  button('前往指定隊員',()=>start({action:'rendezvous',groupId:'local-'+(current.party?.leaderId??owner),targetCharacterId:destination.value}));
-  button('記錄目前會合位置',()=>{writeLocation(captureLocation());return '目前原生會合位置已保存，尚未發出前往操作。';});
-  button('前往已記錄位置',()=>{const location=readLocation();if(!location)throw new Error('尚未記錄會合位置');return start({action:'rendezvous',groupId:'local-position-'+owner,location});});button('關閉',()=>panel.remove());return panel;
+
+function showPartyPanel({document,world,start,readTeam=()=>null,readNames=()=>({}),writeRoutineTeam=()=>{},purpose='battle',mountPanel}){
+ const current=world();if(!current?.charId)throw new Error('等待原生角色載入');const owner=current.charId,saved=readTeam()?.ensure;
+ document.getElementById(PREFIX+'-party')?.remove();const make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;},panel=make('section');panel.id=PREFIX+'-party';panel.style.cssText='color:white;font:13px/1.5 system-ui';
+ const heading=make('strong','指定隊伍與會合'),status=make('p'),enabled=make('input');enabled.type='checkbox';enabled.checked=Boolean(saved);const enabledLabel=make('label','啟用組隊 ');enabledLabel.append(enabled);
+ const role=make('select');role.title='隊伍身分';for(const [value,label]of [['leader','隊長'],['member','隊員']]){const option=make('option',label);option.value=value;role.append(option);}const roleLabel=make('label','隊伍身分：');roleLabel.append(role);
+ const people=new Map(Object.entries(readNames()).filter(([id,name])=>id&&typeof name==='string'&&name));for(const [id,p]of Object.entries(current.remotes??{}))if(p?.name)people.set(id,p.name);for(const p of current.party?.members??[])if(p.characterId&&p.name)people.set(p.characterId,p.name);people.set(owner,current.player?.name??'目前角色');for(const id of saved?.members??[])if(!people.has(id))people.set(id,'已保存成員（待讀取名稱）');
+ const selected=new Set(saved?.members??[owner]);selected.add(owner);const picker=make('select');picker.title='選擇地圖角色';const empty=make('option','選擇角色');empty.value='';picker.append(empty);for(const [id,name]of people){const option=make('option',name);option.value=id;picker.append(option);}const pickerLabel=make('label','地圖角色：');pickerLabel.append(picker);const list=make('div'),leader=make('select');leader.title='鎖定隊長';let desiredLeader=saved?.leaderCharacterId??owner;selected.add(desiredLeader);
+ function renderMembers(){list.replaceChildren();leader.replaceChildren();for(const [id,name]of people){const label=make('label',name+' '),check=make('input');check.type='checkbox';check.checked=selected.has(id);check.disabled=id===owner;label.style.cssText='display:inline-flex;align-items:center;margin:3px 10px 3px 0;gap:3px';label.append(check);list.append(label);check.onchange=()=>{if(check.checked&&selected.size>=4){check.checked=false;status.textContent='隊伍最多四人，包含本人與隊長。';return;}if(check.checked)selected.add(id);else selected.delete(id);if(!selected.has(desiredLeader))desiredLeader=owner;renderMembers();};if(selected.has(id)){const option=make('option',name);option.value=id;leader.append(option);}}leader.value=desiredLeader;role.value=desiredLeader===owner?'leader':'member';}
+ picker.onchange=()=>{if(picker.value){if(!selected.has(picker.value)&&selected.size>=4){status.textContent='隊伍最多四人。';return;}selected.add(picker.value);renderMembers();}picker.value='';};leader.onchange=()=>{desiredLeader=leader.value;role.value=desiredLeader===owner?'leader':'member';};role.onchange=()=>{if(role.value==='leader')desiredLeader=owner;else if(desiredLeader===owner)desiredLeader=[...selected].find(id=>id!==owner)??owner;renderMembers();if(selected.size===1)status.textContent='請勾選隊友並指定隊長，才能設定為隊員。';};
+ const leaderLabel=make('label','隊長：');leaderLabel.append(leader);const full=make('input');full.type='checkbox';full.checked=saved?.waitForAll!==false;const fullLabel=make('label','集合完整再出發 ');fullLabel.append(full);const wait=make('input');wait.type='number';wait.min='1';wait.max='60';wait.value=String(saved?.waitMinutes??3);wait.title='集合等待分鐘';wait.style.width='52px';const waitLabel=make('label','等待 ');waitLabel.append(wait,make('span',' 分鐘'));
+ const first=make('div');first.style.cssText='display:flex;gap:12px;align-items:center;flex-wrap:wrap';first.append(enabledLabel,roleLabel);const timing=make('div');timing.style.cssText='display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px';timing.append(fullLabel,waitLabel);
+ const note=make('p',purpose==='dungeon'?'集合固定為 CH.10 曙光村；啟用後會離開不符的舊隊伍重組，副本在曙光村開場。':'集合固定為 CH.10 曙光村；啟用後會離開不符的舊隊伍重組。隊長出發後，隊員等待五秒再前往隊長。'),policy=make('p','勾選完整集合：缺員時留在集合地點，等待後繼續核對。未勾選：邀請後最多等待設定分鐘數，帶已確認成員出發。');policy.style.cssText='font-size:12px;color:#cbd5e1';const actions=make('div'),save=make('button','儲存'),close=make('button','關閉');save.setAttribute('data-assistant-save','');close.setAttribute('data-assistant-close','');
+ function settings(){const result={action:'assemble',groupId:'local-'+leader.value,leaderCharacterId:leader.value,members:[...selected],allowRegroup:true,role:leader.value===owner?'leader':'member',waitForAll:full.checked,waitMinutes:Number(wait.value),purpose,meetingRegionId:'village',meetingChannel:10};validatePartyAssemblySettings(result,owner);return result;}
+ save.onclick=()=>{try{if(world()?.charId!==owner)throw new Error('角色已切換，請重新開啟設定');writeRoutineTeam(enabled.checked?{ensure:settings()}:null,Object.fromEntries(people));status.textContent='已保存；下次啟動任務採用，現有任務不變。';}catch(error){status.textContent=error.message;}};close.onclick=()=>panel.remove();actions.append(save,close);panel.append(heading,first,note,pickerLabel,list,leaderLabel,timing,policy,status,actions);renderMembers();
+ if(start){const test=make('button','立即集合');test.onclick=()=>Promise.resolve().then(()=>{if(!enabled.checked)throw new Error('請先啟用組隊');if(world()?.charId!==owner)throw new Error('角色已切換');return start(settings());}).then(()=>status.textContent='集合已啟動，結果依原生回讀確認。').catch(error=>status.textContent=error.message);panel.append(test);}
+ if(mountPanel)mountPanel(panel,{title:'指定隊伍與會合',source:'party'});else document.documentElement.append(panel);return panel;
 }
 
 
 // 由自動種植助手正式v2.2.0移植；原始SHA-256 2e5206ea75dc61361553dce2d4d64296a0e905153e4e8f82b9ad44269a513010
 // 保留輪數、等待及設定；庭院操作呼叫每日共用原生服务。來源舊版未改。
 function createFarmAdapter(host) {
-  function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
+  function polishSourcePanel(panel,kind){
+  const document=panel.ownerDocument,make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};
+  if(kind==='daily'&&panel.querySelector('form')){
+    const form=panel.querySelector('form');Object.assign(form.style,{padding:'0',background:'transparent',border:'0',borderRadius:'0'});
+    const taskOptions=form.querySelector('[data-task-options]'),toggle=form.querySelector('[data-toggle-tasks]');if(taskOptions)taskOptions.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');
+    for(const p of form.querySelectorAll('p'))if(/^目前角色（自動偵測）|設定依目前登入角色保存/.test(p.textContent.trim()))p.remove();
+    const notes=make('ol');notes.setAttribute('data-assistant-setting-notes','');notes.style.cssText='margin:10px 0 0;padding-left:22px;font-size:11px;color:#cbd5e1;line-height:1.5';
+    const noteEntries=[];for(const p of form.querySelectorAll('p')){
+      if(/開場固定種六格/.test(p.textContent)){noteEntries.push([1,p.textContent]);p.remove();}
+      else if(/材料可重複選擇/.test(p.textContent)){noteEntries.push([12,p.textContent]);p.remove();}
+      else if(/簡要說明/.test(p.textContent)){noteEntries.push([2,'公會預設捐獻銀幣與金幣；副本素材只捐獻庫存大於投入量10倍的項目。'],[4,'傳奇特權只應用於遠端王國任務繳交。'],[8,'活力購買補跑不再追加。'],[9,'採集工具會嘗試做兩把新的。']);p.remove();}
+    }
+    for(const [,text]of noteEntries.sort((a,b)=>a[0]-b[0]))notes.append(make('li',text));if(noteEntries.length)form.append(notes);
+  }
+  if(kind==='battle'&&panel.querySelector('[data-level]')){
+    const level=panel.querySelector('[data-level]'),oldCurrent=level.value==='current';for(const option of level.querySelectorAll('option[value="current"]'))option.remove();
+    if(oldCurrent){const option=make('option','請重新選擇掛網目標');option.value='';option.selected=true;level.prepend(option);level.value='';const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='舊設定使用當前地圖，請重新選擇掛網目標後保存。';}
+    panel.querySelector('[data-save]')?.addEventListener('click',event=>{if(level.value!=='')return;event.preventDefault();event.stopImmediatePropagation();const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='請重新選擇掛網目標後保存。';},true);
+    for(const fieldset of panel.querySelectorAll('fieldset')){
+      if(!fieldset.querySelector('[data-on]'))continue;const row=fieldset.querySelector('div'),enabled=row.querySelector('label'),type=row.querySelector('select'),stock=row.querySelector('[data-item]'),threshold=row.querySelector('[data-threshold]')?.closest('label'),interval=row.querySelector('[data-interval]')?.closest('label');
+      const first=make('div'),second=make('div');first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';first.append(enabled,type,stock);second.append(threshold,interval);row.replaceChildren(first,second);row.style.cssText='display:grid;gap:4px;min-width:0';fieldset.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';
+    }
+    for(const div of panel.querySelectorAll('div'))if(div.querySelector('[data-dest]')){div.style.flexWrap='wrap';div.style.whiteSpace='normal';div.style.gap='5px';const dest=div.querySelector('[data-dest]');dest.style.width='190px';const note=div.querySelector('[data-rift-note]');if(note){note.style.whiteSpace='normal';note.style.flexShrink='1';}}
+    for(const line of panel.querySelectorAll('[data-role-controls],[data-follow-range]')){line.style.flexWrap='wrap';line.style.whiteSpace='normal';line.style.gap='5px';}
+    const exp=panel.querySelector('[data-exp-scroll-row]');if(exp){exp.style.flexWrap='wrap';exp.style.whiteSpace='normal';exp.style.overflowX='visible';exp.style.padding='0';}
+    const extras=panel.querySelector('[data-dodge]')?.closest('p');if(extras){extras.style.flexWrap='wrap';extras.style.whiteSpace='normal';extras.style.overflowX='visible';extras.style.gap='4px 8px';}
+  }
+  if(kind==='dungeon-leader'||kind==='dungeon-member')for(const label of panel.querySelectorAll('label')){
+    if(!label.querySelector('input[type="checkbox"]'))continue;for(const node of [...label.childNodes])if(node.nodeType===3&&/進副本後自動 AUTO|^自動戰鬥\s*$/.test(node.textContent))node.textContent='副本啟用內建auto ';}
+}
+  function sourceInline(panel,options={}){if(!host.onMountPanel)return false;polishSourcePanel(panel,"farm");return Boolean(host.mountPanel?.(panel,options));}
   function sourceSettingsAnchor(){const rect=host.anchor()?.getBoundingClientRect?.()??{left:0,top:0,right:0,bottom:0};const panel=document.createElement('section');panel.getBoundingClientRect=()=>rect;return panel;}
 
   'use strict';
@@ -4619,7 +4798,7 @@ function createFarmAdapter(host) {
     setStoredValue(FLOW_STATE_KEY, JSON.stringify({
       plantingCropKey, modalSelectionKey, cycleCropKey, cycleRecorded,
       fillCheckPending, fillProbeClicked, supplementing,
-      nativeVersion: 2, nativePending, nativeOwner, nativeHarvestIds, nativeHomeRecords, nativeDay, nativeEntryCycle
+      nativeVersion: 2, nativePending, nativeOwner, nativeHarvestIds, nativeHomeRecords, nativeDay, nativeEntryCycle, backgroundWaiting
     }));
   }
 
@@ -4649,6 +4828,7 @@ function createFarmAdapter(host) {
   let nativeEntryCycle = 0;
   let nativeEpoch = 0;
   let scanPromise = null;
+  let backgroundWaiting = false;
   let nativeOwner = '';
   let nativeBlockedAt = 0;
   let nativeBlockedMessage = '';
@@ -4656,7 +4836,7 @@ function createFarmAdapter(host) {
   try {
     const flow = JSON.parse(getStoredValue(FLOW_STATE_KEY) || '{}');
     if ([1,2].includes(flow.nativeVersion)) {
-      if(flow.nativeVersion===2){nativeHomeRecords=flow.nativeHomeRecords??{};nativeDay=flow.nativeDay??nativeDay;nativeEntryCycle=flow.nativeEntryCycle??0;}
+      if(flow.nativeVersion===2){nativeHomeRecords=flow.nativeHomeRecords??{};nativeDay=flow.nativeDay??nativeDay;nativeEntryCycle=flow.nativeEntryCycle??0;backgroundWaiting=flow.backgroundWaiting===true;}
       nativePending = flow.nativePending || null;
       nativeOwner = flow.nativeOwner || '';
       nativeHarvestIds = Array.isArray(flow.nativeHarvestIds) ? flow.nativeHarvestIds : [];
@@ -4746,6 +4926,10 @@ function createFarmAdapter(host) {
   async function scan(){
     if(!enabled||!host.canOperate(integratedContext))return;
     try{
+      if(backgroundWaiting&&!nativePending){
+        if(waitUntil>Date.now()){statusText='已離開庭園，背景等待成熟 '+formatDuration(waitUntil-Date.now());return;}
+        backgroundWaiting=false;saveNativeProgress();
+      }
       if(!await ensureOwnGarden())return;
       let plots=readGardenPlots();if(!await reconcileNativePending(plots)){statusText='等待菜圃狀態確認';return;}
       plots=readGardenPlots();const empty=plots.filter(plot=>gardenStage(plot)==='empty'),growing=plots.filter(plot=>gardenStage(plot)==='growing'),mature=plots.filter(plot=>gardenStage(plot)==='mature');
@@ -4758,7 +4942,17 @@ function createFarmAdapter(host) {
       if(empty.length===6&&waitUntil){waitUntil=0;randomDelayMs=0;settleUntil=0;cycleRecorded=false;plantingCropKey=configuredCropKey;saveNativeProgress();}
       if(empty.length){await nativePlant();return;}
       const dry=growing.filter(plot=>!plot.watered);if(dry.length){await nativePlotAction(dry[0],'water');statusText='灌溉 '+dry[0].plotId;return;}
-      if(cycleRecorded&&plantCount>=runLimit()){waitUntil=0;randomDelayMs=0;saveNativeProgress();stop('已完成：六格已確認灌溉');return;}
+      if(growing.length||cycleRecorded&&plantCount>=runLimit()){
+        const deadline=Math.max(...plots.filter(plot=>gardenStage(plot)!=='empty').map(plot=>plot.readyAt));
+        if(!Number.isFinite(deadline))throw new Error('六格成熟時間未確認，尚未離家');
+        if(!waitUntil){randomDelayMs=Math.floor(Math.random()*21)*1000;waitUntil=Math.max(Date.now(),deadline-(gardenNow()-Date.now()))+randomDelayMs;}
+        else waitUntil=Math.max(waitUntil,deadline-(gardenNow()-Date.now())+randomDelayMs);
+        saveNativeProgress();const left=await nativeActions.runHome('leave',{phase:'farm:'+plantCount});if(left?.confirmed!==true)throw new Error('原生離家尚未確認，保留庭園流程');
+        backgroundWaiting=true;saveNativeProgress();
+        if(plantCount>=runLimit())stop('已完成：六格已確認灌溉並離開庭園');
+        else statusText='已離開庭園，背景等待成熟 '+formatDuration(waitUntil-Date.now());
+        return;
+      }
       if(growing.length||mature.length){
         const deadline=Math.max(...plots.filter(plot=>gardenStage(plot)!=='empty').map(plot=>plot.readyAt));
         if(!waitUntil){randomDelayMs=Math.floor(Math.random()*21)*1000;waitUntil=Math.max(Date.now(),deadline-(gardenNow()-Date.now()))+randomDelayMs;saveNativeProgress();}
@@ -4779,6 +4973,7 @@ function createFarmAdapter(host) {
       nativeBlockedAt = 0;
       plantCount = 0;
       waitUntil = 0;
+      backgroundWaiting = false;
       randomDelayMs = 0;
       settleUntil = 0;
       irrigationPending = false;
@@ -5024,7 +5219,7 @@ function createFarmAdapter(host) {
   }
   function observe() {
     refreshNativePending();
-    return {state:enabled?'running':statusText.startsWith('已完成：')?'completed':'stopped',phase:nativePending?'pending':waitUntil?'growing':'garden',
+    return {state:enabled?'running':statusText.startsWith('已完成：')?'completed':'stopped',phase:nativePending?'pending':backgroundWaiting?'background-wait':waitUntil?'growing':'garden',
       message:statusText,cropKey:configuredCropKey,count:plantCount,dueAt:waitUntil||null,pending:nativePending?{...nativePending,taskKind:'farm'}:null};
   }
   function snapshot() {saveNativeProgress();return {safe:true,checkpointId:integratedContext.runId+'-farm-'+Date.now(),sourceVersion:'2.2.0',count:plantCount,waitUntil};}
@@ -5056,7 +5251,7 @@ function createFarmAdapter(host) {
       if(checkpoint.settingsRebased){validate(context.settings);if(context.settings.cropKey!==undefined)configuredCropKey=context.settings.cropKey;if(context.settings.limit!==undefined)configuredLimit=String(context.settings.limit);setStoredValue(TARGET_CROP_KEY,configuredCropKey);setStoredValue(LIMIT_KEY,configuredLimit);}
       enabled=true;statusText='接續種植';saveNativeProgress();
     },
-    result:()=>({confirmed:statusText.startsWith('已完成：'),count:plantCount,message:statusText,pending:nativePending})
+    result:()=>({confirmed:statusText.startsWith('已完成：'),count:plantCount,message:statusText,pending:nativePending,dueAt:waitUntil||null,backgroundWaiting})
   };
 }
 
@@ -5064,7 +5259,37 @@ function createFarmAdapter(host) {
 // 由自動戰鬥正式v2.6.4移植；原始SHA-256 03d27726e7fada4ef1fda1c75a0aa14baee089ee2532f77d2a3c92cdc0af1f49
 // 保留全部戰鬥模組；儲存／排程／操作權／交接由整合控制器接管。
 function createBattleAdapter(host) {
-  function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
+  function polishSourcePanel(panel,kind){
+  const document=panel.ownerDocument,make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};
+  if(kind==='daily'&&panel.querySelector('form')){
+    const form=panel.querySelector('form');Object.assign(form.style,{padding:'0',background:'transparent',border:'0',borderRadius:'0'});
+    const taskOptions=form.querySelector('[data-task-options]'),toggle=form.querySelector('[data-toggle-tasks]');if(taskOptions)taskOptions.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');
+    for(const p of form.querySelectorAll('p'))if(/^目前角色（自動偵測）|設定依目前登入角色保存/.test(p.textContent.trim()))p.remove();
+    const notes=make('ol');notes.setAttribute('data-assistant-setting-notes','');notes.style.cssText='margin:10px 0 0;padding-left:22px;font-size:11px;color:#cbd5e1;line-height:1.5';
+    const noteEntries=[];for(const p of form.querySelectorAll('p')){
+      if(/開場固定種六格/.test(p.textContent)){noteEntries.push([1,p.textContent]);p.remove();}
+      else if(/材料可重複選擇/.test(p.textContent)){noteEntries.push([12,p.textContent]);p.remove();}
+      else if(/簡要說明/.test(p.textContent)){noteEntries.push([2,'公會預設捐獻銀幣與金幣；副本素材只捐獻庫存大於投入量10倍的項目。'],[4,'傳奇特權只應用於遠端王國任務繳交。'],[8,'活力購買補跑不再追加。'],[9,'採集工具會嘗試做兩把新的。']);p.remove();}
+    }
+    for(const [,text]of noteEntries.sort((a,b)=>a[0]-b[0]))notes.append(make('li',text));if(noteEntries.length)form.append(notes);
+  }
+  if(kind==='battle'&&panel.querySelector('[data-level]')){
+    const level=panel.querySelector('[data-level]'),oldCurrent=level.value==='current';for(const option of level.querySelectorAll('option[value="current"]'))option.remove();
+    if(oldCurrent){const option=make('option','請重新選擇掛網目標');option.value='';option.selected=true;level.prepend(option);level.value='';const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='舊設定使用當前地圖，請重新選擇掛網目標後保存。';}
+    panel.querySelector('[data-save]')?.addEventListener('click',event=>{if(level.value!=='')return;event.preventDefault();event.stopImmediatePropagation();const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='請重新選擇掛網目標後保存。';},true);
+    for(const fieldset of panel.querySelectorAll('fieldset')){
+      if(!fieldset.querySelector('[data-on]'))continue;const row=fieldset.querySelector('div'),enabled=row.querySelector('label'),type=row.querySelector('select'),stock=row.querySelector('[data-item]'),threshold=row.querySelector('[data-threshold]')?.closest('label'),interval=row.querySelector('[data-interval]')?.closest('label');
+      const first=make('div'),second=make('div');first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';first.append(enabled,type,stock);second.append(threshold,interval);row.replaceChildren(first,second);row.style.cssText='display:grid;gap:4px;min-width:0';fieldset.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';
+    }
+    for(const div of panel.querySelectorAll('div'))if(div.querySelector('[data-dest]')){div.style.flexWrap='wrap';div.style.whiteSpace='normal';div.style.gap='5px';const dest=div.querySelector('[data-dest]');dest.style.width='190px';const note=div.querySelector('[data-rift-note]');if(note){note.style.whiteSpace='normal';note.style.flexShrink='1';}}
+    for(const line of panel.querySelectorAll('[data-role-controls],[data-follow-range]')){line.style.flexWrap='wrap';line.style.whiteSpace='normal';line.style.gap='5px';}
+    const exp=panel.querySelector('[data-exp-scroll-row]');if(exp){exp.style.flexWrap='wrap';exp.style.whiteSpace='normal';exp.style.overflowX='visible';exp.style.padding='0';}
+    const extras=panel.querySelector('[data-dodge]')?.closest('p');if(extras){extras.style.flexWrap='wrap';extras.style.whiteSpace='normal';extras.style.overflowX='visible';extras.style.gap='4px 8px';}
+  }
+  if(kind==='dungeon-leader'||kind==='dungeon-member')for(const label of panel.querySelectorAll('label')){
+    if(!label.querySelector('input[type="checkbox"]'))continue;for(const node of [...label.childNodes])if(node.nodeType===3&&/進副本後自動 AUTO|^自動戰鬥\s*$/.test(node.textContent))node.textContent='副本啟用內建auto ';}
+}
+  function sourceInline(panel,options={}){if(!host.onMountPanel)return false;polishSourcePanel(panel,"battle");return Boolean(host.mountPanel?.(panel,options));}
   function sourceSettingsAnchor(){const rect=host.anchor()?.getBoundingClientRect?.()??{left:0,top:0,right:0,bottom:0};const panel=document.createElement('section');panel.getBoundingClientRect=()=>rect;return panel;}
 
 'use strict';
@@ -6490,7 +6715,37 @@ function 建立隊員移動({now=Date.now}={}){
 // 由每日任務正式v2.21.13移植；SHA-256 d94f68c3962fa1e0693e52653ea5087cfdd487ca42acb25720f166394d882656
 // 不使用工作區未發布每日原始碼；原十四階段、交易證據及補跑保留。
 function createDailyAdapter(host) {
-  function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
+  function polishSourcePanel(panel,kind){
+  const document=panel.ownerDocument,make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};
+  if(kind==='daily'&&panel.querySelector('form')){
+    const form=panel.querySelector('form');Object.assign(form.style,{padding:'0',background:'transparent',border:'0',borderRadius:'0'});
+    const taskOptions=form.querySelector('[data-task-options]'),toggle=form.querySelector('[data-toggle-tasks]');if(taskOptions)taskOptions.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');
+    for(const p of form.querySelectorAll('p'))if(/^目前角色（自動偵測）|設定依目前登入角色保存/.test(p.textContent.trim()))p.remove();
+    const notes=make('ol');notes.setAttribute('data-assistant-setting-notes','');notes.style.cssText='margin:10px 0 0;padding-left:22px;font-size:11px;color:#cbd5e1;line-height:1.5';
+    const noteEntries=[];for(const p of form.querySelectorAll('p')){
+      if(/開場固定種六格/.test(p.textContent)){noteEntries.push([1,p.textContent]);p.remove();}
+      else if(/材料可重複選擇/.test(p.textContent)){noteEntries.push([12,p.textContent]);p.remove();}
+      else if(/簡要說明/.test(p.textContent)){noteEntries.push([2,'公會預設捐獻銀幣與金幣；副本素材只捐獻庫存大於投入量10倍的項目。'],[4,'傳奇特權只應用於遠端王國任務繳交。'],[8,'活力購買補跑不再追加。'],[9,'採集工具會嘗試做兩把新的。']);p.remove();}
+    }
+    for(const [,text]of noteEntries.sort((a,b)=>a[0]-b[0]))notes.append(make('li',text));if(noteEntries.length)form.append(notes);
+  }
+  if(kind==='battle'&&panel.querySelector('[data-level]')){
+    const level=panel.querySelector('[data-level]'),oldCurrent=level.value==='current';for(const option of level.querySelectorAll('option[value="current"]'))option.remove();
+    if(oldCurrent){const option=make('option','請重新選擇掛網目標');option.value='';option.selected=true;level.prepend(option);level.value='';const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='舊設定使用當前地圖，請重新選擇掛網目標後保存。';}
+    panel.querySelector('[data-save]')?.addEventListener('click',event=>{if(level.value!=='')return;event.preventDefault();event.stopImmediatePropagation();const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='請重新選擇掛網目標後保存。';},true);
+    for(const fieldset of panel.querySelectorAll('fieldset')){
+      if(!fieldset.querySelector('[data-on]'))continue;const row=fieldset.querySelector('div'),enabled=row.querySelector('label'),type=row.querySelector('select'),stock=row.querySelector('[data-item]'),threshold=row.querySelector('[data-threshold]')?.closest('label'),interval=row.querySelector('[data-interval]')?.closest('label');
+      const first=make('div'),second=make('div');first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';first.append(enabled,type,stock);second.append(threshold,interval);row.replaceChildren(first,second);row.style.cssText='display:grid;gap:4px;min-width:0';fieldset.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';
+    }
+    for(const div of panel.querySelectorAll('div'))if(div.querySelector('[data-dest]')){div.style.flexWrap='wrap';div.style.whiteSpace='normal';div.style.gap='5px';const dest=div.querySelector('[data-dest]');dest.style.width='190px';const note=div.querySelector('[data-rift-note]');if(note){note.style.whiteSpace='normal';note.style.flexShrink='1';}}
+    for(const line of panel.querySelectorAll('[data-role-controls],[data-follow-range]')){line.style.flexWrap='wrap';line.style.whiteSpace='normal';line.style.gap='5px';}
+    const exp=panel.querySelector('[data-exp-scroll-row]');if(exp){exp.style.flexWrap='wrap';exp.style.whiteSpace='normal';exp.style.overflowX='visible';exp.style.padding='0';}
+    const extras=panel.querySelector('[data-dodge]')?.closest('p');if(extras){extras.style.flexWrap='wrap';extras.style.whiteSpace='normal';extras.style.overflowX='visible';extras.style.gap='4px 8px';}
+  }
+  if(kind==='dungeon-leader'||kind==='dungeon-member')for(const label of panel.querySelectorAll('label')){
+    if(!label.querySelector('input[type="checkbox"]'))continue;for(const node of [...label.childNodes])if(node.nodeType===3&&/進副本後自動 AUTO|^自動戰鬥\s*$/.test(node.textContent))node.textContent='副本啟用內建auto ';}
+}
+  function sourceInline(panel,options={}){if(!host.onMountPanel)return false;polishSourcePanel(panel,"daily");return Boolean(host.mountPanel?.(panel,options));}
   function sourceSettingsAnchor(){const rect=host.anchor()?.getBoundingClientRect?.()??{left:0,top:0,right:0,bottom:0};const panel=document.createElement('section');panel.getBoundingClientRect=()=>rect;return panel;}
 
 'use strict';
@@ -8941,7 +9196,37 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
 // 野王狩獵正式v2.8.4完整移植；SHA-256 e69129140e8691370a9ebcf4c3234dd6ad11d0e6305f4bdf2ac24a98093e1669
 // 原狩獵流程保留；整合控制器接管儲存、啟停、暫停及返場。
 function createBossAdapter(host) {
-  function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
+  function polishSourcePanel(panel,kind){
+  const document=panel.ownerDocument,make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};
+  if(kind==='daily'&&panel.querySelector('form')){
+    const form=panel.querySelector('form');Object.assign(form.style,{padding:'0',background:'transparent',border:'0',borderRadius:'0'});
+    const taskOptions=form.querySelector('[data-task-options]'),toggle=form.querySelector('[data-toggle-tasks]');if(taskOptions)taskOptions.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');
+    for(const p of form.querySelectorAll('p'))if(/^目前角色（自動偵測）|設定依目前登入角色保存/.test(p.textContent.trim()))p.remove();
+    const notes=make('ol');notes.setAttribute('data-assistant-setting-notes','');notes.style.cssText='margin:10px 0 0;padding-left:22px;font-size:11px;color:#cbd5e1;line-height:1.5';
+    const noteEntries=[];for(const p of form.querySelectorAll('p')){
+      if(/開場固定種六格/.test(p.textContent)){noteEntries.push([1,p.textContent]);p.remove();}
+      else if(/材料可重複選擇/.test(p.textContent)){noteEntries.push([12,p.textContent]);p.remove();}
+      else if(/簡要說明/.test(p.textContent)){noteEntries.push([2,'公會預設捐獻銀幣與金幣；副本素材只捐獻庫存大於投入量10倍的項目。'],[4,'傳奇特權只應用於遠端王國任務繳交。'],[8,'活力購買補跑不再追加。'],[9,'採集工具會嘗試做兩把新的。']);p.remove();}
+    }
+    for(const [,text]of noteEntries.sort((a,b)=>a[0]-b[0]))notes.append(make('li',text));if(noteEntries.length)form.append(notes);
+  }
+  if(kind==='battle'&&panel.querySelector('[data-level]')){
+    const level=panel.querySelector('[data-level]'),oldCurrent=level.value==='current';for(const option of level.querySelectorAll('option[value="current"]'))option.remove();
+    if(oldCurrent){const option=make('option','請重新選擇掛網目標');option.value='';option.selected=true;level.prepend(option);level.value='';const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='舊設定使用當前地圖，請重新選擇掛網目標後保存。';}
+    panel.querySelector('[data-save]')?.addEventListener('click',event=>{if(level.value!=='')return;event.preventDefault();event.stopImmediatePropagation();const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='請重新選擇掛網目標後保存。';},true);
+    for(const fieldset of panel.querySelectorAll('fieldset')){
+      if(!fieldset.querySelector('[data-on]'))continue;const row=fieldset.querySelector('div'),enabled=row.querySelector('label'),type=row.querySelector('select'),stock=row.querySelector('[data-item]'),threshold=row.querySelector('[data-threshold]')?.closest('label'),interval=row.querySelector('[data-interval]')?.closest('label');
+      const first=make('div'),second=make('div');first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';first.append(enabled,type,stock);second.append(threshold,interval);row.replaceChildren(first,second);row.style.cssText='display:grid;gap:4px;min-width:0';fieldset.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';
+    }
+    for(const div of panel.querySelectorAll('div'))if(div.querySelector('[data-dest]')){div.style.flexWrap='wrap';div.style.whiteSpace='normal';div.style.gap='5px';const dest=div.querySelector('[data-dest]');dest.style.width='190px';const note=div.querySelector('[data-rift-note]');if(note){note.style.whiteSpace='normal';note.style.flexShrink='1';}}
+    for(const line of panel.querySelectorAll('[data-role-controls],[data-follow-range]')){line.style.flexWrap='wrap';line.style.whiteSpace='normal';line.style.gap='5px';}
+    const exp=panel.querySelector('[data-exp-scroll-row]');if(exp){exp.style.flexWrap='wrap';exp.style.whiteSpace='normal';exp.style.overflowX='visible';exp.style.padding='0';}
+    const extras=panel.querySelector('[data-dodge]')?.closest('p');if(extras){extras.style.flexWrap='wrap';extras.style.whiteSpace='normal';extras.style.overflowX='visible';extras.style.gap='4px 8px';}
+  }
+  if(kind==='dungeon-leader'||kind==='dungeon-member')for(const label of panel.querySelectorAll('label')){
+    if(!label.querySelector('input[type="checkbox"]'))continue;for(const node of [...label.childNodes])if(node.nodeType===3&&/進副本後自動 AUTO|^自動戰鬥\s*$/.test(node.textContent))node.textContent='副本啟用內建auto ';}
+}
+  function sourceInline(panel,options={}){if(!host.onMountPanel)return false;polishSourcePanel(panel,"boss");return Boolean(host.mountPanel?.(panel,options));}
   function sourceSettingsAnchor(){const rect=host.anchor()?.getBoundingClientRect?.()??{left:0,top:0,right:0,bottom:0};const panel=document.createElement('section');panel.getBoundingClientRect=()=>rect;return panel;}
 
 'use strict';
@@ -11351,9 +11636,17 @@ function createNativeInventoryReadFlow({host,context,getWorld,catalog,cleanup=fa
 
 
 
-const DEFAULT_MANUAL_AUTO={battle:false,nativeBattle:false,guildSkills:false,dodge:true,potions:Array.from({length:4},()=>({on:false,type:'hp',threshold:35,interval:0}))};
+
+const DEFAULT_MANUAL_AUTO={battle:false,nativeBattle:false,guildSkills:false,guildSkillIds:[...MANUAL_AUTO_GUILD_SKILL_IDS],dodge:true,potions:Array.from({length:4},()=>({on:false,type:'hp',threshold:35,interval:0}))};
+function normalizeManualAutoSettings(value){const copy=structuredClone(value??DEFAULT_MANUAL_AUTO);if(copy.nativeBattle!==undefined&&typeof copy.nativeBattle!=='boolean')throw new Error('AUTO設定格式無效');copy.nativeBattle=false;if(copy.guildSkillIds===undefined)copy.guildSkillIds=[...MANUAL_AUTO_GUILD_SKILL_IDS];validateManualAuto(copy);return copy;}
+function readManualAutoGuildCatalog({getWorld}){return readNativeManualGuildSkills(getWorld);}
+function readManualAutoPotionSlots({document,getWorld}){
+  const world=getWorld(),props=createNativeQuickItemsView({document,getWorld}).read();
+  return Array.from({length:4},(_,slot)=>{const bind=props?.itemBinds[slot],bound=bind?.type==='item'&&typeof bind.id==='string'&&Boolean(bind.id),row=bound?world?.player?.inv?.find(item=>(item.itemId??item.id)===bind.id):null,quantity=world?.serverAuthoritativeResources===true&&props&&world===getWorld()&&bound?nativeItemQuantity(world,bind.id):null;return {slot,key:'F'+(slot+1),itemId:bound?bind.id:null,name:typeof row?.name==='string'&&row.name?row.name:null,quantity,bound:Boolean(bound),known:Boolean(props)&&world===getWorld(),ready:quantity!==null};});
+}
 function validateManualAuto(value){
-  if(!value||typeof value!=='object'||Object.keys(value).some(k=>!['battle','nativeBattle','guildSkills','dodge','potions'].includes(k))||typeof value.battle!=='boolean'||value.nativeBattle!==undefined&&typeof value.nativeBattle!=='boolean'||value.guildSkills!==undefined&&typeof value.guildSkills!=='boolean'||typeof value.dodge!=='boolean'||!Array.isArray(value.potions)||value.potions.length!==4)throw new Error('AUTO設定格式無效');
+  if(!value||typeof value!=='object'||Object.keys(value).some(k=>!['battle','nativeBattle','guildSkills','guildSkillIds','dodge','potions'].includes(k))||typeof value.battle!=='boolean'||value.nativeBattle!==undefined&&value.nativeBattle!==false||value.guildSkills!==undefined&&typeof value.guildSkills!=='boolean'||typeof value.dodge!=='boolean'||!Array.isArray(value.potions)||value.potions.length!==4)throw new Error('AUTO設定格式無效；自動戰鬥改用助手技能');
+  if(value.guildSkillIds!==undefined&&(!Array.isArray(value.guildSkillIds)||value.guildSkillIds.length>MANUAL_AUTO_GUILD_SKILL_IDS.length||new Set(value.guildSkillIds).size!==value.guildSkillIds.length||value.guildSkillIds.some(id=>!MANUAL_AUTO_GUILD_SKILL_IDS.includes(id))))throw new Error('公會技能選擇無效');
   for(const p of value.potions)if(!p||Object.keys(p).some(k=>!['on','type','threshold','interval'].includes(k))||typeof p.on!=='boolean'||!['hp','sp','time'].includes(p.type)||!Number.isFinite(p.threshold)||p.threshold<0||p.threshold>100||!Number.isFinite(p.interval)||p.interval<0||p.interval>86400||p.on&&p.type==='time'&&p.interval<=0)throw new Error('补品條件無效；定時補品須設定秒數');
   return true;
 }
@@ -11369,22 +11662,30 @@ function createManualAutoAdapter({host,getWorld,document,fetch,dodge,combat,cons
   function releaseMove(){if(dodgeMove&&dodgeWorld===getWorld()&&dodgeWorld.charId===active?.characterId&&dodgeWorld.moveTarget===dodgeMove)dodgeWorld._clearMoveTarget?.('manual-auto-dodge-stop');dodgeMove=null;dodgeWorld=null;}
   function cancel(){host.cancel(driver);driver=null;consumables.cancel();catalog=null;}
   function closeCombat(){if(combatOpen){combat.end();combatOpen=false;}}
-  function initialize(context,saved=null){active=context;settings=structuredClone(context.settings.auto);validateManualAuto(settings);stats=saved?structuredClone(saved):{startedAt:now(),items:[0,0,0,0],lastUseAt:[now(),now(),now(),now()],dodgeCount:0,skillActions:0};stats.skillActions??=0;pausing=false;state='running';message='獨立AUTO已啟用；保留手動操作';if(settings.battle||settings.guildSkills){if(!combat)throw new Error('原戰鬥技能接口尚未接入');combat.begin(context);combatOpen=true;}
+  function initialize(context,saved=null){active=context;settings=normalizeManualAutoSettings(context.settings.auto);active.settings.auto=settings;stats=saved?structuredClone(saved):{startedAt:now(),items:[0,0,0,0],lastUseAt:[now(),now(),now(),now()],dodgeCount:0,skillActions:0};stats.skillActions??=0;pausing=false;state='running';message='自動戰鬥已啟用；保留手動操作';if(settings.battle||settings.guildSkills){if(!combat)throw new Error('原戰鬥技能接口尚未接入');combat.begin(context);combatOpen=true;}
     potionFlow=createNativePotionFlow({host,context:()=>active,getWorld,view,definitions:()=>defs,blocked,now,onConfirmed:slot=>{stats.items[slot]++;stats.lastUseAt[slot]=now();message='F'+(slot+1)+'補品已確認';}});
     defs=consumables.read();if(settings.potions.some(p=>p.on)&&!defs.size){const c=context;catalog=consumables.load(c).then(value=>{host.assert(c,{allowPending:true});defs=value;}).catch(error=>{if(active===c&&state==='running'){message='補品定義尚未就緒：'+error.message;state='failed';}}).finally(()=>{catalog=null;});}
     driver=host.interval(()=>{void tick().catch(error=>{message=error.message;state='failed';});},250);
   }
   async function tick(){if(!active||!['running','pausing'].includes(state))return;host.assert(active,{allowPending:true});const pending=host.currentPending();
-    if(pending){if(pending.kind==='native-manual-item')potionFlow.reconcile(pending);else if(pending.kind==='native-battle-guild')combat.reconcileGuild(pending);else auto.reconcile(pending);if(host.currentPending()){message='等待原生操作確認，不重送';if(now()-(pending.flowSentAt??pending.sentAt)>15000){state='failed';message='原生操作結果未知，停止追加操作並保留紀錄';}return;}}
+    if(pending){if(pending.kind==='native-manual-item')potionFlow.reconcile(pending);else if(pending.kind==='native-battle-guild')combat.reconcileGuild(pending);else if(pending.kind==='manual-native-auto-stop')reconcileNativeAutoStop(pending);else auto.reconcile(pending);if(host.currentPending()){message='等待原生操作確認，不重送';if(now()-(pending.flowSentAt??pending.sentAt)>15000){state='failed';message='原生操作結果未知，停止追加操作並保留紀錄';}return;}}
     if(pausing)return;const world=getWorld();if(blocked()){message='安全驗證或輸入中，等待手動處理';return;}if(world?.serverAuthoritativeResources!==true||world.dead||!(world.player?.hp>0)||world.isWorldInteractionLocked?.()!==false){message='等待原生角色與世界就緒';return;}
-    if(settings.nativeBattle===true&&world.autoBattle===false&&!world.autoBattlePendingAction)auto.enable();if(host.currentPending())return;
+    if(world.autoBattle!==false||world.autoBattlePendingAction){if(world.autoBattle===true&&!world.autoBattlePendingAction)requestNativeAutoStop(world);message='等待原生AUTO停止確認，尚未施放助手技能';return;}if(host.currentPending())return;
     if(settings.dodge&&now()-lastDodgeScan>=350){lastDodgeScan=now();host.assert(active);if(dodge({world,now:now(),lastDodgeAt})){lastDodgeAt=now();dodgeWorld=world;dodgeMove=world.moveTarget;stats.dodgeCount++;message='避開Boss技能，保留手動遊玩';}}
     if(!world.castingState&&!world.pendingSkill&&!world._queuedCast)await potionFlow.tick(settings.potions.map((p,i)=>({...p,lastUseAt:stats.lastUseAt[i]})));
     if(settings.guildSkills&&!host.currentPending()&&combat.guildTick())return;
     if(settings.battle&&!host.currentPending()&&!world.castingState&&!world.pendingSkill&&!world._queuedCast){const result=combat.tick();if(result.acted)stats.skillActions++;if(result.message)message=result.message;}
   }
-  function reconcile(pending){if(pending?.sourceRole!=='manual')return {confirmed:false};if(pending.kind==='native-battle-guild')return combat.reconcileGuild(pending);if(pending.kind==='manual-skill-cleanup'){const w=getWorld();const confirmed=w?.charId===pending.characterId&&w.player?.name===pending.role&&w.regionId===pending.regionId&&(w.instanceId??null)===(pending.instanceId??null)&&w.serverAuthoritativeResources===true&&typeof w.prepareSkill==='function'&&typeof w._castResolved==='function'&&!skillBusy(w);if(confirmed)host.pending(null);return {confirmed,evidence:confirmed?'原生施法／選取已結束，未補發技能':null};}if(pending.kind==='native-manual-item'){if(potionFlow)return potionFlow.reconcile(pending);if(nativePotionProof(pending,getWorld())){host.pending(null);return {confirmed:true,evidence:'重載後原生補品扣量與冷卻／增益已確認'};}return {confirmed:false};}return auto.reconcile(pending);}
-  return {kind:'battle',selfDriven:true,restoredOwnership:()=>auto.restoredOwnership(),validate:value=>validateManualAuto(value.auto),getSettings:()=>readSettings(),observe:()=>({state,phase:'manual-auto',message,manualAuto:true,items:stats?.items??null,dodgeCount:stats?.dodgeCount??0,pending:host.currentPending()}),tick,
+  function sameNativeAutoScope(record,w){return w?.charId===record.characterId&&w.player?.name===record.role&&w.mode===record.mode&&w.regionId===record.regionId&&(w.instanceId??null)===(record.instanceId??null);}
+  function reconcileNativeAutoStop(record){const world=getWorld(),confirmed=record?.kind==='manual-native-auto-stop'&&sameNativeAutoScope(record,world)&&world.serverAuthoritativeResources===true&&world.autoBattle===false&&!world.autoBattlePendingAction;if(confirmed)host.pending(null);return {confirmed:Boolean(confirmed),evidence:confirmed?'原生AUTO停止已確認；未追加切換':null};}
+  function requestNativeAutoStop(world){
+    host.assert(active);if(host.currentPending()||world!==getWorld()||world.charId!==active.characterId||!world.player?.name||world.autoBattle!==true||world.autoBattlePendingAction||blocked()||typeof world.toggleAutoBattle!=='function')return false;
+    host.pending({kind:'manual-native-auto-stop',taskKind:'battle',sourceRole:'manual',role:world.player.name,mode:world.mode,regionId:world.regionId,instanceId:world.instanceId??null,sentAt:now(),flowSentAt:now()});host.assert(active,{allowPending:true});
+    if(world!==getWorld()||!sameNativeAutoScope(host.currentPending(),world)||world.autoBattle!==true||world.autoBattlePendingAction||world.dead||!(world.player.hp>0)||world.isWorldInteractionLocked?.()!==false||blocked())throw new Error('保存後原生AUTO場域或狀態已變，未切換');
+    const sent=world.toggleAutoBattle();sent?.catch?.(()=>{});reconcileNativeAutoStop(host.currentPending());return true;
+  }
+  function reconcile(pending){if(pending?.sourceRole!=='manual')return {confirmed:false};if(pending.kind==='manual-native-auto-stop')return reconcileNativeAutoStop(pending);if(pending.kind==='native-battle-guild')return combat?.reconcileGuild(pending)??{confirmed:false};if(pending.kind==='manual-skill-cleanup'){const w=getWorld();const confirmed=w?.charId===pending.characterId&&w.player?.name===pending.role&&w.regionId===pending.regionId&&(w.instanceId??null)===(pending.instanceId??null)&&w.serverAuthoritativeResources===true&&typeof w.prepareSkill==='function'&&typeof w._castResolved==='function'&&!skillBusy(w);if(confirmed)host.pending(null);return {confirmed,evidence:confirmed?'原生施法／選取已結束，未補發技能':null};}if(pending.kind==='native-manual-item'){if(potionFlow)return potionFlow.reconcile(pending);if(nativePotionProof(pending,getWorld())){host.pending(null);return {confirmed:true,evidence:'重載後原生補品扣量與冷卻／增益已確認'};}return {confirmed:false};}return auto.reconcile(pending);}
+  return {kind:'battle',selfDriven:true,restoredOwnership:()=>auto.restoredOwnership(),validate:value=>{normalizeManualAutoSettings(value.auto);return true;},getSettings:()=>readSettings(),observe:()=>({state,phase:'manual-auto',message,manualAuto:true,items:stats?.items??null,dodgeCount:stats?.dodgeCount??0,pending:host.currentPending()}),tick,
     start(context){host.assert(context);initialize(context);},
     async pause(context){host.assert(context,{allowPending:true});pausing=true;state='pausing';releaseMove();if(host.currentPending()){reconcile(host.currentPending());if(host.currentPending())return {safe:false};}if(skillBusy(getWorld())){message='等待原生施法／選取結束再暫停';return {safe:false};}if(auto.owns()&&!auto.release())return {safe:false};cancel();closeCombat();state='paused';return {safe:true,checkpointId:context.runId+'-manual-auto',sourceRole:'manual',sourceVersion:1,manualAuto:structuredClone(stats)};},
     async stop(context,reason){pausing=true;cancel();releaseMove();closeCombat();state='cleanup';message='獨立AUTO收尾中，等待已送出操作';const deadline=now()+15000;
@@ -11406,21 +11707,29 @@ function combineBattleModes(battle,manual){
 
 
 
-function showManualAutoPanel({document,prefix,read,write,isCurrent,start,stop,resume,status,history=()=>[],mountPanel}){
-  document.getElementById(prefix+'-manual-auto-settings')?.remove();const panel=document.createElement('section');panel.id=prefix+'-manual-auto-settings';panel.style.cssText='position:fixed;left:8vw;top:12vh;width:78vw;max-width:690px;max-height:78vh;overflow:auto;z-index:2147483647;background:#172c43;color:white;padding:18px;border:1px solid #9ac5e7;border-radius:8px;font:14px/1.6 system-ui';
-  const make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};const value=structuredClone(read()??DEFAULT_MANUAL_AUTO),title=make('strong','AUTO 設定'),hint=make('p','手動遊玩時自動戰鬥沿用原技能選擇／施法流程；內建AUTO為獨立選項。可另啟用Boss閃避與補品。使用遊戲目前F1～F4的綁定，保留既有玩家AUTO；不前往練等地圖或操作隊伍。'),info=make('p',status()),error=make('p');error.style.color='#ffb7ad';panel.append(title,hint,info);
-  function check(text,key){const label=make('label',text+' '),input=make('input');input.type='checkbox';input.checked=value[key];input.title=text;label.append(input);input.onchange=()=>value[key]=input.checked;label.style.marginRight='18px';panel.append(label);}
-  check('自動戰鬥（原技能流程）','battle');check('內建AUTO（選用）','nativeBattle');check('Boss閃避','dodge');check('公會技能','guildSkills');
-  const rows=make('div');rows.style.marginTop='14px';panel.append(rows);
-  for(let i=0;i<4;i++){const p=value.potions[i],row=make('div');row.style.cssText='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0';const label=make('label','F'+(i+1)+' '),on=make('input');on.type='checkbox';on.checked=p.on;on.title='啟用F'+(i+1)+'補品';on.onchange=()=>p.on=on.checked;label.append(on);const type=make('select');type.title='F'+(i+1)+'補品條件';for(const [key,text]of [['hp','HP低於'],['sp','SP低於'],['time','只按時間']]){const option=make('option',text);option.value=key;type.append(option);}type.value=p.type;type.onchange=()=>p.type=type.value;
-    const threshold=make('input');threshold.type='number';threshold.min='0';threshold.max='100';threshold.value=String(p.threshold);threshold.title='F'+(i+1)+'百分比';threshold.style.width='64px';threshold.onchange=()=>p.threshold=Number(threshold.value);
-    const seconds=make('input');seconds.type='number';seconds.min='0';seconds.max='86400';seconds.value=String(p.interval);seconds.title='F'+(i+1)+'間隔秒數';seconds.style.width='76px';seconds.onchange=()=>p.interval=Number(seconds.value);row.append(label,type,threshold,make('span','%／或每'),seconds,make('span','秒（0停用定時）'));rows.append(row);
+function showManualAutoPanel({document,prefix,read,write,isCurrent,start,stop,resume,status,history=()=>[],readGuildSkills=()=>[],readPotionSlots=()=>[],mountPanel}){
+  document.getElementById(prefix+'-manual-auto-settings')?.remove();const panel=document.createElement('section');panel.id=prefix+'-manual-auto-settings';panel.style.cssText='position:fixed;left:8vw;top:12vh;width:78vw;max-width:470px;max-height:78vh;overflow:auto;z-index:2147483647;background:#172c43;color:white;padding:12px;border:1px solid #9ac5e7;border-radius:8px;font:13px/1.4 system-ui';
+  const make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};const value=normalizeManualAutoSettings(read()??DEFAULT_MANUAL_AUTO),title=make('strong','自動戰鬥設定'),hint=make('p','在目前地圖使用助手技能攻擊，可搭配閃避、公會技能與目前 F1～F4 的補品。'),info=make('p',status()),error=make('p');error.style.color='#ffb7ad';hint.style.cssText='font-size:11px;color:#cbd5e1;margin:6px 0';info.style.cssText='font-size:11px;margin:6px 0';panel.append(title,hint,info);
+  function check(text,key,container=panel){const label=make('label'),input=make('input');input.type='checkbox';input.checked=value[key];input.title=text;label.append(make('span',text),input);input.onchange=()=>value[key]=input.checked;label.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:6px;margin:4px 0;font-size:12px';container.append(label);return input;}
+  check('助手技能攻擊','battle');check('BOSS 技能閃避','dodge');
+  const guild=make('details'),guildTitle=make('summary','公會技能'),guildBody=make('div');guild.open=false;guild.append(guildTitle,guildBody);guild.style.margin='6px 0';check('啟用公會技能','guildSkills',guildBody);
+  const catalog=readGuildSkills();if(catalog.length){for(const item of catalog){const label=make('label'),input=make('input');input.type='checkbox';input.value=item.id;input.checked=value.guildSkillIds.includes(item.id);input.title=item.name;input.disabled=item.available===false;label.append(make('span',item.name+(item.rank>0?' Lv'+item.rank:'')),input);label.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:6px;margin:4px 0;font-size:12px';input.onchange=()=>{const chosen=new Set(value.guildSkillIds);if(input.checked)chosen.add(item.id);else chosen.delete(item.id);value.guildSkillIds=[...chosen];};guildBody.append(label);}}
+  else guildBody.append(make('p','等待原生公會技能資料'));panel.append(guild);
+  const rows=make('div'),stockLabels=[];panel.append(rows);
+  for(let i=0;i<4;i++){
+    const p=value.potions[i],row=make('fieldset'),legend=make('legend','F'+(i+1)),first=make('div'),second=make('div');row.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';second.style.marginTop='4px';
+    const label=make('label','啟用 '),on=make('input');on.type='checkbox';on.checked=p.on;on.title='啟用F'+(i+1)+'補品';on.onchange=()=>p.on=on.checked;label.append(on);const type=make('select');type.title='F'+(i+1)+'補品條件';for(const [key,text]of [['hp','紅水（HP）'],['sp','藍水（SP）'],['time','補品']]){const option=make('option',text);option.value=key;type.append(option);}type.value=p.type;
+    const threshold=make('input');threshold.type='number';threshold.min='0';threshold.max='100';threshold.value=String(p.threshold);threshold.title='F'+(i+1)+'百分比';threshold.style.width='55px';threshold.onchange=()=>p.threshold=Number(threshold.value);const thresholdLabel=make('label','門檻 ');thresholdLabel.append(threshold,make('span','％'));
+    const seconds=make('input');seconds.type='number';seconds.min='0';seconds.max='86400';seconds.step='0.1';seconds.value=String(p.interval);seconds.title='F'+(i+1)+'間隔秒數';seconds.style.width='65px';seconds.onchange=()=>p.interval=Number(seconds.value);const intervalLabel=make('label','間隔 ');intervalLabel.append(seconds,make('span',' 秒定時吃'));
+    const stock=make('span','綁定／庫存未讀取');stockLabels.push(stock);stock.style.cssText='font-size:11px;color:#cbd5e1';stock.setAttribute('data-potion-stock',String(i));const toggle=()=>threshold.disabled=type.value==='time';type.onchange=()=>{p.type=type.value;toggle();};toggle();first.append(label,type,stock);second.append(thresholdLabel,intervalLabel);row.append(legend,first,second);rows.append(row);
   }
-  const note=make('p','低於門檻優先使用；間隔由上次確認使用起算。綁定、庫存或冷卻未確認時等待，結果未知不重送。保存的新設定於下次啟用採用。');panel.append(note,error);
-  function action(label,fn){const b=make('button',label);b.style.cssText='margin:4px;padding:6px 10px';b.onclick=()=>Promise.resolve().then(()=>{if(!isCurrent())throw new Error('角色已切換，請重新開啟AUTO設定');return fn();}).catch(e=>error.textContent=e.message);panel.append(b);}
-  function save(){validateManualAuto(value);write(structuredClone(value));error.textContent='已保存本角色AUTO設定';}
-  action('保存設定',save);action('啟用獨立AUTO',async()=>{save();await start(structuredClone(value));panel.remove();});action('接續獨立AUTO',async()=>{await resume();panel.remove();});action('停止獨立AUTO',async()=>{await stop();info.textContent=status();});action('關閉',()=>panel.remove());
-  const records=make('details'),summary=make('summary','AUTO紀錄'),text=make('pre');text.style.cssText='white-space:pre-wrap;font:inherit';const entries=history().filter(e=>e.result?.manualAuto).slice(-30);text.textContent=entries.length?entries.map(e=>{const r=e.result.report;return `${new Date(e.at).toLocaleString('zh-TW')}｜技能受理 ${r?.skillActions??0} 次｜閃避 ${r?.dodgeCount??'未讀取'} 次｜補品 ${r?.items?.map((n,i)=>'F'+(i+1)+':'+n).join('／')??'未讀取'}`;}).join('\n'):'尚無已結束的獨立AUTO紀錄';records.append(summary,text);panel.append(records);if(mountPanel)mountPanel(panel);else document.documentElement.append(panel);return panel;
+  panel.assistantRefresh=()=>{if(!panel.isConnected||panel.closest('[hidden]')||!isCurrent())return;let slots;try{slots=readPotionSlots()??[];}catch{slots=[];}for(let i=0;i<stockLabels.length;i++){const slot=slots.find(s=>s.slot===i);stockLabels[i].textContent=slot?.bound?(slot.name??slot.itemId??'補品')+'｜'+(Number.isInteger(slot.quantity)?'原生庫存 '+slot.quantity+' 個':'庫存未讀取'):slot?.known===true?'尚未綁定':'綁定／庫存未讀取';}};
+  const note=make('p','低於門檻優先使用；定時補品需設定秒數，0 為停用。綁定、庫存或冷卻未確認時等待。保存後於下次啟用採用。');note.style.cssText='font-size:11px;color:#cbd5e1';panel.append(note,error);
+  function action(label,fn){const b=make('button',label);b.type='button';b.style.cssText='margin:2px;padding:3px 6px';b.onclick=()=>Promise.resolve().then(()=>{if(!isCurrent())throw new Error('角色已切換，請重新開啟自動戰鬥設定');return fn();}).catch(e=>error.textContent=e.message);panel.append(b);return b;}
+  function snapshot(){const saved=normalizeManualAutoSettings(value);validateManualAuto(saved);return saved;}
+  const save=action('保存',()=>{write(snapshot());error.textContent='已保存本角色自動戰鬥設定';});save.setAttribute('data-assistant-save','');
+  action('啟用自動戰鬥',async()=>{await start(snapshot());panel.remove();});action('接續自動戰鬥',async()=>{await resume();panel.remove();});action('停止自動戰鬥',async()=>{await stop();info.textContent=status();});const close=action('關閉',()=>panel.remove());close.setAttribute('data-assistant-close','');
+  const records=make('details'),summary=make('summary','自動戰鬥紀錄'),text=make('pre');text.style.cssText='white-space:pre-wrap;font:inherit';const entries=history().filter(e=>e.result?.manualAuto).slice(-30);text.textContent=entries.length?entries.map(e=>{const r=e.result.report;return `${new Date(e.at).toLocaleString('zh-TW')}｜技能受理 ${r?.skillActions??0} 次｜閃避 ${r?.dodgeCount??'未讀取'} 次｜補品 ${r?.items?.map((n,i)=>'F'+(i+1)+':'+n).join('／')??'未讀取'}`;}).join('\n'):'尚無已結束的自動戰鬥紀錄';records.append(summary,text);panel.append(records);if(mountPanel)mountPanel(panel,{title:'自動戰鬥設定'});else document.documentElement.append(panel);panel.assistantRefresh();return panel;
 }
 
 
@@ -11428,7 +11737,37 @@ function showManualAutoPanel({document,prefix,read,write,isCurrent,start,stop,re
 // 副本正式v2.6.6完整來源移植；SHA-256 08a3f763cc196d5fc608f116f339995a518213cb16e7c623266300a09dd826c9
 // 原流程保留；驗證人工處理，安全交接不開下一場。
 function createDungeonLeaderAdapter(host) {
-  function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
+  function polishSourcePanel(panel,kind){
+  const document=panel.ownerDocument,make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};
+  if(kind==='daily'&&panel.querySelector('form')){
+    const form=panel.querySelector('form');Object.assign(form.style,{padding:'0',background:'transparent',border:'0',borderRadius:'0'});
+    const taskOptions=form.querySelector('[data-task-options]'),toggle=form.querySelector('[data-toggle-tasks]');if(taskOptions)taskOptions.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');
+    for(const p of form.querySelectorAll('p'))if(/^目前角色（自動偵測）|設定依目前登入角色保存/.test(p.textContent.trim()))p.remove();
+    const notes=make('ol');notes.setAttribute('data-assistant-setting-notes','');notes.style.cssText='margin:10px 0 0;padding-left:22px;font-size:11px;color:#cbd5e1;line-height:1.5';
+    const noteEntries=[];for(const p of form.querySelectorAll('p')){
+      if(/開場固定種六格/.test(p.textContent)){noteEntries.push([1,p.textContent]);p.remove();}
+      else if(/材料可重複選擇/.test(p.textContent)){noteEntries.push([12,p.textContent]);p.remove();}
+      else if(/簡要說明/.test(p.textContent)){noteEntries.push([2,'公會預設捐獻銀幣與金幣；副本素材只捐獻庫存大於投入量10倍的項目。'],[4,'傳奇特權只應用於遠端王國任務繳交。'],[8,'活力購買補跑不再追加。'],[9,'採集工具會嘗試做兩把新的。']);p.remove();}
+    }
+    for(const [,text]of noteEntries.sort((a,b)=>a[0]-b[0]))notes.append(make('li',text));if(noteEntries.length)form.append(notes);
+  }
+  if(kind==='battle'&&panel.querySelector('[data-level]')){
+    const level=panel.querySelector('[data-level]'),oldCurrent=level.value==='current';for(const option of level.querySelectorAll('option[value="current"]'))option.remove();
+    if(oldCurrent){const option=make('option','請重新選擇掛網目標');option.value='';option.selected=true;level.prepend(option);level.value='';const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='舊設定使用當前地圖，請重新選擇掛網目標後保存。';}
+    panel.querySelector('[data-save]')?.addEventListener('click',event=>{if(level.value!=='')return;event.preventDefault();event.stopImmediatePropagation();const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='請重新選擇掛網目標後保存。';},true);
+    for(const fieldset of panel.querySelectorAll('fieldset')){
+      if(!fieldset.querySelector('[data-on]'))continue;const row=fieldset.querySelector('div'),enabled=row.querySelector('label'),type=row.querySelector('select'),stock=row.querySelector('[data-item]'),threshold=row.querySelector('[data-threshold]')?.closest('label'),interval=row.querySelector('[data-interval]')?.closest('label');
+      const first=make('div'),second=make('div');first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';first.append(enabled,type,stock);second.append(threshold,interval);row.replaceChildren(first,second);row.style.cssText='display:grid;gap:4px;min-width:0';fieldset.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';
+    }
+    for(const div of panel.querySelectorAll('div'))if(div.querySelector('[data-dest]')){div.style.flexWrap='wrap';div.style.whiteSpace='normal';div.style.gap='5px';const dest=div.querySelector('[data-dest]');dest.style.width='190px';const note=div.querySelector('[data-rift-note]');if(note){note.style.whiteSpace='normal';note.style.flexShrink='1';}}
+    for(const line of panel.querySelectorAll('[data-role-controls],[data-follow-range]')){line.style.flexWrap='wrap';line.style.whiteSpace='normal';line.style.gap='5px';}
+    const exp=panel.querySelector('[data-exp-scroll-row]');if(exp){exp.style.flexWrap='wrap';exp.style.whiteSpace='normal';exp.style.overflowX='visible';exp.style.padding='0';}
+    const extras=panel.querySelector('[data-dodge]')?.closest('p');if(extras){extras.style.flexWrap='wrap';extras.style.whiteSpace='normal';extras.style.overflowX='visible';extras.style.gap='4px 8px';}
+  }
+  if(kind==='dungeon-leader'||kind==='dungeon-member')for(const label of panel.querySelectorAll('label')){
+    if(!label.querySelector('input[type="checkbox"]'))continue;for(const node of [...label.childNodes])if(node.nodeType===3&&/進副本後自動 AUTO|^自動戰鬥\s*$/.test(node.textContent))node.textContent='副本啟用內建auto ';}
+}
+  function sourceInline(panel,options={}){if(!host.onMountPanel)return false;polishSourcePanel(panel,"dungeon-leader");return Boolean(host.mountPanel?.(panel,options));}
   function sourceSettingsAnchor(){const rect=host.anchor()?.getBoundingClientRect?.()??{left:0,top:0,right:0,bottom:0};const panel=document.createElement('section');panel.getBoundingClientRect=()=>rect;return panel;}
 
 'use strict';
@@ -11576,8 +11915,8 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
     if (v.dead && !v.reward) {
       if(!v.combat)return stop('副本外死亡，已停止副本循環');
       if(s.deathSince===null) {s.deathSince=t;s.reviveAt=t+reviveDelay();}
-      if(t-s.deathSince>15000)return stop('副本復活逾時，未確認恢復存活');
-      if(!s.reviveSent && v.reviveRemaining===0)return stop('副本復活次數已用完');
+      if(v.reviveRemaining!==0&&t-s.deathSince>15000)return stop('副本復活逾時，未確認恢復存活');
+      if(!s.reviveSent && v.reviveRemaining===0)return {message:'本場三次復活已用完，等待隊友與副本結算'};
       if(!s.reviveSent && t>=s.reviveAt && v.reviveReady && v.reviveRemaining>0) {
         s.reviveSent=true;s.finalRevive=v.reviveRemaining===1 && v.reviveTotal===3;
         return {action:'revive',message:'已請求副本復活，等待存活確認'};
@@ -11587,7 +11926,7 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
     if(s.deathSince!==null) {
       if(s.reviveSent && s.finalRevive && !v.dead) {
         exhaustions++;onExhaustion(exhaustions);
-        if(exhaustions>=2)return stop('兩次用完副本復活，已停止');
+        // 每場原生三次復活額度獨立，不以兩場用盡停止下一場。
       }
       s.deathSince=null;s.reviveSent=false;s.finalRevive=false;s.resumeAt=t+resumeDelay();s.autoWrongSince=0;
     }
@@ -11630,18 +11969,18 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
     if (!v.targetReady || !v.settingsReady) {
       if(s.repairSince===null)s.repairSince=t;
       if (t-s.repairSince > 90000) return stop('準備副本或隊伍設定逾時');
-      return { action: 'prepare', message: '前往王都並準備鎖定副本／隊伍設定' };
+      return { action: 'prepare', message: '前往曙光村並準備鎖定副本／隊伍設定' };
     }
     s.repairSince=null;
-    if (!s.deadline) { s.deadline = t + 60000; s.phase = 'team'; }
+    if (!s.deadline) { s.deadline = t + 180000; s.phase = 'team'; }
     if(v.invitationAll) {
       if(s.allReadySince===null)s.allReadySince=t;
       if(t-s.allReadySince<20000) return {message:'全員同意，等待遊戲倒數進場'};
     } else s.allReadySince=null;
-    // 名單或設定缺失不會重置截止時間；每次失敗必須完整等滿一分鐘。
+    // 名單或設定缺失不會重置截止時間；每次失敗必須完整等滿三分鐘。
     if (t >= s.deadline) {
       if (s.attempt >= 3) return stop(`隊友卡住：三次等待均未進場（${v.teamReason || '進場未完成'}）`);
-      s.attempt++; s.deadline = t + 60000; s.sent = false;
+      s.attempt++; s.deadline = t + 180000; s.sent = false;
       // 邀請仍掛著時只在這個邊界允許重新送出，不能每個 tick 重點。
       s.sent = !!(v.arrived && v.enterReady);
       return { action: v.arrived && v.enterReady ? 'enter' : undefined,
@@ -11753,7 +12092,7 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
   let nativeReturnRequested=false,nativeTravelNextAt=0,nativeTravelPausedBaseline=0;
   const nativeWorldTravel=createSourceNativeChannelAdapter({host,kind:'dungeon',sourceRole:'leader',key:PREFIX+'native-world-v1',getContext:()=>integratedContext,getWorld:()=>PAGE.__world,isRunning:()=>enabled,document,page:PAGE,requestMap:()=>{message='等待原生地圖選單入口';}});
   const travel={reset:()=>nativeWorldTravel.cancel()};
-  function requestNativeReturn(){if(nativeWorldTravel.busy()||Date.now()<nativeTravelNextAt)return;const context=integratedContext;nativeReturnRequested=true;nativeTravelPausedBaseline=verificationPaused;nativeTravelNextAt=Date.now()+1000;nativeWorldTravel.travel('holy_city').then(result=>{if(context===integratedContext&&enabled)message=result.message;}).catch(error=>{if(context===integratedContext&&enabled)stop('原生返回王都：'+error.message);});}
+  function requestNativeReturn(){if(nativeWorldTravel.busy()||Date.now()<nativeTravelNextAt)return;const context=integratedContext;nativeReturnRequested=true;nativeTravelPausedBaseline=verificationPaused;nativeTravelNextAt=Date.now()+1000;nativeWorldTravel.travel('village').then(result=>{if(context===integratedContext&&enabled)message=result.message;}).catch(error=>{if(context===integratedContext&&enabled)stop('原生返回曙光村：'+error.message);});}
 
 
 
@@ -11792,13 +12131,13 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
   function prepare(v) {
     const w=PAGE.__world;
     if(!w?.regionId) { message='等待當前地圖資料，暫不尋找守門員'; return; }
-    const gateMap=w.regionId==='village'?'曙光村':w.regionId==='holy_city'?'王都':null;
+    const gateMap=w.regionId==='village'?'曙光村':null;
     if(!gateMap) {
       navigator.reset();
       requestNativeReturn();
       return;
     }
-    if(nativeReturnRequested){if(!nativeWorldTravel.destinationConfirmed('holy_city')){message='等待原生返回王都確認';return;}if(nativeWorldTravel.navigationView().isOpen()){assertSource();nativeWorldTravel.navigationView().close();message='等待原生地圖關閉';return;}nativeReturnRequested=false;}
+    if(nativeReturnRequested){if(!nativeWorldTravel.destinationConfirmed('village')){message='等待原生返回曙光村確認';return;}if(nativeWorldTravel.navigationView().isOpen()){assertSource();nativeWorldTravel.navigationView().close();message='等待原生地圖關閉';return;}nativeReturnRequested=false;}
     const gateTarget={regionId:w.regionId,id:'dungeon_master',name:'副本守門員 索倫'};
     const menu=nativeDungeonChoice.read();
     if(!menu) {
@@ -11979,7 +12318,7 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
     const avoid=document.createElement('input');avoid.type='checkbox';avoid.checked=options.dodge;field('BOSS技能閃避',avoid);
     const rest=document.createElement('input');rest.type='checkbox';rest.checked=options.rest;field('隨機休息',rest);
 
-    const note=document.createElement('p');note.style.whiteSpace='pre-line';note.textContent='執行場次為單副本執行次數\n隊長起動，未到場/同意每次等60秒\n連續三次失敗停止腳本\n自動同意邀請與接受招集自動勾選\n閃避至技能邊緣外30～50，保留安全路徑檢查\n隨機休息10-20場1-3分鐘';box.append(note);
+    const note=document.createElement('p');note.style.whiteSpace='pre-line';note.textContent='執行場次為單副本執行次數\n隊長起動，未到場/同意每次等180秒\n連續三次失敗停止腳本\n自動同意邀請與接受招集自動勾選\n閃避至技能邊緣外30～50，保留安全路徑檢查\n隨機休息10-20場1-3分鐘';box.append(note);
     const save=document.createElement('button');save.textContent='儲存';save.onclick=()=>{if(!targetChecks.some(c=>c.checked)){note.textContent='請至少選取一個目標';return;}if(enabled)stop('設定已變更，請重新啟動');options={level:options.level,levels:targetChecks.filter(c=>c.checked).map(c=>Number(c.value)),mode:mode.value,auto:auto.checked,dodge:avoid.checked,rest:rest.checked};limit=Math.min(9999,Math.max(1,parseInt(times.value,10)||100));write(keys.options,JSON.stringify(options));write(keys.limit,limit);box.remove();render();scheduleCollapse();};
     const close=document.createElement('button');close.textContent='取消';close.onclick=()=>{box.remove();scheduleCollapse();};box.append(save,close);if(sourceInline(box,{title:'連刷副本隊長設定'}))return;document.documentElement.append(box);heading.style.cssText="display:block;cursor:grab;touch-action:none";layout.attachDrag(box,{handle:heading,saveAfterDrag:false});
   }
@@ -12034,7 +12373,37 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
 // 隊友返回正式v1.7.0完整移植；SHA-256 4a46fbf4363080a8939fbedc0fa557a2f9039cd62235cc66e3fb65c1dccce717
 // 原每場復活／AUTO／閃避／報告保留，統一副本隊員模式。
 function createDungeonMemberAdapter(host) {
-  function sourceInline(panel,options={}){return Boolean(host.mountPanel?.(panel,options));}
+  function polishSourcePanel(panel,kind){
+  const document=panel.ownerDocument,make=(tag,text)=>{const el=document.createElement(tag);if(text)el.textContent=text;return el;};
+  if(kind==='daily'&&panel.querySelector('form')){
+    const form=panel.querySelector('form');Object.assign(form.style,{padding:'0',background:'transparent',border:'0',borderRadius:'0'});
+    const taskOptions=form.querySelector('[data-task-options]'),toggle=form.querySelector('[data-toggle-tasks]');if(taskOptions)taskOptions.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');
+    for(const p of form.querySelectorAll('p'))if(/^目前角色（自動偵測）|設定依目前登入角色保存/.test(p.textContent.trim()))p.remove();
+    const notes=make('ol');notes.setAttribute('data-assistant-setting-notes','');notes.style.cssText='margin:10px 0 0;padding-left:22px;font-size:11px;color:#cbd5e1;line-height:1.5';
+    const noteEntries=[];for(const p of form.querySelectorAll('p')){
+      if(/開場固定種六格/.test(p.textContent)){noteEntries.push([1,p.textContent]);p.remove();}
+      else if(/材料可重複選擇/.test(p.textContent)){noteEntries.push([12,p.textContent]);p.remove();}
+      else if(/簡要說明/.test(p.textContent)){noteEntries.push([2,'公會預設捐獻銀幣與金幣；副本素材只捐獻庫存大於投入量10倍的項目。'],[4,'傳奇特權只應用於遠端王國任務繳交。'],[8,'活力購買補跑不再追加。'],[9,'採集工具會嘗試做兩把新的。']);p.remove();}
+    }
+    for(const [,text]of noteEntries.sort((a,b)=>a[0]-b[0]))notes.append(make('li',text));if(noteEntries.length)form.append(notes);
+  }
+  if(kind==='battle'&&panel.querySelector('[data-level]')){
+    const level=panel.querySelector('[data-level]'),oldCurrent=level.value==='current';for(const option of level.querySelectorAll('option[value="current"]'))option.remove();
+    if(oldCurrent){const option=make('option','請重新選擇掛網目標');option.value='';option.selected=true;level.prepend(option);level.value='';const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='舊設定使用當前地圖，請重新選擇掛網目標後保存。';}
+    panel.querySelector('[data-save]')?.addEventListener('click',event=>{if(level.value!=='')return;event.preventDefault();event.stopImmediatePropagation();const warning=panel.querySelector('[data-follow-error]');if(warning)warning.textContent='請重新選擇掛網目標後保存。';},true);
+    for(const fieldset of panel.querySelectorAll('fieldset')){
+      if(!fieldset.querySelector('[data-on]'))continue;const row=fieldset.querySelector('div'),enabled=row.querySelector('label'),type=row.querySelector('select'),stock=row.querySelector('[data-item]'),threshold=row.querySelector('[data-threshold]')?.closest('label'),interval=row.querySelector('[data-interval]')?.closest('label');
+      const first=make('div'),second=make('div');first.className='assistant-potion-top';second.className='assistant-potion-bottom';for(const line of [first,second])line.style.cssText='display:flex;align-items:center;gap:6px;flex-wrap:wrap';first.append(enabled,type,stock);second.append(threshold,interval);row.replaceChildren(first,second);row.style.cssText='display:grid;gap:4px;min-width:0';fieldset.style.cssText='min-width:0;margin:6px 0;padding:6px;border:1px solid #64748b;border-radius:5px';
+    }
+    for(const div of panel.querySelectorAll('div'))if(div.querySelector('[data-dest]')){div.style.flexWrap='wrap';div.style.whiteSpace='normal';div.style.gap='5px';const dest=div.querySelector('[data-dest]');dest.style.width='190px';const note=div.querySelector('[data-rift-note]');if(note){note.style.whiteSpace='normal';note.style.flexShrink='1';}}
+    for(const line of panel.querySelectorAll('[data-role-controls],[data-follow-range]')){line.style.flexWrap='wrap';line.style.whiteSpace='normal';line.style.gap='5px';}
+    const exp=panel.querySelector('[data-exp-scroll-row]');if(exp){exp.style.flexWrap='wrap';exp.style.whiteSpace='normal';exp.style.overflowX='visible';exp.style.padding='0';}
+    const extras=panel.querySelector('[data-dodge]')?.closest('p');if(extras){extras.style.flexWrap='wrap';extras.style.whiteSpace='normal';extras.style.overflowX='visible';extras.style.gap='4px 8px';}
+  }
+  if(kind==='dungeon-leader'||kind==='dungeon-member')for(const label of panel.querySelectorAll('label')){
+    if(!label.querySelector('input[type="checkbox"]'))continue;for(const node of [...label.childNodes])if(node.nodeType===3&&/進副本後自動 AUTO|^自動戰鬥\s*$/.test(node.textContent))node.textContent='副本啟用內建auto ';}
+}
+  function sourceInline(panel,options={}){if(!host.onMountPanel)return false;polishSourcePanel(panel,"dungeon-member");return Boolean(host.mountPanel?.(panel,options));}
   function sourceSettingsAnchor(){const rect=host.anchor()?.getBoundingClientRect?.()??{left:0,top:0,right:0,bottom:0};const panel=document.createElement('section');panel.getBoundingClientRect=()=>rect;return panel;}
 
 'use strict';
@@ -12814,8 +13183,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.94.2';
-const RUNTIME_VERSION='0.94.2';
+const SCRIPT_VERSION='0.95.0';
+const RUNTIME_VERSION='0.95.0';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
@@ -12841,7 +13210,13 @@ anchor.append(heading,status,metrics,message,buttons);document.documentElement.a
 const layout=createFloatingPanelLayout({readPosition:()=>GM_getValue(PREFIX+':position',null),writePosition:v=>GM_setValue(PREFIX+':position',v),clearPosition:()=>GM_deleteValue(PREFIX+':position'),viewport:()=>({width:innerWidth,height:innerHeight})});
 layout.restore(anchor);layout.attachDrag(anchor,{handle:heading});
 const compactPanel=createCompactAssistantPanel({document,anchor,heading,status,metrics,message,buttons,readDockWidth:()=>GM_getValue(PREFIX+':status-width',null),writeDockWidth:value=>GM_setValue(PREFIX+':status-width',value),readDockRightBoundary:()=>readNativeQuickbarBoundary(document),onError:error=>{notice=error.message;render();}});
-const mountAssistantPanel=(panel,options)=>compactPanel.mountPanel(panel,options);
+const mountAssistantPanel=(panel,options)=>{
+ if(options?.source==='battle'){
+  const owner=roleId;
+  panel.assistantRefresh=()=>{if(!panel.isConnected||identity().characterId!==owner)return;const slots=readManualAutoPotionSlots({document,getWorld:()=>PAGE.__world});for(const node of panel.querySelectorAll('[data-item]')){const slot=slots.find(item=>item.slot===Number(node.dataset.item));if(slot)node.textContent=slot.quantity!==null?'原生庫存 '+slot.quantity+' 個':slot.known&&!slot.bound?'尚未綁定':'未讀取';}};
+ }
+ return compactPanel.mountPanel(panel,options);
+};
 const dockLayout=createFloatingPanelLayout({readPosition:()=>GM_getValue(PREFIX+':status-position',null),writePosition:v=>GM_setValue(PREFIX+':status-position',v),clearPosition:()=>GM_deleteValue(PREFIX+':status-position'),viewport:()=>({width:innerWidth,height:innerHeight})});
 dockLayout.restore(compactPanel.dock);dockLayout.attachDrag(compactPanel.dock,{handle:compactPanel.logo,excludeSelector:'button:not([data-assistant-logo]),select,input,textarea,a',saveAfterDrag:false,onStart:()=>compactPanel.setDragging?.(true),onEnd:(_panel,{moved})=>{compactPanel.setDragging?.(false);if(moved)compactPanel.saveDockPosition?.(position=>GM_setValue(PREFIX+':status-position',JSON.stringify(position)));}});
 const button=(label,handler)=>{const b=document.createElement('button');b.textContent=label;b.style.cssText='padding:5px 8px;border-radius:5px;border:1px solid #8292aa;background:#293d58;color:white;cursor:pointer';b.addEventListener('click',()=>Promise.resolve().then(handler).catch(e=>{notice=e.message;render();}));buttons.append(b);compactPanel.register(label,b);return b;};
@@ -12923,7 +13298,7 @@ function initializeRole() {
   if(pending&&!controller.pending){controller.pending={...pending,characterId:roleId};controller.state='reconciling';controller.persist();}
   restoreNativeSourcePending();
   const transport=createExtensionCoreTransport(PAGE);
-  const receiver=new CommandReceiver(controller,{capabilities:['task.start','task.start:battle.manual-auto:v1','task.pause','task.stop','task.resume','task.reconcile','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],execute:async command=>{
+  const receiver=new CommandReceiver(controller,{capabilities:['task.start','task.start:battle.manual-auto:v1',MANUAL_TASK_CAPABILITY,'task.pause','task.stop','task.resume','task.reconcile','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],execute:async command=>{
     if(identity().characterId!==ownerId)throw new ControlError('identity_changed','指令屬於原角色');
     if(command.type==='page.reload'){if(safePause?.job)throw new ControlError('pause_busy','等待安全暫停完成');return coreReload.request(command);}
     if(coreReload?.job&&['task.start','task.resume','farm.service','party.ensure','party.rendezvous'].includes(command.type))throw new ControlError('reload_busy','重整等待安全交接，暫不開始其他任務');
@@ -12937,18 +13312,19 @@ function initializeRole() {
       const kind=command.type==='farm.service'?'farm':command.payload.taskKind;
       if(!['farm','battle','daily','boss','dungeon','party'].includes(kind))throw new ControlError('unsupported_task','此任務尚未接入');
       assertSourcesReadable();
+      if(manualTaskStart(command))return executeManualTaskStart(ownerController,command,{acquire:()=>acquireRoleLock(ownerId,ownerController)});
       if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.active)throw new ControlError('task_busy','先完成目前任務交接');
       const manual=command.payload.manualAuto;
       const priorManualPause=ownerController.manualPause;
       let settings=controller.config?.settings?.[kind]||{};
-      if(manual!==undefined){if(kind!=='battle'||manual?.schemaVersion!==1)throw new ControlError('unsupported_task','核心AUTO格式不相容');validateManualAuto(manual.auto);settings={manualAuto:true,auto:structuredClone(manual.auto)};controller.manualPause=false;controller.persist();}
+      if(manual!==undefined){if(kind!=='battle'||manual?.schemaVersion!==1)throw new ControlError('unsupported_task','核心AUTO格式不相容');const auto=normalizeManualAutoSettings(manual.auto);validateManualAuto(auto);settings={manualAuto:true,auto};controller.manualPause=false;controller.persist();}
       try{await acquireRoleLock(ownerId,ownerController);return await ownerController.start(kind,{runId:command.runId,settings});}
       catch(error){if(manual!==undefined&&!ownerController.active&&!ownerController.cleanup){ownerController.manualPause=priorManualPause;ownerController.persist();}throw error;}
     }
     throw new ControlError('unsupported_capability','指令尚未接入');
   }});
   session=new CoreSession({transport,controller,receiver,identity,snapshot,results,scriptVersion:SCRIPT_VERSION,runtimeVersion:RUNTIME_VERSION,
-    capabilities:['observe','results.ack:v1','results.chunk:v1','config.recovery:v1','task.start:farm','task.start:battle','task.start:battle.manual-auto:v1','task.start:daily','task.start:boss','task.start:dungeon','task.start:party','task.pause','task.stop','task.resume','task.reconcile','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],
+    capabilities:['observe','results.ack:v1','results.chunk:v1','config.recovery:v1','task.start:farm','task.start:battle','task.start:battle.manual-auto:v1',MANUAL_TASK_CAPABILITY,'task.start:daily','task.start:boss','task.start:dungeon','task.start:party','task.pause','task.stop','task.resume','task.reconcile','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],
     pairingStore:{get:()=>GM_getValue(PREFIX+':pairing',null),set:value=>GM_setValue(PREFIX+':pairing',value)}});
   coreReload=new CorePageReload({controller:ownerController,receiver,session,reload:()=>{closed=true;clearInterval(mainTimer);release();PAGE.location.reload();}});
   safePause=new SafePauseManager({controller:ownerController,receiver,session,onStatus:value=>{notice=value;}});
@@ -12982,10 +13358,19 @@ function render() {
 }
 function assertSourcesReadable(){restoreNativeSourcePending();if(safePause?.job)throw new ControlError('pause_busy','等待安全暫停完成');if(controller?.mode==='managed'&&session?.results?.load().length>=30)throw new ControlError('delivery_full','未交付成果已達上限，等待核心接收後再開始');for(const runtime of sourceRuntimes.values())if(runtime.storageError)throw runtime.storageError;}
 function sourceSettings(kind){return kind==='dungeon'?{...dungeonAdapter.getSettings(),role:dungeonRole.value}:controller.adapters.get(kind).getSettings();}
-function localSettings(kind){return drafts?.settings(kind,sourceSettings(kind))??sourceSettings(kind);}
+function localSettings(kind){const value=drafts?.settings(kind,sourceSettings(kind))??sourceSettings(kind),team=taskTeam(kind);return team?.ensure?.action==='assemble'?{...value,role:team.ensure.role}:value;}
 function applyDraftBoundary(){if(drafts?.applyAtBoundary()){if(routine?.state.enabled){for(const [kind,draft]of Object.entries(drafts.data().approved??{}))routine.state.settings[kind]=structuredClone(draft.values);routine.persist();}notice='核准草稿已採用，下一個新任務使用；原執行快照保留';}}
 function openSourceSettings(kind){initializeRole();if(!controller)throw new Error('等待角色載入');if(controller.active?.kind===kind||controller.cleanup?.kind===kind)throw new Error('目前功能正在執行；請到安全點停止後修改原功能設定');const adapter=controller.adapters.get(kind);if(!adapter)throw new Error('設定尚未接入');adapter.settings(kind==='dungeon'?dungeonRole.value:undefined);}
-async function startLocal(kind,overrides={}){initializeRole();if(modeInitializing)throw new ControlError('mode_initializing','正在確認控制模式，請稍候');assertSourcesReadable();if(!controller)throw new Error('等待角色載入');const c=controller,owner=roleId;if(c.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(c.active)throw new ControlError('task_busy','先完成目前任務交接');if(c.mode!=='standalone')throw new Error('核心模式請由核心派發');if(c.manualPause){c.manualPause=false;c.persist();}const adapter=c.adapters.get(kind);if(!adapter)throw new Error('任務尚未接入');routine?.suspend('使用者改以單項任務操作');routine?.archivePlan();applyDraftBoundary();if(['battle','dungeon','boss'].includes(kind)&&routineFarm.checked&&farmInterruptControls[kind].checked&&!Object.keys(overrides).length){await routine.begin({primaryKind:kind,dailyEnabled:false,farmEnabled:true,farmInterrupt:farmInterruptSettings(),team:null});notice='單項任務已啟動，種植到期等待安全點插隊';render();return;}for(const editor of document.querySelectorAll('[id^="endless-integrated-assistant"][id$="-settings"]'))editor.remove();const settings={...localSettings(kind),...overrides};await acquireRoleLock(owner,c);if(controller!==c||identity().characterId!==owner)throw new ControlError('identity_changed','角色已切換，原AUTO操作已取消');try{await c.start(kind,{runId:crypto.randomUUID(),settings});notice='流程已開始，成果由原生回讀確認';}catch(error){if(controller===c&&!c.active&&!c.cleanup)release();throw error;}render();}
+function taskTeam(kind){const settings=store.read(roleId,'settings',{})??{};const team=settings.taskTeams?.[kind]??settings.routineTeam??null;if(!team||!['battle','dungeon'].includes(kind))return null;const value=structuredClone(team);if(value.ensure?.action==='assemble')value.ensure.purpose=kind;return value;}
+function taskSnapshot(kind,overrides={}){const settings=kind==='party'&&Object.keys(overrides).length?structuredClone(overrides):{...localSettings(kind),...overrides},team=taskTeam(kind);if(team?.ensure?.action==='assemble')settings.role=team.ensure.role;return settings;}
+async function startLocal(kind,overrides={}){
+ initializeRole();if(modeInitializing)throw new ControlError('mode_initializing','正在確認控制模式，請稍候');assertSourcesReadable();if(!controller)throw new Error('等待角色載入');const c=controller,owner=roleId,adapter=c.adapters.get(kind);if(!adapter)throw new Error('任務尚未接入');
+ applyDraftBoundary();const settings=taskSnapshot(kind,overrides);if(kind==='battle'&&!settings.manualAuto&&settings.level==='current')throw new Error('請先在刷怪設定選擇目標地圖；目前地圖可使用自動戰鬥');adapter.validate(settings);
+ if(c.mode==='managed'){closeSourceEditors();const options={team:taskTeam(kind),farmEnabled:false,farmInterrupt:farmInterruptSettings()};await session.manualTask({action:'start',taskKind:kind,settings,options});notice='已請核心執行'+(PLAN_TASK_LABELS[kind]??kind)+'，等待安全交接與原生確認';render();return;}
+ if(c.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(c.active)throw new ControlError('task_busy','先安全停止目前任務再切換');if(c.pending)throw new ControlError('unknown_result','先核對未明操作再開始');if(c.manualPause){c.manualPause=false;c.persist();}routine?.suspend('使用者改以單項任務操作');routine?.archivePlan();
+ if(['battle','dungeon','boss'].includes(kind)&&((routineFarm.checked&&farmInterruptControls[kind].checked)||taskTeam(kind))&&!overrides.manualAuto){await routine.begin({primaryKind:kind,dailyEnabled:false,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:taskTeam(kind)});notice='單項任務已啟動，組隊與種植等待安全點';render();return;}
+ closeSourceEditors();await acquireRoleLock(owner,c);if(controller!==c||identity().characterId!==owner)throw new ControlError('identity_changed','角色已切換，原操作已取消');try{await c.start(kind,{runId:crypto.randomUUID(),settings});notice='流程已開始，成果由原生回讀確認';}catch(error){if(controller===c&&!c.active&&!c.cleanup)release();throw error;}render();
+}
 button('開始種植',()=>startLocal('farm'));
 button('開始戰鬥',()=>startLocal('battle'));
 button('開始每日',()=>startLocal('daily'));
@@ -13003,7 +13388,7 @@ button('副本設定',()=>openSourceSettings('dungeon'));
 button('副本紀錄',()=>{initializeRole();if(!dungeonAdapter)throw new Error('等待角色載入');dungeonAdapter.records(dungeonRole.value);});
 const dailyStages=document.createElement('select');dailyStages.title='選擇補跑階段';
 for(const [value,label]of [['','全部每日'],['farming','每日種植'],['friends','白名單互讚'],['guild','公會作業'],['hunting','邊境狩獵'],['kingdom','三王國委託'],['transport','王國護送'],['trial','每日副本'],['recharge','成品補給'],['vitality','購買活力'],['gathering','材料採集'],['adventure','冒險大廳'],['activity','每日活動'],['welfare','簽到與津貼'],['certificates','憑證兌換']]){const option=document.createElement('option');option.value=value;option.textContent=label;dailyStages.append(option);}buttons.append(dailyStages);compactPanel.register('補跑階段',dailyStages);
-button('每日補跑',()=>startLocal('daily',{taskId:dailyStages.value||'',rerunAll:!dailyStages.value}));
+button('開始補跑',()=>startLocal('daily',{taskId:dailyStages.value||'',rerunAll:!dailyStages.value}));
 button('種植設定',()=>openSourceSettings('farm'));
 button('戰鬥設定',()=>openSourceSettings('battle'));
 button('戰鬥紀錄',()=>{initializeRole();if(!battleAdapter)throw new Error('等待角色載入');battleAdapter.records();});
@@ -13011,13 +13396,13 @@ button('每日設定',()=>openSourceSettings('daily'));
 button('每日日誌',()=>{initializeRole();if(!dailyAdapter)throw new Error('等待角色載入');dailyAdapter.records();});
 button('野王設定',()=>openSourceSettings('boss'));
 button('設定草稿',()=>{initializeRole();if(!drafts)throw new Error('等待角色載入');showSettingsDraftPanel({document,mountPanel:mountAssistantPanel,manager:drafts,settings:sourceSettings,edit:openSourceSettings});});
-button('指定隊伍與會合',()=>{initializeRole();if(!partyAdapter)throw new Error('等待角色載入');const owner=roleId;showPartyPanel({document,mountPanel:mountAssistantPanel,world:()=>PAGE.__world,start:settings=>startLocal('party',settings),captureLocation:()=>partyAdapter.captureLocation(),readLocation:()=>store.read(owner,'settings',{})?.meetingPoint??null,writeLocation:location=>store.write(owner,'settings',{...store.read(owner,'settings',{}),meetingPoint:location}),writeRoutineTeam:team=>{if(team){partyAdapter.validate(team.ensure);if(team.rendezvous)partyAdapter.validate(team.rendezvous);}store.write(owner,'settings',{...store.read(owner,'settings',{}),routineTeam:team});}});});
+button('指定隊伍與會合',()=>{initializeRole();if(!partyAdapter)throw new Error('等待角色載入');const owner=roleId,purpose=compactPanel.currentFeature?.()==='連刷副本'?'dungeon':'battle';showPartyPanel({document,mountPanel:mountAssistantPanel,world:()=>PAGE.__world,start:settings=>startLocal('party',settings),purpose,readTeam:()=>store.read(owner,'settings',{})?.taskTeams?.[purpose]??store.read(owner,'settings',{})?.routineTeam??null,readNames:()=>store.read(owner,'settings',{})?.partyMemberNames??{},writeRoutineTeam:(team,names)=>{if(team){partyAdapter.validate(team.ensure);if(team.rendezvous)partyAdapter.validate(team.rendezvous);}const saved=store.read(owner,'settings',{})??{};store.write(owner,'settings',{...saved,routineTeam:team,taskTeams:{...saved.taskTeams,[purpose]:team},partyMemberNames:names??saved.partyMemberNames??{}});}});});
 button('首領倒數',()=>{initializeRole();if(!bossAdapter)throw new Error('等待角色載入');bossAdapter.timers();});
 button('野王紀錄',()=>{initializeRole();if(!bossAdapter)throw new Error('等待角色載入');bossAdapter.records();});
-button('安全暫停',async()=>{initializeRole();if(!safePause)throw new Error('等待角色載入');if(coreReload?.job)throw new ControlError('reload_busy','重整已等待安全點');routine?.suspend();const checkpoint=await safePause.requestLocal();if(checkpoint)routine?.archivePlan();notice=checkpoint?'已保存接續快照':'尚未到安全點，等待當前操作確認';render();});
-button('接續',async()=>{if(!controller)throw new Error('等待角色載入');if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.active)throw new ControlError('task_busy','先完成目前任務交接');await acquireRoleLock();try{await controller.resume({manual:true});}catch(e){if(!controller.active&&!controller.cleanup)release();throw e;}notice='已接續';render();});
-button('停止',async()=>{if(controller?.mode==='managed'&&controller.active?.context.settings.manualAuto)return runManualAuto('stop');safePause?.cancel('使用者停止取消暫停等待');reloadRequested=false;coreReload?.cancel('使用者已停止');routine?.suspend('使用者已停止日常流程');await controller?.stop();notice='使用者已停止；未明操作仍保存待核對';render();});
-button('核對未明操作',async()=>{const result=await controller?.reconcile();notice=result?.confirmed?'已取得核對證據':'結果仍未確認，不重送';render();});
+button('安全暫停',async()=>{initializeRole();if(controller?.mode==='managed'){await session.manualTask({action:'pause',...(controller.active?{runId:controller.active.context.runId}:{})});notice='已請核心等待安全點暫停';render();return;}if(!safePause)throw new Error('等待角色載入');if(coreReload?.job)throw new ControlError('reload_busy','重整已等待安全點');routine?.suspend();const checkpoint=await safePause.requestLocal();if(checkpoint)routine?.archivePlan();notice=checkpoint?'已保存接續快照':'尚未到安全點，等待當前操作確認';render();});
+button('接續',async()=>{if(controller?.mode==='managed'){await session.manualTask({action:'resume',...(controller.checkpoint?{runId:controller.checkpoint.context.runId}:{})});notice='已請核心接續原安全快照';render();return;}if(!controller)throw new Error('等待角色載入');if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.active)throw new ControlError('task_busy','先完成目前任務交接');await acquireRoleLock();try{await controller.resume({manual:true});}catch(e){if(!controller.active&&!controller.cleanup)release();throw e;}notice='已接續';render();});
+button('停止',async()=>{if(controller?.mode==='managed'&&controller.active?.context.settings.manualAuto)return runManualAuto('stop');if(controller?.mode==='managed'){await session.manualTask({action:'stop',...(controller.active?{runId:controller.active.context.runId}:{})});notice='已請核心停止；等待收尾與未明操作核對';render();return;}safePause?.cancel('使用者停止取消暫停等待');reloadRequested=false;coreReload?.cancel('使用者已停止');routine?.suspend('使用者已停止日常流程');await controller?.stop();notice='使用者已停止；未明操作仍保存待核對';render();});
+button('核對未明操作',async()=>{if(controller?.mode==='managed'){await session.manualTask({action:'reconcile'});notice='已請核心核對原未明操作';render();return;}const result=await controller?.reconcile();notice=result?.confirmed?'已取得核對證據':'結果仍未確認，不重送';render();});
 modeToggle=button('核心模式',async()=>{
   initializeRole();if(!controller||!session)throw new Error('等待角色載入');if(controller.active||controller.cleanup)throw new Error('請先停止並等待目前收尾');
   const managed=controller.mode!=='managed';coreReload?.cancel('切換控制模式');
@@ -13032,23 +13417,33 @@ const routineDaily=document.createElement('input');routineDaily.type='checkbox';
 const routineFarm=document.createElement('input');routineFarm.type='checkbox';routineFarm.checked=false;const farmLabel=document.createElement('label');farmLabel.textContent='種植到期插隊';farmLabel.append(routineFarm);buttons.append(farmLabel);compactPanel.register('種植插隊',farmLabel);
 const farmInterruptControls={};for(const [kind,text]of Object.entries({battle:'刷怪時允許種植插隊',dungeon:'副本結算後允許種植插隊',boss:'野王時允許種植插隊'})){const input=document.createElement('input');input.type='checkbox';input.checked=true;const label=document.createElement('label');label.textContent=text;label.append(input);buttons.append(label);compactPanel.register(text,label);farmInterruptControls[kind]=input;}
 const farmInterruptSettings=()=>Object.fromEntries(Object.entries(farmInterruptControls).map(([kind,input])=>[kind,input.checked]));
-button('啟動日常流程',async()=>{initializeRole();assertSourcesReadable();if(!routine)throw new Error('等待角色載入');if(!controller.active&&!controller.pending&&controller.mode==='standalone'){controller.manualPause=false;controller.persist();applyDraftBoundary();}for(const editor of document.querySelectorAll('[id^="endless-integrated-assistant"][id$="-settings"]'))editor.remove();await routine.begin({primaryKind:primaryChoice.value,dailyEnabled:routineDaily.checked,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null});notice='日常流程已啟動，交接等待安全點';render();});
-button('接續日常流程',async()=>{initializeRole();assertSourcesReadable();if(!routine)throw new Error('等待角色載入');await routine.resumeSaved();notice='已核對並接續原日常流程';render();});
+button('啟動日常流程',async()=>{initializeRole();assertSourcesReadable();if(!routine)throw new Error('等待角色載入');
+ if(controller.mode==='managed'){
+  applyDraftBoundary();const steps=[];if(routineDaily.checked)steps.push({kind:'daily',settings:taskSnapshot('daily')});if(primaryChoice.value!=='idle')steps.push({kind:primaryChoice.value,settings:taskSnapshot(primaryChoice.value)});if(!steps.length&&routineFarm.checked)steps.push({kind:'farm',settings:{...localSettings('farm'),limit:1}});if(!steps.length)throw new Error('請選擇每日、主任務或種植服務');for(const step of steps)controller.adapters.get(step.kind).validate(step.settings);
+  await session.manualTask({action:'start',steps,options:{dailyEnabled:routineDaily.checked,dailySettings:taskSnapshot('daily'),farmEnabled:routineFarm.checked,farmSettings:{...localSettings('farm'),limit:1},farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null}});notice='已請核心開始日常流程，交接等待安全點';render();return;
+ }
+ if(!controller.active&&!controller.pending){controller.manualPause=false;controller.persist();applyDraftBoundary();}closeSourceEditors();await routine.begin({primaryKind:primaryChoice.value,dailyEnabled:routineDaily.checked,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null});notice='日常流程已啟動，交接等待安全點';render();});
+button('接續日常流程',async()=>{initializeRole();assertSourcesReadable();if(controller?.mode==='managed'){await session.manualTask({action:'resume',...(controller.checkpoint?{runId:controller.checkpoint.context.runId}:{})});notice='已請核心接續原日常流程';render();return;}if(!routine)throw new Error('等待角色載入');await routine.resumeSaved();notice='已核對並接續原日常流程';render();});
 button('安全重整',()=>{if(!controller)throw new Error('等待角色載入');if(controller.mode!=='standalone')throw new Error('核心模式的重整由核心安排');reloadRequested=true;notice='已排隊重整，等待目前操作與本場安全點';render();});
 const defaultPlans=()=>[[{kind:'daily',count:1},{kind:'battle',count:1}],[{kind:'daily',count:1},{kind:'boss',count:1}],[{kind:'daily',count:1},{kind:'dungeon',count:3},{kind:'boss',count:3},{kind:'battle',count:1}]];
 for(let i=0;i<3;i++){const option=document.createElement('option');option.value='plan-'+i;option.textContent='方案'+(i+1);compactPanel.choice.append(option);}
-async function executeSelection(rerun=false){initializeRole();assertSourcesReadable();if(!controller)throw new Error('等待角色載入');const selected=compactPanel.choice.value;if(selected.startsWith('plan-')){if(rerun){await routine.resumePlan(selected);}else{applyDraftBoundary();const plans=store.read(roleId,'settings',{})?.plans??defaultPlans();await routine.beginPlan(plans[Number(selected.slice(5))],{planId:selected,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null});}if(!rerun){routine.state.planLabel='方案'+(Number(selected.slice(5))+1);routine.persist();}notice=rerun?'已接續原方案進度':'已開始角色方案';render();return;}if(rerun&&controller.checkpoint?.kind===selected&&controller.checkpoint.context?.settings.manualAuto!==true){if(!routine.state.steps&&routine.state.currentRun?.runId===controller.checkpoint.context.runId&&routine.state.options?.primaryKind===selected){await routine.resumeSaved();notice='已接續原單項任務與種植插隊安排';}else{await acquireRoleLock();await controller.resume({manual:true});notice='已接續原單項任務';}render();return;}return startLocal(selected,rerun&&selected==='daily'?{rerunAll:true}:{});}
+async function executeSelection(rerun=false){initializeRole();assertSourcesReadable();if(!controller)throw new Error('等待角色載入');const selected=compactPanel.choice.value;if(selected.startsWith('plan-')){if(controller.mode==='managed'){
+ if(rerun&&controller.checkpoint){await session.manualTask({action:'resume',runId:controller.checkpoint.context.runId});notice='已請核心接續原方案';render();return;}
+ const plans=store.read(roleId,'settings',{})?.plans??defaultPlans(),steps=plans[Number(selected.slice(5))];validatePlanSteps(steps);const snapshots=steps.map(step=>({kind:step.kind,settings:planStepSettings(step,taskSnapshot(step.kind))}));for(const step of snapshots)controller.adapters.get(step.kind).validate(step.settings);
+ await session.manualTask({action:'start',steps:snapshots,options:{planId:selected,farmEnabled:steps.some(step=>step.kind==='farm'),farmSettings:{...localSettings('farm'),limit:1},farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null}});notice='已請核心執行'+selected.replace('plan-','方案')+'；交接依安全點進行';render();return;
+}if(rerun){await routine.resumePlan(selected);}else{applyDraftBoundary();const plans=store.read(roleId,'settings',{})?.plans??defaultPlans();await routine.beginPlan(plans[Number(selected.slice(5))],{planId:selected,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null});}if(!rerun){routine.state.planLabel='方案'+(Number(selected.slice(5))+1);routine.persist();}notice=rerun?'已接續原方案進度':'已開始角色方案';render();return;}if(rerun&&controller.checkpoint?.kind===selected&&controller.checkpoint.context?.settings.manualAuto!==true){if(controller.mode==='managed'){await session.manualTask({action:'resume',runId:controller.checkpoint.context.runId});notice='已請核心接續原單項快照';render();return;}if(!routine.state.steps&&routine.state.currentRun?.runId===controller.checkpoint.context.runId&&routine.state.options?.primaryKind===selected){await routine.resumeSaved();notice='已接續原單項任務與種植插隊安排';}else{await acquireRoleLock();await controller.resume({manual:true});notice='已接續原單項任務';}render();return;}return startLocal(selected,rerun&&selected==='daily'?{rerunAll:true}:{});}
 compactPanel.action('執行',()=>executeSelection());
 compactPanel.action('暫停',()=>compactPanel.execute('安全暫停'));
 compactPanel.action('補跑',()=>executeSelection(true));
-compactPanel.feature('每日任務',['每日設定','補跑階段','每日補跑','每日日誌']);
+const rerunLabel=document.createElement('span');rerunLabel.textContent='補跑按鈕：';buttons.append(rerunLabel);compactPanel.register('補跑說明',rerunLabel);
+compactPanel.feature('每日任務',['每日設定','每日日誌','補跑說明','補跑階段','開始補跑']);
 compactPanel.feature('刷怪練等',['戰鬥設定','戰鬥紀錄','指定隊伍與會合','刷怪時允許種植插隊']);
 compactPanel.feature('連刷副本',['副本角色','副本設定','副本紀錄','指定隊伍與會合','副本結算後允許種植插隊']);
 compactPanel.feature('野王狩獵',['野王設定','首領倒數','野王紀錄','野王時允許種植插隊']);
 button('種植紀錄',()=>{initializeRole();if(!roleId)throw new Error('等待角色載入');const owner=roleId;showFarmRecords({document,mountPanel:mountAssistantPanel,characterName:identity().characterName||PAGE.__world?.player?.name||owner,readHistory:()=>store.entries(owner,'history'),current:()=>farmAdapter?.observe(),managed:()=>controller?.mode==='managed',isCurrent:()=>identity().characterId===owner});});
-compactPanel.feature('自動種植',['種植設定','種植紀錄','種植插隊']);
-compactPanel.feature('AUTO 設定',['AUTO設定入口']);
-function readManualAuto(){const auto=structuredClone(store.read(roleId,'settings',{})?.manualAuto??DEFAULT_MANUAL_AUTO);validateManualAuto(auto);return auto;}
+compactPanel.feature('自動種植',['種植設定','種植紀錄']);
+compactPanel.feature('自動戰鬥',['自動戰鬥設定']);
+function readManualAuto(){const auto=normalizeManualAutoSettings(store.read(roleId,'settings',{})?.manualAuto??DEFAULT_MANUAL_AUTO);validateManualAuto(auto);return auto;}
 async function runManualAuto(action,auto=null){
   initializeRole();if(!controller||!session)throw new Error('等待角色載入');if(modeInitializing)throw new ControlError('mode_initializing','正在確認控制模式，請稍候');if(autoActionBusy||autoIntent)throw new Error('AUTO啟停確認中');
   if(controller.cleanup)throw new Error('等待原執行收尾');if(action==='start'&&controller.pending)throw new Error('等待未明操作核對');
@@ -13072,8 +13467,8 @@ async function toggleManualAuto(){
   if(controller?.active?.context.settings.manualAuto)return runManualAuto('stop');
   initializeRole();if(!roleId)throw new Error('等待角色載入');const auto=readManualAuto();auto.battle=true;return runManualAuto('start',auto);
 }
-function openManualAuto(){initializeRole();if(!roleId)throw new Error('等待角色載入');const owner=roleId;return showManualAutoPanel({document,mountPanel:mountAssistantPanel,prefix:PREFIX,read:()=>store.read(owner,'settings',{})?.manualAuto??structuredClone(DEFAULT_MANUAL_AUTO),write:manualAuto=>store.write(owner,'settings',{...store.read(owner,'settings',{}),manualAuto}),isCurrent:()=>identity().characterId===owner,status:()=>controller?.active?.context.settings.manualAuto?'AUTO執行中':controller?.cleanup?.context.settings.manualAuto?'AUTO收尾中':'AUTO尚未啟用',history:()=>store.entries(owner,'history'),resume:async()=>{if(controller?.mode==='managed')throw new Error('核心模式的接續由核心安排');if(controller?.checkpoint?.sourceRole!=='manual')throw new Error('沒有AUTO的安全快照');assertSourcesReadable();await acquireRoleLock();await controller.resume({manual:true});render();},start:auto=>runManualAuto('start',auto),stop:()=>runManualAuto('stop')});}
-button('AUTO設定入口',openManualAuto);
+function openManualAuto(){initializeRole();if(!roleId)throw new Error('等待角色載入');const owner=roleId;return showManualAutoPanel({document,mountPanel:mountAssistantPanel,prefix:PREFIX,read:()=>normalizeManualAutoSettings(store.read(owner,'settings',{})?.manualAuto??DEFAULT_MANUAL_AUTO),readGuildSkills:()=>readManualAutoGuildCatalog({getWorld:()=>PAGE.__world}),readPotionSlots:()=>readManualAutoPotionSlots({document,getWorld:()=>PAGE.__world}),write:manualAuto=>store.write(owner,'settings',{...store.read(owner,'settings',{}),manualAuto}),isCurrent:()=>identity().characterId===owner,status:()=>controller?.active?.context.settings.manualAuto?'AUTO執行中':controller?.cleanup?.context.settings.manualAuto?'AUTO收尾中':'AUTO尚未啟用',history:()=>store.entries(owner,'history'),resume:async()=>{if(controller?.mode==='managed'){await session.manualTask({action:'resume',...(controller.checkpoint?{runId:controller.checkpoint.context.runId}:{})});notice='已請核心接續自動戰鬥安全快照';render();return;}if(controller?.checkpoint?.sourceRole!=='manual')throw new Error('沒有AUTO的安全快照');assertSourcesReadable();await acquireRoleLock();await controller.resume({manual:true});render();},start:auto=>runManualAuto('start',auto),stop:()=>runManualAuto('stop')});}
+button('自動戰鬥設定',openManualAuto);
 compactPanel.setAutoAction(toggleManualAuto);
 compactPanel.feature('方案流程',['接續','停止','核對未明操作','編輯三套方案','每日後主任務','換日設定','種植插隊','啟動日常流程','接續日常流程','設定草稿']);
 button('編輯三套方案',()=>{initializeRole();if(!roleId)throw new Error('等待角色載入');const owner=roleId;showPlanEditor({document,mountPanel:mountAssistantPanel,prefix:PREFIX,read:()=>store.read(owner,'settings',{})?.plans??defaultPlans(),write:plans=>store.write(owner,'settings',{...store.read(owner,'settings',{}),plans}),isCurrent:()=>identity().characterId===owner});});
