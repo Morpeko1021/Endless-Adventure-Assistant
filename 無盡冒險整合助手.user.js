@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.95.2
+// @version      0.95.4
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -1786,12 +1786,13 @@ function normalizeNativeItemNames(data){
 }
 
 // 從原戰鬥公會監控抽出同一排程；所有來源共用原生交易保存。
-const MANUAL_AUTO_GUILD_SKILL_IDS=Object.freeze(['guild_battle_banner','guild_guard_oath','guild_rally_call','guild_adventure_guidance','guild_rest_breath','guild_expedition_ready']);
+const LEGACY_MANUAL_AUTO_GUILD_SKILL_IDS=Object.freeze(['guild_battle_banner','guild_guard_oath','guild_rally_call','guild_adventure_guidance','guild_rest_breath','guild_expedition_ready']);
+const MANUAL_AUTO_GUILD_SKILL_IDS=Object.freeze([...LEGACY_MANUAL_AUTO_GUILD_SKILL_IDS,'guild_gather_chant','guild_safe_return']);
 function readNativeManualGuildSkills(getWorld){
   const world=getWorld?.();if(!world?.charId||!world.player||typeof world._resolveSkillRef!=='function')return [];
-  const rows=[];for(const id of MANUAL_AUTO_GUILD_SKILL_IDS){let skill;try{skill=world._resolveSkillRef(id);}catch{continue;}if(world!==getWorld()||skill?.isGuildSkill!==true||!Number.isFinite(Number(skill.rank))||!(Number(skill.rank)>0))continue;rows.push({id,name:typeof skill.name==='string'&&skill.name?skill.name:id,rank:Number(skill.rank),available:true});}return rows;
+  const rows=[];for(const id of MANUAL_AUTO_GUILD_SKILL_IDS){let skill;try{skill=world._resolveSkillRef(id);}catch{continue;}if(world!==getWorld()||skill?.isGuildSkill!==true||skill.id!==undefined&&skill.id!==id||!Number.isFinite(Number(skill.rank))||!(Number(skill.rank)>0))continue;rows.push({id,name:typeof skill.name==='string'&&skill.name?skill.name:id,rank:Number(skill.rank),available:true});}return rows;
 }
-function createNativeBattleGuildMonitor({host,context,getWorld,skillIds,now=Date.now,random=Math.random,blocked=()=>false}){
+function createNativeBattleGuildMonitor({host,context,getWorld,skillIds,manualSkillIds=skillIds,now=Date.now,random=Math.random,blocked=()=>false}){
   const states=new Map();let owner=null,identity='',lastSent=-Infinity,operation=null,epoch=0;
   function reset(){epoch++;states.clear();owner=null;identity='';lastSent=-Infinity;}
   function reconcile(record){if(record?.kind==='native-battle-guild'&&record.characterId===getWorld()?.charId&&record.role===getWorld()?.player?.name&&record.submitted!==true&&!operation){host.pending(null);return {confirmed:true,evidence:'未提交的公會技能準備已取消'};}const w=getWorld(),confirmed=record?.kind==='native-battle-guild'&&w?.charId===record.characterId&&w.player?.name===record.role&&w.serverAuthoritativeResources===true&&nativeGuildSkillActive(w,record.skillId,now);if(confirmed){host.pending(null);states.delete(record.skillId);}return {confirmed:Boolean(confirmed),evidence:confirmed?'原生公會技能增益已確認':null};}
@@ -1800,8 +1801,8 @@ function createNativeBattleGuildMonitor({host,context,getWorld,skillIds,now=Date
     const pending=host.currentPending();if(pending){if(pending.kind==='native-battle-guild')reconcile(pending);return Boolean(host.currentPending());}
     if(!w?.player||w!==getWorld()||typeof w._resolveSkillRef!=='function'||typeof w.prepareSkill!=='function')return false;
     const data=w.guildTerritoryContext?.skills||w.player.guildSkills,key=String(w.charId||'')+'|'+JSON.stringify(data?.allocation||{});if(owner!==w||key!==identity){reset();owner=w;identity=key;}
-    const chosenIds=context()?.settings?.manualAuto===true?context().settings.auto?.guildSkillIds??skillIds:skillIds;
-    if(!Array.isArray(chosenIds)||new Set(chosenIds).size!==chosenIds.length||chosenIds.some(id=>!skillIds.includes(id)))return false;
+    const manual=context()?.settings?.manualAuto===true,allowedIds=manual?manualSkillIds:skillIds,chosenIds=manual?context().settings.auto?.guildSkillIds??skillIds:skillIds;
+    if(!Array.isArray(allowedIds)||!Array.isArray(chosenIds)||new Set(chosenIds).size!==chosenIds.length||chosenIds.some(id=>!allowedIds.includes(id)))return false;
     const t=now(),ready=[];for(const id of chosenIds){let skill;try{skill=w._resolveSkillRef(id);}catch{continue;}if(!skill?.isGuildSkill||!(Number(skill.rank)>0)){states.delete(id);continue;}const cd=Number(w.guildSkillCooldowns?.[id]||w.cooldowns?.[id]||0);if(!Number.isFinite(cd))continue;let state=states.get(id);if(state?.retryAt>t)continue;if(!state||state.cooldown!==cd){state={cooldown:cd,due:Math.max(cd,t)+(1+Math.min(29,Math.floor(random()*30)))*1000};states.set(id,state);}if(cd<=t&&t>=state.due&&!nativeGuildSkillActive(w,id,now))ready.push({id,skill});}
     if(!allowed||blocked()||w.dead||w.serverAuthoritativeResources!==true||w.isWorldInteractionLocked?.()||w.castingState||w._queuedCast||w.pendingSkill||w._isSilenced?.()||t-lastSent<1000)return false;
     const chosen=ready.find(({skill})=>Number.isFinite(Number(skill.mpCost))&&Number.isFinite(Number(w.player.mp))&&Number(w.player.mp)>=Number(skill.mpCost));if(!chosen)return false;
@@ -1826,6 +1827,7 @@ function readNativeHomeGardenObjects({world,readPlots,now=Date.now}){
   return readPlots(world).map(plot=>{if(plot.cropId&&(!nativeHomeCropIds.includes(plot.cropId)||!Number.isFinite(plot.readyAt)||typeof plot.watered!=='boolean'))throw new Error('原生菜圃作物資料未就緒');return {...plot,plotStage:!plot.cropId?'empty':plot.readyAt<=time?'mature':'sprout'};});
 }
 const nativeHomeRegions=new Set(['player_home','player_home_garden']);
+function isNativeOutsideHome(world){return typeof world?.regionId==='string'&&Boolean(world.regionId)&&!nativeHomeRegions.has(world.regionId)&&nativeHomeOwner(world.instanceId)===null&&nativeHomeOwner(world.player?.instanceId)===null;}
 const nativeHomeInteger=value=>Number.isSafeInteger(value)&&value>=0;
 function nativeHomePlots(home,ids){
   if(!home?.plots||typeof home.plots!=='object'||!Array.isArray(ids)||ids.length!==6||new Set(ids).size!==6)throw new Error('原生六格家園資料未確認');
@@ -1844,12 +1846,25 @@ function createNativeHomeView({document,getWorld,characterId,verify}){
   const readHud=()=>readNativeViewProps({document,selector:'aside.home-v1-hud',accept:props=>props.characterId===characterId&&typeof props.onTravel==='function'&&props.state});
   const readActions=()=>readNativeViewProps({document,selector:'.home-experience-panel',accept:props=>props.characterId===characterId&&props.homeState&&typeof props.onAction==='function'});
   const menu=createNativeMenuView({document,verify,targetId:'home'});
+  const leaveTickets=new WeakMap();
+  function leaveEntry(allowVisitor){
+    const world=getWorld();if(world?.charId!==characterId||!nativeHomeRegions.has(world.regionId))return null;let hud,node=null,worldOwner=null;
+    if(allowVisitor){const rows=readNativeViewEntries({document,selector:'aside.home-v1-hud',accept:(props,entry)=>props.characterId===characterId&&typeof props.onLeaveHome==='function'&&Boolean(nativeViewWorldOwner(entry,world))});if(rows.length!==1)return null;node=rows[0].node;hud=rows[0].props;worldOwner=nativeViewWorldOwner(node,world);}else hud=readHud();
+    if(typeof hud?.onLeaveHome!=='function')return null;
+    if(allowVisitor&&(typeof world.instanceId!=='string'||typeof world.player?.instanceId!=='string'||world.instanceId!==world.player.instanceId))return null;
+    const instances=[world.instanceId,world.player?.instanceId].filter(value=>value!==undefined&&value!==null),owner=instances.length&&new Set(instances).size===1?nativeHomeOwner(instances[0]):null;
+    if(!owner||!allowVisitor&&!isNativeOwnHome(world))return null;
+    return {world,hud,node,worldOwner,owner,regionId:world.regionId,instanceId:instances[0],onLeaveHome:hud.onLeaveHome};
+  }
+  function sameLeaveEntry(a,b){return Boolean(a&&b&&a.world===b.world&&a.hud===b.hud&&a.node===b.node&&a.worldOwner===b.worldOwner&&a.owner===b.owner&&a.regionId===b.regionId&&a.instanceId===b.instanceId&&a.onLeaveHome===b.onLeaveHome);}
+  function prepareLeave({allowVisitor=false}={}){verify();const entry=leaveEntry(allowVisitor);if(!entry)return null;const ticket=Object.freeze({regionId:entry.regionId,instanceId:entry.instanceId,ownerCharacterId:entry.owner});leaveTickets.set(ticket,{entry,allowVisitor});return ticket;}
   return {
     hud:readHud,actions:readActions,
     prepareEntry(){verify();return Boolean(readHud())||menu.prepare();},
     enter(regionId){verify();if(!nativeHomeRegions.has(regionId))throw new Error('原生家園目的地無效');const hud=readHud();if(hud){hud.onTravel(regionId,{ownerCharacterId:characterId});verify();return;}if(regionId!=='player_home')throw new Error('尚未抵達自己的家園');if(!menu.open())throw new Error('原生家園選單入口未就緒');verify();},
     prepareActions(){verify();if(readActions())return true;const hud=readHud();if(!isNativeOwnHome(getWorld())||typeof hud?.onDashboard!=='function')throw new Error('原生家園總覽入口未就緒');verify();hud.onDashboard();verify();return false;},
-    leave(){verify();const hud=readHud();if(!isNativeOwnHome(getWorld())||typeof hud?.onLeaveHome!=='function')throw new Error('原生離開家園入口未就緒');verify();hud.onLeaveHome();verify();},
+    prepareLeave,
+    leave({ticket=null,beforeSend=()=>{}}={}){verify();ticket??=prepareLeave();const saved=ticket&&leaveTickets.get(ticket);if(!saved||!sameLeaveEntry(saved.entry,leaveEntry(saved.allowVisitor)))throw new Error('原生離開家園入口未就緒');verify();beforeSend();verify();if(!sameLeaveEntry(saved.entry,leaveEntry(saved.allowVisitor)))throw new Error('保存後原生離家入口或屋主已變');leaveTickets.delete(ticket);const result=saved.entry.onLeaveHome();result?.catch?.(()=>{});verify();return result;},
     send(action,payload,before){verify();const props=readActions();if(!props||props.homeEconomyBusy!==false||props.homeOwnerCharacterId&&props.homeOwnerCharacterId!==characterId||!isNativeOwnHome(getWorld(),'player_home_garden'))throw new Error('原生家園操作入口或屋主未確認');const current=nativeHomePlots(props.homeState,before.plots.map(plot=>plot.plotId));if(nativeHomePlotFingerprint(current)!==nativeHomePlotFingerprint(before.plots))throw new Error('原生家園介面與伺服器資料不同，未送出');verify();return props.onAction(action,payload);}
   };
 }
@@ -1871,7 +1886,7 @@ function createNativeHomeFlow({api,view,getWorld,context,day,verify,readRecord,w
   function proof(record,state){
     if(record.day!==day||record.characterId!==context.characterId)return false;
     if(record.action==='enter-home'||record.action==='enter-garden')return ready()&&isNativeOwnHome(getWorld(),record.regionId);
-    if(record.action==='leave-home')return ready()&&!nativeHomeRegions.has(getWorld().regionId);
+    if(record.action==='leave-home')return ready()&&isNativeOutsideHome(getWorld());
     if(record.action==='supply'){const row=state.find(row=>row.kingdomId===record.kingdomId&&row.itemId===record.itemId);return nativeHomeInteger(record.beforeUsed)&&nativeHomeInteger(record.quantity)&&record.quantity>0&&nativeHomeInteger(record.limit)&&record.beforeUsed+record.quantity<=record.limit&&row?.dailySubmitted===record.beforeUsed+record.quantity&&row.dailyLimit===record.limit&&row.prized===record.prized;}
     if(!Array.isArray(record.before)||record.before.length!==6||new Set(record.before.map(plot=>plot?.plotId)).size!==6||record.before.some(plot=>typeof plot?.plotId!=='string'||!plot.plotId||plot.cropId&&(!nativeHomeCropIds.includes(plot.cropId)||!Number.isFinite(plot.plantedAt)||!Number.isFinite(plot.readyAt)||typeof plot.watered!=='boolean')))return false;
     if(!Array.isArray(record.targets)||new Set(record.targets).size!==record.targets.length||record.targets.some(id=>!record.before.some(plot=>plot.plotId===id))||!nativeHomeInteger(record.quantity)||record.action!=='claim_yield'&&(record.quantity<=0||record.quantity>record.targets.length))return false;
@@ -1903,9 +1918,10 @@ function createNativeHomeFlow({api,view,getWorld,context,day,verify,readRecord,w
   }
   async function leaveHome(phase){
     await reconcile();if(pendingEntries().length)throw new Error('原生家園仍有未明操作，未離開');
-    if(ready()&&!nativeHomeRegions.has(getWorld().regionId))return {confirmed:true,sent:false};
+    if(ready()&&isNativeOutsideHome(getWorld()))return {confirmed:true,sent:false};
     if(typeof phase!=='string'||!phase)throw new Error('離開家園階段未確認');const action='leave-home',revision=context.runId+':'+phase,key=nativeHomeRecordKey({day,action,revision});
-    return ledger.perform({key,intent:{day,action,revision},observe:readWorld,confirmed:()=>ready()&&!nativeHomeRegions.has(getWorld().regionId),canSend:()=>ready()&&isNativeOwnHome(getWorld()),send:async()=>{verify();view.leave();await wait(()=>ready()&&!nativeHomeRegions.has(getWorld().regionId),'等待原生離開家園',30000);verify();}});
+    const previous=readRecord(key);if(previous?.state==='skipped'&&previous.evidence==='native-not-started')return {sent:false,confirmed:false,rejected:true,reason:'原生離家明確未受理，等待手動核對；本階段不重送'};
+    let ticket=null,sentRecord=null;return ledger.perform({key,intent:{day,action,revision},observe:readWorld,confirmed:()=>ready()&&isNativeOutsideHome(getWorld()),canSend:()=>ready()&&isNativeOwnHome(getWorld())&&Boolean(ticket=view.prepareLeave()),rejected:receipt=>{if(receipt!==false)return false;const current=readRecord(key);if(!sentRecord||current?.state!=='pending'||JSON.stringify(current)!==sentRecord)throw new Error('原生離家未受理回覆的保存紀錄已變，保留待核對');return true;},send:async()=>{verify();sentRecord=JSON.stringify(readRecord(key));const receipt=view.leave({ticket});if(receipt===false)return false;await wait(()=>ready()&&isNativeOutsideHome(getWorld()),'等待原生離開家園',30000);verify();return receipt;}});
   }
   async function readSupply(){
     if(!ready()||!isNativeOwnHome(getWorld(),'player_home_garden'))throw new Error('原生家園收購場景未確認');const data=await api.readSupply(context.characterId);verify();
@@ -3135,6 +3151,7 @@ function createNativeMoveOwner({getWorld,getContext,readRecord,writeRecord,verif
 
 
 const CONTRACT_VERSION = 1;
+const READONLY_RECONCILE_CAPABILITY='task.reconcile:readonly:v1';
 const TASK_KINDS = Object.freeze(['daily','battle','dungeon','boss','farm','party','idle']);
 const COMMAND_TYPES = Object.freeze(['task.start','task.pause','task.stop','task.resume','task.reconcile','config.apply','party.ensure','party.rendezvous','farm.service','page.reload']);
 function taskDay(timestamp = Date.now()) {
@@ -3144,6 +3161,7 @@ function taskDay(timestamp = Date.now()) {
 class ControlError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
+async function pendingFingerprint(pending){if(!pending)throw new ControlError('pending_changed','沒有原未明紀錄');const canonical=value=>Array.isArray(value)?'['+value.map(canonical).join(',')+']':value&&typeof value==='object'?'{'+Object.keys(value).sort().map(key=>JSON.stringify(key)+':'+canonical(value[key])).join(',')+'}':JSON.stringify(value);const data=new TextEncoder().encode(canonical(JSON.parse(JSON.stringify(pending))));if(!globalThis.crypto?.subtle)throw new ControlError('fingerprint_unavailable','未明紀錄指紋核對不可用');const digest=await globalThis.crypto.subtle.digest('SHA-256',data);return Array.from(new Uint8Array(digest),value=>value.toString(16).padStart(2,'0')).join('');}
 class TaskController {
   constructor({identity, clock = () => performance.now(), wallClock = Date.now, save = () => {}, release = () => {}, onResult=()=>{}, epoch, restored = null}) {
     this.identity = identity; this.clock = clock; this.wallClock = wallClock; this.save = save; this.release = release;this.onResult=onResult;
@@ -3177,9 +3195,12 @@ class TaskController {
       !Number.isFinite(serverTime) || !Number.isFinite(lease.expiresAt)) throw new ControlError('invalid_lease','操作權身分或期限無效');
     const remaining = lease.expiresAt - serverTime;
     if(remaining <= 0 || remaining > 5000) throw new ControlError('invalid_lease','操作權超過五秒或已到期');
+    if(lease.purpose!==undefined&&lease.purpose!=='reconcile')throw new ControlError('invalid_lease','未知操作權用途');
+    if(lease.purpose==='reconcile'&&(!['commandId','runId'].every(key=>typeof lease[key]==='string'&&lease[key])||!(/^[a-f0-9]{64}$/).test(lease.pendingHash)))throw new ControlError('invalid_lease','唯讀核對操作權證據不完整');
+    if(lease.purpose==='reconcile'&&Object.keys(lease).some(key=>!['roleId','pageEpoch','leaseId','expiresAt','purpose','commandId','runId','pendingHash'].includes(key)))throw new ControlError('invalid_lease','唯讀核對操作權欄位無效');
     this.lease = {...lease}; this.leaseDeadline = this.clock() + remaining;
   }
-  assertAuthority(context = null, {allowPending = false,allowSettlement=false,allowCleanup=false,allowManualPause=false} = {}) {
+  assertAuthority(context = null, {allowPending = false,allowSettlement=false,allowCleanup=false,allowManualPause=false,allowReadOnlyLease=false} = {}) {
     const identity = this.identity();
     if(!identity?.worldReady || !identity.characterId) throw new ControlError('identity_unknown','角色身分尚未確認');
     if(context && (context.characterId !== identity.characterId || context.generation !== this.generation || context.pageEpoch !== this.pageEpoch))
@@ -3191,6 +3212,7 @@ class TaskController {
     if(this.mode === 'managed') {
       if(this.bindingState !== 'bound' || this.boundCharacterId !== identity.characterId) throw new ControlError('identity_mismatch','配對角色尚未核對或已切換');
       if(!this.lease || this.clock() >= this.leaseDeadline) throw new ControlError('lease_expired','核心操作權已到期');
+      if(this.lease.purpose==='reconcile'&&!allowReadOnlyLease)throw new ControlError('readonly_lease','唯讀核對權限不能開始或接續操作');
     }
     return identity;
   }
@@ -3264,13 +3286,18 @@ class TaskController {
       this.pending=null; this.persist(); return evidence;
     } catch(error) { this.state='reconciling'; this.release(); this.persist(); throw error; }
   }
-  async reconcile() {
+  async reconcile({readOnlyCommand=null}={}) {
+    if(this.lease?.purpose==='reconcile'&&!readOnlyCommand)throw new ControlError('readonly_reconcile_required','唯讀核對必須由指定核心指令執行');
     if(!this.pending) return {confirmed:true};
-    const adapter=this.adapters.get(this.pending.taskKind);
+    const pending=this.pending,record=JSON.stringify(pending),identity=this.identity()?.characterId,epoch=this.pageEpoch,generation=this.generation,roleId=this.roleId,readonlyLease=this.lease;
+    const readOnlyGuard=()=>{this.assertAuthority(null,{allowPending:true,allowManualPause:true,allowReadOnlyLease:true});if(this.active||this.cleanup||this.settlement||this.lease!==readonlyLease||this.lease?.purpose!=='reconcile'||readOnlyCommand.type!=='task.reconcile'||this.lease.commandId!==readOnlyCommand.commandId||readOnlyCommand.leaseId!==this.lease.leaseId||readOnlyCommand.pageEpoch!==epoch||readOnlyCommand.roleId!==roleId||readOnlyCommand.runId!==pending.runId||this.lease.runId!==pending.runId||readOnlyCommand.payload?.readOnly!==true||readOnlyCommand.payload.pendingHash!==this.lease.pendingHash)throw new ControlError('readonly_reconcile_required','唯讀核對不允許現存執行或收尾');};
+    if(readOnlyCommand){readOnlyGuard();if(await pendingFingerprint(pending)!==readonlyLease.pendingHash||this.pending!==pending||JSON.stringify(this.pending)!==record||this.identity()?.characterId!==identity||this.pageEpoch!==epoch||this.generation!==generation||this.roleId!==roleId)throw new ControlError('pending_changed','唯讀核對證據在等待期間改變');readOnlyGuard();}
+    const adapter=this.adapters.get(pending.taskKind);
     if(!adapter) throw new ControlError('unsupported_task','未明操作的任務尚未接入');
-    if(this.pending.characterId !== this.identity()?.characterId) throw new ControlError('identity_mismatch','禁止核對其他角色的未明操作');
-    const evidence=await adapter.reconcile(this.pending);
+    if(pending.characterId !== identity) throw new ControlError('identity_mismatch','禁止核對其他角色的未明操作');
+    let evidence;try{if(readOnlyCommand)this.readOnlyReconcilePending={pending,record};evidence=await adapter.reconcile(pending);if(this.identity()?.characterId!==identity||this.pageEpoch!==epoch||this.generation!==generation||this.roleId!==roleId||this.pending!==null&&(this.pending!==pending||JSON.stringify(this.pending)!==record))throw new ControlError('pending_changed','核對期間角色、頁面或未明紀錄已改變');if(readOnlyCommand)readOnlyGuard();}catch(error){if(this.pending===null){this.pending=pending;this.persist();}throw error;}finally{if(readOnlyCommand)this.readOnlyReconcilePending=null;}
     if(evidence?.confirmed === true) {this.pending=null;this.state='paused';this.persist();}
+    else if(this.pending===null){this.pending=pending;this.persist();}
     return evidence;
   }
   async watchdog() {
@@ -3474,7 +3501,9 @@ function validateCommand(command, controller, {now=Date.now(), capabilities=COMM
   if(manualTask){if(!capabilities.includes(MANUAL_TASK_CAPABILITY))throw new ControlError('unsupported_capability','未宣告人工核心任務能力');try{validateManualTaskSnapshot(controller,command);}catch(error){if(error.code==='party_role_conflict'||error.code==='party_role_missing')throw error;throw new ControlError('invalid_payload','人工任務設定無效');}}
   if(command.type==='task.resume'&&command.payload.returnLocation!==undefined){if(!capabilities.includes(MANUAL_RESUME_LOCATION_CAPABILITY))throw new ControlError('unsupported_capability','未宣告核心返場接續能力');if(Object.keys(command.payload).some(key=>key!=='returnLocation'))throw new ControlError('invalid_payload','返場接續僅接受位置證據');validateManualResumeLocation(command.payload.returnLocation);if(!controller.checkpoint||controller.checkpoint.context?.runId!==command.runId)throw new ControlError('stale_run','返場位置不屬於原接續快照');}
   if(command.leaseId !== controller.lease?.leaseId) throw new ControlError('wrong_lease','指令操作權不符');
-  controller.assertAuthority(null,{allowPending:command.type==='task.reconcile' || command.type==='task.stop',allowSettlement:command.type==='task.stop'||command.type==='task.reconcile',allowCleanup:['task.stop','task.reconcile','config.apply'].includes(command.type),allowManualPause:manualAutoStart||manualTask||['task.resume','task.reconcile','config.apply','task.stop'].includes(command.type)});
+  const readonly=controller.lease?.purpose==='reconcile';
+  if(readonly||command.payload.readOnly!==undefined){if(!readonly||command.type!=='task.reconcile'||!capabilities.includes(READONLY_RECONCILE_CAPABILITY)||command.payload.readOnly!==true||Object.keys(command.payload).some(key=>!['readOnly','pendingHash'].includes(key))||command.commandId!==controller.lease.commandId||command.runId!==controller.lease.runId||command.payload.pendingHash!==controller.lease.pendingHash||!controller.pending||controller.pending.characterId!==controller.identity()?.characterId||controller.active||controller.cleanup||controller.settlement)throw new ControlError('readonly_lease','唯讀權限僅供指定未明紀錄核對');}
+  controller.assertAuthority(null,{allowPending:command.type==='task.reconcile' || command.type==='task.stop',allowSettlement:!readonly&&(command.type==='task.stop'||command.type==='task.reconcile'),allowCleanup:!readonly&&['task.stop','task.reconcile','config.apply'].includes(command.type),allowManualPause:manualAutoStart||manualTask||['task.resume','task.reconcile','config.apply','task.stop'].includes(command.type),allowReadOnlyLease:readonly&&command.type==='task.reconcile'});
   if(scenarioRevision !== undefined && (command.type==='config.apply'?command.scenarioRevision<scenarioRevision:command.scenarioRevision!==scenarioRevision)) throw new ControlError('stale_scenario','情境版本不符');
   if(command.type === 'task.start' && (!TASK_KINDS.includes(command.payload.taskKind) || command.payload.taskKind==='idle')) throw new ControlError('unsupported_task','任務種類無效');
   if(command.type === 'task.start' && command.payload.configRevision !== configRevision) throw new ControlError('stale_config','設定版本不符');
@@ -3487,6 +3516,7 @@ function validateCommand(command, controller, {now=Date.now(), capabilities=COMM
 }
 function canonicalJson(value){if(Array.isArray(value))return '['+value.map(canonicalJson).join(',')+']';if(value&&typeof value==='object')return '{'+Object.keys(value).sort().map(key=>JSON.stringify(key)+':'+canonicalJson(value[key])).join(',')+'}';return JSON.stringify(value);}
 async function commandFingerprint(command){const fields=['commandId','roleId','pageEpoch','runId','leaseId','type','issuedAt','expiresAt','scenarioRevision','payload'];const wire=JSON.parse(JSON.stringify(Object.fromEntries(fields.filter(key=>command?.[key]!==undefined).map(key=>[key,command[key]]))));const data=new TextEncoder().encode(canonicalJson(wire));if(data.length>65536)throw new ControlError('invalid_command','指令封套超過64KiB');if(!globalThis.crypto?.subtle)throw new ControlError('fingerprint_unavailable','指令指紋核對不可用');const digest=await globalThis.crypto.subtle.digest('SHA-256',data);return Array.from(new Uint8Array(digest),value=>value.toString(16).padStart(2,'0')).join('');}
+
 function publicReceipt(value){const {_fingerprint,...receipt}=value;return receipt;}
 class CommandReceiver {
   constructor(controller,{execute,capabilities=COMMAND_TYPES,wallClock=Date.now}={}) {this.controller=controller;this.execute=execute;this.capabilities=capabilities;this.wallClock=wallClock;this.queue=Promise.resolve();this.clockAnchor=null;}
@@ -3503,13 +3533,18 @@ class CommandReceiver {
     try {
       validateCommand(command,c,{now:this.commandNow(),capabilities:this.capabilities,scenarioRevision:c.config?.scenarioRevision,configRevision:c.config?.revision});
       receipt._fingerprint=await commandFingerprint(command);
+      const readonlyPending=command.payload.readOnly===true?c.pending:null,readonlyRecord=readonlyPending?JSON.stringify(readonlyPending):null;
+      if(command.payload.readOnly===true&&(await pendingFingerprint(readonlyPending)!==command.payload.pendingHash||c.pending!==readonlyPending||JSON.stringify(c.pending)!==readonlyRecord))throw new ControlError('pending_changed','未明紀錄與唯讀指令不符');
       validateCommand(command,c,{now:this.commandNow(),capabilities:this.capabilities,scenarioRevision:c.config?.scenarioRevision,configRevision:c.config?.revision});
       receipt.state='accepted';record();
       receipt.state='running';record();
-      const result=await this.execute(command);
+      const readonly=command.type==='task.reconcile'&&command.payload.readOnly===true;
+      if(readonly&&(c.pending!==readonlyPending||JSON.stringify(c.pending)!==readonlyRecord))throw new ControlError('pending_changed','未明紀錄在保存指令時改變');
+      const result=readonly?await c.reconcile({readOnlyCommand:command}):await this.execute(command);
       if(result?.[DEFERRED_COMMAND]){receipt.result=result.result??null;return record();}
-      receipt.result=result;
-      receipt.state=c.pending?'uncertain':'succeeded';receipt.reasonCode=c.pending?'unknown_result':null;
+      receipt.result=readonly?{...result,readOnly:true,pendingHash:command.payload.pendingHash}:result;
+      const unknown=c.pending||readonly&&result?.confirmed!==true;
+      receipt.state=unknown?'uncertain':'succeeded';receipt.reasonCode=unknown?'unknown_result':null;
     } catch(error) {
       receipt.reasonCode=error.code || 'execution_error';receipt.message=error.message;
       receipt.state=receipt.state==='running'?(c.pending?'uncertain':'failed'):'rejected';
@@ -4087,7 +4122,7 @@ function createExtensionCoreTransport(target,{timeout=4000,probeTimeout=900,setT
 
 function coreReceiptBatch(receipts){
   const batch=[];let bytes=2;
-  for(const receipt of receipts){let wire=receipt;if(new TextEncoder().encode(JSON.stringify(wire)).length>65536){const result={detailsOmitted:true};for(const key of ['checkpointId','safe','runId','prepared','reloadConfirmed','resumed','configRevision','scenarioRevision'])if(['string','number','boolean'].includes(typeof receipt.result?.[key]))result[key]=receipt.result[key];wire={commandId:receipt.commandId,state:receipt.state,reasonCode:receipt.reasonCode,message:String(receipt.message??'').slice(0,4096),result};}
+  for(const receipt of receipts){let wire=receipt;if(new TextEncoder().encode(JSON.stringify(wire)).length>65536){const result={detailsOmitted:true};for(const key of ['checkpointId','safe','runId','prepared','reloadConfirmed','resumed','configRevision','scenarioRevision','confirmed','readOnly','pendingHash'])if(['string','number','boolean'].includes(typeof receipt.result?.[key]))result[key]=receipt.result[key];wire={commandId:receipt.commandId,state:receipt.state,reasonCode:receipt.reasonCode,message:String(receipt.message??'').slice(0,4096),result};}
     const size=new TextEncoder().encode(JSON.stringify(wire)).length+1;
     if(bytes+size>65536)break;
     batch.push(wire);bytes+=size;
@@ -4203,6 +4238,7 @@ class CoreSession {
       if(this.identity().characterId!==exchangeIdentity||this.controller.pageEpoch!==exchangeEpoch)throw new ControlError('identity_changed','交換等待期間角色或頁面已改變');
       this.assertConnection(revision,authorization);
       this.controller.bindingState=result.bindingState;
+      if(result.lease?.purpose==='reconcile'&&!this.capabilities.includes(READONLY_RECONCILE_CAPABILITY))throw new ControlError('unsupported_capability','此助手未宣告唯讀核對能力');
       this.controller.acceptLease(result.lease,result.serverTime);
       this.receiver.synchronizeClock(result.serverTime);
       this.lastValidAt=this.now();this.failures=0;this.retryAt=0;this.error=null;
@@ -4277,6 +4313,19 @@ class CoreSession {
 function preserveSourcePending({controller:c,characterId,taskKind,action,context=null}) {
   if(!c||c.identity()?.characterId!==characterId)throw new ControlError('identity_mismatch','未明操作不得寫入另一角色');
   const previous=c.pending;
+  if(c.lease?.purpose==='reconcile'||c.readOnlyReconcilePending){
+    const scope=c.readOnlyReconcilePending;
+    if(!scope||scope.pending.taskKind!==taskKind||scope.pending.characterId!==characterId)throw new ControlError('readonly_lease','唯讀核對只可清除指定原未明紀錄');
+    if(action===null&&previous===null&&scope.cleared===true)return;
+    if(previous!==scope.pending||JSON.stringify(previous)!==scope.record)throw new ControlError('readonly_lease','唯讀核對紀錄已更換');
+    if(action!==null){
+      const canonical=v=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}':JSON.stringify(v),original=JSON.parse(scope.record),sync=JSON.parse(JSON.stringify(action));
+      if(!sync||sync.taskKind!==taskKind||sync.kind!==original.kind||sync.sourceRole!==original.sourceRole||Object.keys(sync).some(key=>{if(key==='entries'&&Array.isArray(sync.entries)&&Array.isArray(original.entries)){const remaining=original.entries.map(canonical);return sync.entries.some(entry=>{const at=remaining.indexOf(canonical(entry));if(at<0)return true;remaining.splice(at,1);return false;});}return canonical(sync[key])!==canonical(original[key]);}))throw new ControlError('readonly_lease','來源同步不是原未明紀錄');
+      // 回讀日誌可減少已確認子項；控制器仍保留完整原指紋，直到全部肯定確認。
+      return;
+    }
+    scope.cleared=true;
+  }
   if(context&&c.active?.kind===taskKind&&c.active.context!==context)throw new ControlError('stale_generation','舊來源不能修改目前執行的未明操作');
   if(action===null){
     if(previous?.taskKind===taskKind&&previous.characterId===characterId){
@@ -4599,7 +4648,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     if(pending.kind==='party-leave')confirmed=w.party===null;
     if(pending.kind==='party-invite')confirmed=w.party?.id===pending.partyId&&w.party.members?.some(member=>member.characterId===pending.targetCharacterId);
     if(pending.kind==='party-accept')confirmed=w.party?.leaderId===pending.leaderCharacterId&&w.party.members?.some(member=>member.characterId===w.charId);
-    if(pending.kind==='party-home-leave')confirmed=!['player_home','player_home_garden'].includes(w.regionId)&&w.mode==='open'&&w.isWorldInteractionLocked?.()===false;
+    if(pending.kind==='party-home-leave')confirmed=isNativeOutsideHome(w)&&w.mode==='open'&&w.isWorldInteractionLocked?.()===false;
     if(pending.kind==='party-rendezvous')confirmed=arrivalEvidence(pending);
     if(pending.kind==='party-channel'){if(pending.nativeNavigation){try{const current=readNativeChannelSnapshot(w);confirmed=current.ready&&current.regionId===pending.regionId&&current.channelId===pending.nativeChannelId&&current.instanceId===pending.instanceId;}catch{}}else confirmed=[pending.channelId,pending.nativeChannelId].includes(gateway.readChannel());if(confirmed)channelAlias=gateway.readChannel();}
     if(pending.kind==='party-travel')confirmed=w.regionId===pending.regionId&&!w.isWorldInteractionLocked?.();
@@ -4624,7 +4673,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     if(assemblyArrived&&(w.charId===plan.leaderCharacterId||departureSeenAt===null||inHome)&&(w.regionId!=='village'||gateway.readChannel()!=='10')){assemblyArrived=false;assemblyWaitAt=null;assemblySearched.clear();}
     if(w.party&&(w.party.leaderId!==plan.leaderCharacterId||w.party.members?.some(p=>!plan.members.includes(p.characterId)))){const result=gateway.leave(context,{allowRegroup:true});message=result.sent?'已要求離開不符隊伍，等待原生確認':'等待原生離隊入口';return;}
     if(!assemblyArrived){
-      if(['player_home','player_home_garden'].includes(w.regionId)){host.pending({kind:'party-home-leave',taskKind:'party',fromRegionId:w.regionId});if(world()!==w)throw new ControlError('identity_changed','離家前角色世界已更換');homeView.leave();message='已使用庭園頂部離開家園，等待原生返回';return;}
+      if(['player_home','player_home_garden'].includes(w.regionId)){const ticket=homeView.prepareLeave({allowVisitor:true}),leaveContext=context;let leavePending=null;if(!ticket){message='等待目前庭園的原生離家入口與屋主確認';return;}if(world()!==w)throw new ControlError('identity_changed','離家前角色世界已更換');const receipt=homeView.leave({ticket,beforeSend:()=>{host.pending({kind:'party-home-leave',taskKind:'party',fromRegionId:ticket.regionId,fromInstanceId:ticket.instanceId,homeOwnerCharacterId:ticket.ownerCharacterId});leavePending=host.currentPending();}});if(receipt===false){gateway.guard(leaveContext,{allowPending:true});const pending=host.currentPending();if(context!==leaveContext||world()!==w||pending!==leavePending||pending?.kind!=='party-home-leave'||pending.characterId!==leaveContext.characterId||pending.runId!==leaveContext.runId||pending.fromRegionId!==ticket.regionId||pending.fromInstanceId!==ticket.instanceId||pending.homeOwnerCharacterId!==ticket.ownerCharacterId)throw new ControlError('identity_changed','離家未受理回覆不屬於目前操作');host.pending(null);travelDestination='village';message='原生離家未受理，等待世界就緒後經原生地圖前往曙光村';return;}message='已使用庭園頂部離開家園，等待原生返回';return;}
       if(gateway.readChannel()!=='10'){const result=gateway.switchPosition(context,{channelId:10},'channel');message=result.reason??'等待切換CH.10';return;}
       if(w.regionId!=='village'){travelDestination='village';void travelTick();message='前往CH.10曙光村集合';return;}
       assemblyArrived=true;assemblyWaitAt=null;
@@ -4652,7 +4701,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     departureSeenAt??=now();if(now()-departureSeenAt<5000){message='隊長已出發，等待五秒後跟隨';return;}
     const result=gateway.rendezvous(context,plan.leaderCharacterId);if(result.arrived){completeAssembly('已在隊長出發五秒後依原生位置完成跟隨');return;}message=result.reason??'已前往隊長，等待原生地圖／分線確認';
   }
-  async function travelTick(readOnly=false){const current=context;if(travel.busy())return;try{travelDestination=plan.action==='assemble'?'village':plan.location.regionId;let result=readOnly?await travel.reconcile():await travel.travel(travelDestination);if(readOnly&&result.confirmed)result=await travel.travel(travelDestination);if(current!==context||!['running','waiting','reconciling'].includes(state))return;state='waiting';message=result.message??'等待原生世界與伺服器傳送核對';if(result.state==='arrived'){travelDestination=null;return tick();}}catch(error){if(current===context&&['running','waiting','reconciling'].includes(state)){state=host.currentPending()?'reconciling':'failed';message=error.message;}}}
+  async function travelTick(readOnly=false){const current=context;if(travel.busy())return;try{travelDestination=plan.action==='assemble'?'village':plan.location.regionId;let result=readOnly?await travel.reconcile():await travel.travel(travelDestination);if(readOnly&&result.confirmed)result=await travel.travel(travelDestination);if(current!==context||!['running','waiting','reconciling'].includes(state))return;state='waiting';message=result.message??'等待原生世界與伺服器傳送核對';if(result.state==='arrived'){travelDestination=null;return tick();}}catch(error){if(current===context&&['running','waiting','reconciling'].includes(state)){state=host.currentPending()?'reconciling':plan.action==='assemble'&&['player_home','player_home_garden'].includes(world()?.regionId)&&error.code==='party_not_ready'?'waiting':'failed';message=error.message;}}}
   function observe(){gateway.refresh();return {state,phase:plan?.action??'idle',message,runId:context?.runId??null,groupId:plan?.groupId??null,desiredLeaderCharacterId:plan?.leaderCharacterId??null,members:structuredClone(world()?.party?.members??null),pending:host.currentPending()};}
   return {kind:'party',validate,observe,tick,getSettings:()=>plan??{action:'ensure',groupId:'local-'+host.characterId,leaderCharacterId:host.characterId,members:[host.characterId],allowRegroup:false},
     start(ctx){validate(ctx.settings);host.assert(ctx);if(ctx.settings.action==='assemble')validatePartyAssemblySettings(ctx.settings,ctx.characterId);if(ctx.settings.action==='ensure'&&!ctx.settings.members.includes(ctx.characterId))throw new ControlError('party_role_missing','目前原生角色不在指定隊伍名單');context=ctx;plan=structuredClone(ctx.settings);channelAlias=null;travelDestination=null;assemblyWaitAt=null;departureSeenAt=null;assemblyArrived=false;assemblySearchIndex=0;assemblySearched=new Set();assemblyInvited=new Set();assemblyInviteAt=new Map();state='running';deadline=now()+(plan.timeoutMs??120000);completedAt=null;gateway.refresh();return tick();},
@@ -5705,7 +5754,7 @@ function 建立隊員移動({now=Date.now}={}){
   const 戰鬥公會技能 = Object.freeze(['guild_battle_banner','guild_guard_oath','guild_rally_call','guild_adventure_guidance','guild_rest_breath','guild_expedition_ready']);
 
 // 僅由呼叫端 tick 驅動，不自行建立會在停止後繼續施放的計時器。
-  const guildMonitor=createNativeBattleGuildMonitor({host,context:()=>integratedContext,getWorld:()=>PAGE.__world,skillIds:戰鬥公會技能,blocked:()=>integratedPausing||movementBlocked()||nativeSecurityChallenge(document,()=>PAGE.__world)});
+  const guildMonitor=createNativeBattleGuildMonitor({host,context:()=>integratedContext,getWorld:()=>PAGE.__world,skillIds:戰鬥公會技能,manualSkillIds:MANUAL_AUTO_GUILD_SKILL_IDS,blocked:()=>integratedPausing||movementBlocked()||nativeSecurityChallenge(document,()=>PAGE.__world)});
   // 原生測試角色 2026-10-09 實測：exp_scroll_60、bound:true、bindScope:account；
   // buff_exp_gain / consumable:exp_scroll_60 / value:1 / expire=使用時間+3600000。
   // 原生 useItem(itemId,false) 不接受 uid／bindScope，混合綁定不得猜測堆疊。
@@ -11704,8 +11753,8 @@ function createNativeInventoryReadFlow({host,context,getWorld,catalog,cleanup=fa
 
 
 
-const DEFAULT_MANUAL_AUTO={battle:false,nativeBattle:false,guildSkills:false,guildSkillIds:[...MANUAL_AUTO_GUILD_SKILL_IDS],dodge:true,potions:Array.from({length:4},()=>({on:false,type:'hp',threshold:35,interval:0}))};
-function normalizeManualAutoSettings(value){const copy=structuredClone(value??DEFAULT_MANUAL_AUTO);if(copy.nativeBattle!==undefined&&typeof copy.nativeBattle!=='boolean')throw new Error('AUTO設定格式無效');copy.nativeBattle=false;if(copy.guildSkillIds===undefined)copy.guildSkillIds=[...MANUAL_AUTO_GUILD_SKILL_IDS];validateManualAuto(copy);return copy;}
+const DEFAULT_MANUAL_AUTO={battle:false,nativeBattle:false,guildSkills:false,guildSkillIds:[...LEGACY_MANUAL_AUTO_GUILD_SKILL_IDS],dodge:true,potions:Array.from({length:4},()=>({on:false,type:'hp',threshold:35,interval:0}))};
+function normalizeManualAutoSettings(value){const copy=structuredClone(value??DEFAULT_MANUAL_AUTO);if(copy.nativeBattle!==undefined&&typeof copy.nativeBattle!=='boolean')throw new Error('AUTO設定格式無效');copy.nativeBattle=false;if(copy.guildSkillIds===undefined)copy.guildSkillIds=[...LEGACY_MANUAL_AUTO_GUILD_SKILL_IDS];validateManualAuto(copy);return copy;}
 function readManualAutoGuildCatalog({getWorld}){return readNativeManualGuildSkills(getWorld);}
 function readManualAutoPotionSlots({document,getWorld}){
   const world=getWorld(),props=createNativeQuickItemsView({document,getWorld}).read();
@@ -13253,8 +13302,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.95.2';
-const RUNTIME_VERSION='0.95.2';
+const SCRIPT_VERSION='0.95.4';
+const RUNTIME_VERSION='0.95.4';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
@@ -13373,7 +13422,7 @@ function initializeRole() {
   if(pending&&!controller.pending){controller.pending={...pending,characterId:roleId};controller.state='reconciling';controller.persist();}
   restoreNativeSourcePending();
   const transport=createExtensionCoreTransport(PAGE);
-  const receiver=new CommandReceiver(controller,{capabilities:['task.start','task.start:battle.manual-auto:v1',MANUAL_TASK_CAPABILITY,MANUAL_RESUME_LOCATION_CAPABILITY,'task.pause','task.stop','task.resume','task.reconcile','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],execute:async command=>{
+  const receiver=new CommandReceiver(controller,{capabilities:['task.start','task.start:battle.manual-auto:v1',MANUAL_TASK_CAPABILITY,MANUAL_RESUME_LOCATION_CAPABILITY,'task.pause','task.stop','task.resume','task.reconcile','task.reconcile:readonly:v1','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],execute:async command=>{
     if(identity().characterId!==ownerId)throw new ControlError('identity_changed','指令屬於原角色');
     if(command.type==='page.reload'){if(safePause?.job)throw new ControlError('pause_busy','等待安全暫停完成');return coreReload.request(command);}
     if(coreReload?.job&&['task.start','task.resume','farm.service','party.ensure','party.rendezvous'].includes(command.type))throw new ControlError('reload_busy','重整等待安全交接，暫不開始其他任務');
@@ -13399,7 +13448,7 @@ function initializeRole() {
     throw new ControlError('unsupported_capability','指令尚未接入');
   }});
   session=new CoreSession({transport,controller,receiver,identity,snapshot,results,scriptVersion:SCRIPT_VERSION,runtimeVersion:RUNTIME_VERSION,
-    capabilities:['observe','results.ack:v1','results.chunk:v1','config.recovery:v1','task.start:farm','task.start:battle','task.start:battle.manual-auto:v1',MANUAL_TASK_CAPABILITY,MANUAL_RESUME_LOCATION_CAPABILITY,'task.start:daily','task.start:boss','task.start:dungeon','task.start:party','task.pause','task.stop','task.resume','task.reconcile','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],
+    capabilities:['observe','results.ack:v1','results.chunk:v1','config.recovery:v1','task.start:farm','task.start:battle','task.start:battle.manual-auto:v1',MANUAL_TASK_CAPABILITY,MANUAL_RESUME_LOCATION_CAPABILITY,'task.start:daily','task.start:boss','task.start:dungeon','task.start:party','task.pause','task.stop','task.resume','task.reconcile','task.reconcile:readonly:v1','config.apply','page.reload','farm.service','party.ensure','party.rendezvous'],
     pairingStore:{get:()=>GM_getValue(PREFIX+':pairing',null),set:value=>GM_setValue(PREFIX+':pairing',value)}});
   coreReload=new CorePageReload({controller:ownerController,receiver,session,reload:()=>{closed=true;clearInterval(mainTimer);release();PAGE.location.reload();}});
   safePause=new SafePauseManager({controller:ownerController,receiver,session,onStatus:value=>{notice=value;}});
@@ -13428,9 +13477,10 @@ function render() {
   const manual=Boolean(controller?.active?.context.settings.manualAuto),manualCleanup=Boolean(controller?.cleanup?.context.settings.manualAuto);
   if(autoIntent){const receipt=controller?.receipts.get(autoIntent.commandId);if(receipt&&['rejected','failed','uncertain'].includes(receipt.state)){notice='AUTO啟停失敗：'+(receipt.message||'執行尚未確認');autoIntent=null;}else if(autoIntent.roleId!==roleId||autoIntent.action==='start'&&manual||autoIntent.action==='stop'&&!manual&&!manualCleanup)autoIntent=null;else if(Date.now()-autoIntent.at>20000){notice='AUTO啟停尚未確認，請核對核心狀態';autoIntent=null;}}
   const autoReason=!controller?'等待角色載入':modeInitializing?'正在確認控制模式':controller.cleanup?'等待原執行收尾':controller.pending&&!manual?'等待未明操作核對':controller.active&&!manual?'其他任務執行中':coreTask&&!['stopped','completed','failed'].includes(coreTask.state)&&!manual?'核心流程執行或暫停中':safePause?.job||coreReload?.job?'等待安全交接':controller.mode==='managed'&&!core?.available?'核心不可用：'+(core?.message||core?.reason||'連線未就緒'):controller.mode==='managed'&&(!core?.registered||core.state!=='connected')?'等待核心連線':conflicts()?'偵測到舊助手操作衝突':'';
-  status.textContent='角色：'+(s.identity.characterName||'等待載入')+'｜'+(controller?.mode==='managed'?'核心模式':'獨立模式')+'｜'+(manual?'AUTO中':controller?.active?({battle:'戰鬥中',daily:'每日中',farm:'種植中',boss:'野王中',dungeon:'副本中',party:routine?.state.phase==='farm-return'?'返場中':'隊伍處理中'}[controller.active.kind]):controller?.cleanup?(controller.manualPause?'人工停止・收尾中':'收尾中'):controller?.manualPause?'人工停止':controller?.pending?'待核對':'待命');
+  status.textContent='角色：'+(s.identity.characterName||'等待載入')+'｜'+(controller?.mode==='managed'?'核心模式':'獨立模式')+'｜'+(manual?'AUTO中':controller?.active?({battle:'戰鬥中',daily:'每日中',farm:'種植中',boss:'野王中',dungeon:'副本中',party:routine?.state.phase==='farm-return'?'返場中':'隊伍處理中'}[controller.active.kind]):controller?.cleanup?(controller.manualPause?'人工停止・收尾中':'收尾中'):controller?.pending?(controller.manualPause?'人工停止・待核對':'待核對'):controller?.manualPause?'人工停止':'待命');
   metrics.textContent=formatCompactAssistantMetrics({world:PAGE.__world,snapshot:s});
-  compactPanel.update({active:Boolean(controller?.active||controller?.cleanup||routine?.state.enabled||coreTaskActive||autoIntent),characterName:s.identity.characterName,plan:manual||manualCleanup?'AUTO':/^plan-[0-2]$/.test(coreTask?.planId??'')?'方案'+(Number(coreTask.planId.slice(5))+1):routine?.state.enabled&&routine.state.planLabel?routine.state.planLabel:PLAN_TASK_LABELS[controller?.active?.kind]??'單項任務',state:autoIntent?(autoIntent.action==='start'?'AUTO啟動中':'AUTO停止中'):coreTask?.state==='background-idle'?'等待下一次背景任務':source?.message??controller?.state??'待命',autoLabel:autoIntent?(autoIntent.action==='start'?'啟動中':'停止中'):autoReason?'AUTO 不可用':manual?'AUTO ON':'AUTO OFF',autoDisabled:Boolean(autoReason||autoActionBusy||autoIntent),autoTitle:autoReason||(manual?'點擊停止目前AUTO':'點擊啟動目前地圖的助手技能攻擊')});
+  const compactState=controller?.pending?'等待未明操作核對':coreTask?.state==='background-idle'?'等待下一次背景任務':source?.message??({idle:'待命',stopped:'已停止',paused:'已暫停',reconciling:'等待核對'}[controller?.state]??controller?.state??'待命');
+  compactPanel.update({active:Boolean(controller?.active||controller?.cleanup||routine?.state.enabled||coreTaskActive||autoIntent),characterName:s.identity.characterName,plan:manual||manualCleanup?'AUTO':/^plan-[0-2]$/.test(coreTask?.planId??'')?'方案'+(Number(coreTask.planId.slice(5))+1):routine?.state.enabled&&routine.state.planLabel?routine.state.planLabel:PLAN_TASK_LABELS[controller?.active?.kind]??'單項任務',state:autoIntent?(autoIntent.action==='start'?'AUTO啟動中':'AUTO停止中'):compactState,autoLabel:autoIntent?(autoIntent.action==='start'?'啟動中':'停止中'):autoReason?'AUTO 不可用':manual?'AUTO ON':'AUTO OFF',autoDisabled:Boolean(autoReason||autoActionBusy||autoIntent),autoTitle:autoReason||(manual?'點擊停止目前AUTO':'點擊啟動目前地圖的助手技能攻擊')});
   message.textContent=[source?.message,source?.warning,notice,controller?.mode==='managed'&&!core?.available?'核心不可用：'+(core?.message||core?.reason||'連線未就緒'):'',conflicts()?'偵測到舊助手，阻止開始新任務':''].filter(Boolean).join('；');
 }
 function assertSourcesReadable(){restoreNativeSourcePending();if(safePause?.job)throw new ControlError('pause_busy','等待安全暫停完成');if(controller?.mode==='managed'&&session?.results?.load().length>=30)throw new ControlError('delivery_full','未交付成果已達上限，等待核心接收後再開始');for(const runtime of sourceRuntimes.values())if(runtime.storageError)throw runtime.storageError;}
