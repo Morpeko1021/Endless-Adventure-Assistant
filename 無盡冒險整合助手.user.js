@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.96.3
+// @version      0.96.4
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -783,7 +783,19 @@ function 建立戰鬥走位({now=Date.now,random=Math.random,setTimer=setTimeout
 // 遊戲第一方原生請求的共用入口；不記錄權杖，不重試未知寫入。
 const encodeNativeId=value=>{if(typeof value!=='string'||!value||value.length>256)throw new Error('原生識別碼無效');return encodeURIComponent(value);};
 function readGameNativeToken(page){try{const account=JSON.parse(page.localStorage.getItem('ro_session_v1')||'null')?.account;return account?.accessToken||account?.token||null;}catch{return null;}}
-function createGameNativeTransport({fetch,getToken,verify,setTimer=setTimeout,clearTimer=clearTimeout,timeoutMs=12000}){
+const nativePageThrottle={retryAt:0},nativeRecoveryQueues=new WeakMap();
+class NativeRateLimitError extends Error {
+  constructor(message,{retryAt,requestSent=false,attempts=0}={}){super(message);this.name='NativeRateLimitError';this.code='native_rate_limited';this.status=429;this.retryAt=retryAt;this.requestSent=Boolean(requestSent);this.attempts=attempts;}
+}
+function nativeRetryAt(response,now){
+  let value=null;try{value=response.headers?.get?.('Retry-After')?.trim();}catch{}
+  if(typeof value==='string'&&/^\d+$/.test(value)){const seconds=Number(value),at=now+seconds*1000;if(Number.isSafeInteger(seconds)&&Number.isSafeInteger(at))return at;}
+  if(typeof value==='string'&&/^(?:[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT|[A-Za-z]+, \d{2}-[A-Za-z]{3}-\d{2} \d{2}:\d{2}:\d{2} GMT|[A-Za-z]{3} [A-Za-z]{3} {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4})$/.test(value)){const at=Date.parse(value);if(Number.isFinite(at))return Math.max(now,at);}
+  // 無可用伺服器期限時採客戶端30秒冷卻，不代表伺服器配額。
+  return now+30000;
+}
+function createGameNativeTransport({fetch,getToken,verify,setTimer=setTimeout,clearTimer=clearTimeout,timeoutMs=12000,now=Date.now,getDeadline=()=>Infinity,sharedThrottle=nativePageThrottle}){
+  if(!sharedThrottle||typeof sharedThrottle!=='object'||Array.isArray(sharedThrottle))throw new Error('原生冷卻狀態無效');
   const controllers=new Set();
   async function request({method='GET',path,body,label='原生請求',allowFailure=false,timeoutMs:requestTimeoutMs=timeoutMs}){
     const warehouseRead=method==='GET'&&/^\/warehouse(?:\/personal\?characterId=[^&#\r\n]+)?$/.test(path);
@@ -792,12 +804,52 @@ function createGameNativeTransport({fetch,getToken,verify,setTimer=setTimeout,cl
     if(!['GET','POST'].includes(method)||typeof path!=='string'||(!/^\/(?:characters|social-hub)\//.test(path)&&!warehouseRead&&!publicItems&&!vipSupply)||path.includes('://')||/[\r\n#]/.test(path))throw new Error('原生請求路徑或方法無效');
     verify();const token=publicItems?null:getToken();if(!publicItems&&(typeof token!=='string'||!token))throw new Error('原生登入狀態未就緒');
     if(!Number.isFinite(requestTimeoutMs)||requestTimeoutMs<=0)throw new Error('原生請求期限無效');
-    const controller=new AbortController();controllers.add(controller);const timer=setTimer(()=>controller.abort(),Math.min(timeoutMs,requestTimeoutMs));
+    if(!Number.isFinite(timeoutMs)||timeoutMs<=0)throw new Error('原生請求期限無效');
+    const authorityDeadline=getDeadline()??Infinity;if(authorityDeadline!==Infinity&&!Number.isFinite(authorityDeadline))throw new Error('原生請求期限無效');
+    const deadline=Math.min(now()+Math.min(timeoutMs,requestTimeoutMs),authorityDeadline),controller=new AbortController();controllers.add(controller);
+    let attempts=0,releaseRecovery=null;
+    const cancelled=()=>new Error(label+'已逾期或取消'),check=()=>{verify();if(controller.signal.aborted||now()>=deadline)throw cancelled();};
+    const limited=()=>new NativeRateLimitError(label+'遇到HTTP 429，等待原生服務冷卻',{retryAt:Number(sharedThrottle.retryAt)||now(),requestSent:attempts>0,attempts});
+    const abortable=promise=>new Promise((resolve,reject)=>{
+      const abort=()=>reject(cancelled());if(controller.signal.aborted){abort();return;}
+      controller.signal.addEventListener('abort',abort,{once:true});
+      Promise.resolve(promise).then(resolve,reject).finally(()=>controller.signal.removeEventListener('abort',abort));
+    });
+    async function recoveryTurn(){
+      if(releaseRecovery)return;
+      const previous=nativeRecoveryQueues.get(sharedThrottle)??Promise.resolve();let release;
+      const turn=new Promise(resolve=>release=resolve),tail=previous.then(()=>turn);nativeRecoveryQueues.set(sharedThrottle,tail);
+      releaseRecovery=()=>{release();if(nativeRecoveryQueues.get(sharedThrottle)===tail)nativeRecoveryQueues.delete(sharedThrottle);};
+      await abortable(previous);check();
+    }
+    async function waitForCooldown(){
+      while((Number(sharedThrottle.retryAt)||0)>now()){
+        check();if(sharedThrottle.retryAt>=deadline)throw limited();
+        let timer;
+        try{await abortable(new Promise(resolve=>timer=setTimer(resolve,sharedThrottle.retryAt-now())));}finally{if(timer!==undefined)clearTimer(timer);}
+        check();
+      }
+    }
+    const timer=setTimer(()=>controller.abort(),Math.max(0,deadline-now()));
     try{
-      const response=await fetch('https://api.play.endless.tw'+path,{method,credentials:publicItems?'omit':'include',cache:'no-store',signal:controller.signal,headers:{'Content-Type':'application/json',...(publicItems?{}:{Authorization:'Bearer '+token})},...(body===undefined?{}:{body:JSON.stringify(body)})});
-      verify();if(controller.signal.aborted)throw new Error(label+'已逾期或取消');if(!response.ok&&!allowFailure)throw new Error(label+'未確認（HTTP '+response.status+'）');
-      const data=await response.json();verify();if(controller.signal.aborted)throw new Error(label+'已逾期或取消');if(!response.ok&&(!allowFailure||data?.ok!==false))throw new Error(label+'未確認（HTTP '+response.status+'）');return data;
-    }catch(error){verify();throw error;}finally{clearTimer(timer);controllers.delete(controller);}
+      check();
+      if(method==='POST'&&(Number(sharedThrottle.retryAt)||0)>now())throw limited();
+      // 已知冷卻超本請求期限時先拒絕；不能先被其他恢復請求佔住排隊。
+      if(method==='GET'&&(Number(sharedThrottle.retryAt)||0)>now()&&sharedThrottle.retryAt>=deadline)throw limited();
+      if(method==='GET'&&((Number(sharedThrottle.retryAt)||0)>now()||nativeRecoveryQueues.has(sharedThrottle)))await recoveryTurn();
+      for(;;){
+        if(method==='GET')await waitForCooldown();check();attempts++;
+        const response=await abortable(fetch('https://api.play.endless.tw'+path,{method,credentials:publicItems?'omit':'include',cache:'no-store',signal:controller.signal,headers:{'Content-Type':'application/json',...(publicItems?{}:{Authorization:'Bearer '+token})},...(body===undefined?{}:{body:JSON.stringify(body)})}));
+        check();
+        if(response.status===429){
+          sharedThrottle.retryAt=Math.max(Number(sharedThrottle.retryAt)||0,nativeRetryAt(response,now()));
+          if(method==='POST'||attempts>=3||sharedThrottle.retryAt>=deadline)throw limited();
+          await recoveryTurn();continue;
+        }
+        if(!response.ok&&!allowFailure)throw new Error(label+'未確認（HTTP '+response.status+'）');
+        const data=await abortable(response.json());check();if(!response.ok&&(!allowFailure||data?.ok!==false))throw new Error(label+'未確認（HTTP '+response.status+'）');return data;
+      }
+    }catch(error){verify();throw error;}finally{clearTimer(timer);releaseRecovery?.();controllers.delete(controller);}
   }
   return {request,cancel:()=>{for(const controller of controllers)controller.abort();}};
 }
@@ -2850,7 +2902,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
   let operation=null,readOnlyApi=null,cancellationEpoch=0;
   const travelDestinations=new Map();
   const token=()=>readGameNativeToken(page);
-  const transport=verify=>createGameNativeTransport({fetch:(...args)=>page.fetch(...args),getToken:token,verify,setTimer,clearTimer});
+  const transport=verify=>createGameNativeTransport({fetch:(...args)=>page.fetch(...args),getToken:token,verify,now,getDeadline:()=>host.nativeRequestDeadline(getContext()),setTimer:(fn,ms)=>host.deadline(fn,ms),clearTimer:key=>host.cancel(key)});
   const rewardApi=(transport,verify,day)=>createNativeRewardsTransport({transport,day,readDailyDefinitions:()=>{verify();const world=getWorld();if(world?.daily?.day!==day||typeof world._getDailyQuestDefs!=='function')throw new Error('原生每日定義入口未就緒');const definitions=world._getDailyQuestDefs();verify();return definitions;}});
   function acceptNativeWorld(snapshot,world,verify,{localReturnRegion=null}={}){
     verify();if(!snapshot?.player||snapshot.player.name!==getRole()||snapshot.regionId!==world.regionId&&!(localReturnRegion&&world.regionId==='caravan_route_verdant_pass'&&world.caravanEscort?.returnTo?.regionId===localReturnRegion&&snapshot.regionId===localReturnRegion)||(snapshot.instanceId??null)!==(world.instanceId??null)||typeof world.applyAuthoritativeWorldState!=='function')throw new Error('操作後原生角色資料尚未同步');
@@ -2897,7 +2949,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
     if(typeof world.progressDailyQuest!=='function')throw new Error('原生讚賞任務入口未就緒');
     return createNativeFriendsFlow({...journal,day,readFriends,api:createNativeSocialTransport({transport}),onCreated:()=>{journal.verify();world.progressDailyQuest('praise',1);journal.verify();}}).run(names);
   });
-  const tradeFlow=({transport,journal,world,day})=>createNativeDailyTradeFlow({...journal,day,api:createNativeDailyTradeTransport({transport,acceptWorld:snapshot=>{journal.verify();return snapshot.player?.name===world.player.name&&snapshot.regionId===world.regionId;}}),isLegendaryActive:()=>{journal.verify();return world.player?.legendaryActive;},isFatal:()=>Boolean(host.storageError),onSignedIn:()=>{journal.verify();world.progressDailyQuest?.('guild_signin',1);journal.verify();},onDaily:daily=>{journal.verify();if(typeof world.setDaily!=='function')throw new Error('原生每日同步入口未就緒');world.setDaily(daily);journal.verify();},canInteractFacility:(guildId,id)=>{
+  const tradeFlow=({transport,journal,world,day})=>createNativeDailyTradeFlow({...journal,day,api:createNativeDailyTradeTransport({transport,acceptWorld:snapshot=>{journal.verify();return snapshot.player?.name===world.player.name&&snapshot.regionId===world.regionId;}}),isLegendaryActive:()=>{journal.verify();return world.player?.legendaryActive;},isFatal:error=>Boolean(host.storageError)||error?.code==='native_rate_limited'&&error.status===429,onSignedIn:()=>{journal.verify();world.progressDailyQuest?.('guild_signin',1);journal.verify();},onDaily:daily=>{journal.verify();if(typeof world.setDaily!=='function')throw new Error('原生每日同步入口未就緒');world.setDaily(daily);journal.verify();},canInteractFacility:(guildId,id)=>{
     journal.verify();if(world.regionId!=='guild_territory'||world.guildTerritoryContext?.guildId!==guildId||world.guildTerritoryContext?.visiting)return false;
     const objects=world.region?.decorations?.filter(item=>item?.hidden!==true&&item.kind==='guildFacility'&&item.facilityId===id);
     return Array.isArray(objects)&&objects.length===1&&[objects[0].x,objects[0].y,world.player.x,world.player.y].every(Number.isFinite)&&Math.hypot(objects[0].x-world.player.x,objects[0].y-world.player.y)<=200;
@@ -3729,7 +3781,25 @@ class CorePageReload {
 
 
 class SafePauseManager {
-  constructor({controller,receiver,session,onStatus=()=>{}}){Object.assign(this,{controller,receiver,session,onStatus});this.job=null;this.busy=false;}
+  constructor({controller,receiver,session,onStatus=()=>{}}){Object.assign(this,{controller,receiver,session,onStatus});this.job=null;this.busy=false;this.rateLimitActive=null;}
+  async requestSourceRateLimit(rateLimit,{routine=null}={}){
+    const c=this.controller,active=c.active;
+    if(active?.kind!=='daily'||rateLimit?.code!=='native_rate_limited')return false;
+    if(this.rateLimitActive===active)return true;
+    this.rateLimitActive=active;
+    const pending=Boolean(c.pending),reason=pending?'遊戲限流；原操作保留待核對，核對後再接續':'遊戲限流；保存原進度，稍後可按接續';
+    if(c.mode==='managed'){
+      try{await this.session.manualTask({action:pending?'stop':'pause',runId:active.context.runId});}
+      catch(error){if(c.active===active)await c.stop('限流暫停未送達核心：'+error.message);this.onStatus('限流暫停未送達核心，已停止並保留原進度與未明操作');return true;}
+      this.onStatus(pending?reason:'已請核心保存限流暫停快照，等待原安全點');
+    }else{
+      routine?.suspend(reason);
+      if(pending)await c.stop(reason);
+      else{const checkpoint=await this.requestLocal({reason});if(checkpoint)routine?.archivePlan();}
+      this.onStatus(reason);
+    }
+    return true;
+  }
   queue(options,command=null){if(this.job)throw new ControlError('pause_busy','安全暫停正在等待核對');const c=this.controller;c.assertAuthority(null,{allowPending:true});this.job={options,command,active:c.active,characterId:c.identity().characterId,pageEpoch:c.pageEpoch,mode:c.mode};return this.job;}
   requestCore(command){if(this.controller.mode!=='managed')throw new ControlError('wrong_mode','核心暫停需要核心模式');this.queue(command.payload,command);return {[DEFERRED_COMMAND]:true,result:{queued:true,safe:false,checkpointId:null,runId:command.runId}};}
   async requestLocal(options={}){const job=this.queue(options),complete=await this.tick();if(job.cancelled)throw job.cancelled;return complete?this.controller.checkpoint:null;}
@@ -4421,6 +4491,13 @@ class SourceRuntime {
     this.lastContext=context;
   }
   canOperate(context){try{this.assert(context,{allowPending:true});return true;}catch{return false;}}
+  nativeRequestDeadline(context,now=Date.now()){
+    const c=this.controller();
+    if(c?.mode!=='managed')return Infinity;
+    // 只換算原租約剩餘時間；請求等待不得替控制器延長操作權。
+    const remaining=c.leaseDeadline-c.clock();
+    return now+Math.max(0,Number.isFinite(remaining)?remaining:0);
+  }
   currentPending(){return this.controller()?.pending??null;}
   isManagedHistory(key){return this.controller()?.mode==='managed'&&/(?:reports-v\d|reports-role-v\d|history-role-v\d)/.test(key);}
   storage(area) {
@@ -7498,9 +7575,9 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
       cleanup.party.message='收尾現場未就緒，未操作隊伍';cleanup.channel.message='未確認返回王都，未切換分線';
     }else{
       runtime.message='最後離隊並返回10分線';persist();updatePanel();
-      try{cleanup.party={status:'完成',message:await leaveDailyParty()};}catch(error){if(error instanceof RunCancelled)throw error;cleanup.party.message='離隊未確認：'+error.message;}
+      try{cleanup.party={status:'完成',message:await leaveDailyParty()};}catch(error){if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;cleanup.party.message='離隊未確認：'+error.message;}
       await guard(epoch);
-      try{cleanup.channel={status:'完成',message:await switchGatheringChannel({target:10,final:true})};}catch(error){if(error instanceof RunCancelled)throw error;cleanup.channel.message='返回 CH.10 未確認：'+error.message;}
+      try{cleanup.channel={status:'完成',message:await switchGatheringChannel({target:10,final:true})};}catch(error){if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;cleanup.channel.message='返回 CH.10 未確認：'+error.message;}
       await guard(epoch);
       if(PAGE_WINDOW.__world?.party)cleanup.party={status:'警示',message:'結束前仍有隊伍，未確認保持單人'};
       if(readMinimapContext().channel!==10)cleanup.channel={status:'警示',message:'結束前未確認 CH.10'};
@@ -7967,7 +8044,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
           if(!target || target.x!==record.x || target.y!==record.y)done=true; // 已被其他動作取代，不清他人的移動。
           else if(typeof w._clearMoveTarget==='function'){requireRunOwner();w._clearMoveTarget('daily-task-cleanup');done=!w.moveTarget;}
         }
-      }catch{}
+      }catch(error){if(isNativeRateLimit(error))throw error;}
       if(!current())return false;
       if(done)delete operations[kind];else{okay=false;blockScene(reason+'：'+kind+'清理未確認，可能仍在運作；其餘會操作遊戲的項目均阻擋');}
     }
@@ -8209,7 +8286,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       saveStep(key, 'done', result || '已確認');
       return true;
     } catch (error) {
-      if (error instanceof RunCancelled || error instanceof NativeTradePrivilegeExpired) throw error;
+      if ((error instanceof RunCancelled||isNativeRateLimit(error)) || error instanceof NativeTradePrivilegeExpired) throw error;
       await cleanupOwnedActivities(key+'失敗');
       if(currentTask()?.id==='gathering')finishGatherNet();
       if(nativeActions.hasSecurityChallenge())blockScene('安全驗證未解除；保留現場，其餘操作項目阻擋');
@@ -8237,7 +8314,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   }
 
   async function travelTo(destination) {
-    try{await until(() => ensureTravel(destination), `無法抵達${destination}；已按十秒間隔重試，請核對傳送狀態`,90000);}catch(error){if(!(error instanceof RunCancelled))travelFailure(destination,error.message);throw error;}
+    try{await until(() => ensureTravel(destination), `無法抵達${destination}；已按十秒間隔重試，請核對傳送狀態`,90000);}catch(error){if(!((error instanceof RunCancelled||isNativeRateLimit(error))))travelFailure(destination,error.message);throw error;}
     if(ledger()['傳送：'+destination]?.state==='warn')saveStep('傳送：'+destination,'done','補跑已確認抵達'+destination+'；先前傳送警示已排除');
   }
 
@@ -8640,7 +8717,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       saveStep('採集中斷重啟',started?'done':'skipped',started?'已重新啟動，繼續監測活力':'無法補足工具，略過');
       return started;
     }catch(error){
-      if(error instanceof RunCancelled)throw error;
+      if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;
       saveStep('採集中斷重啟','skipped',error.message);return false;
     }
   }
@@ -8691,7 +8768,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     let acquired=false;
     const stop=reason=>{
       clearTicket();runtime.running=false;runtime.paused=false;runtime.resumeAvailable=false;runtime.message=reason+'；腳本已停止';runtime.warning=reason;
-      if(acquired&&roleCoordinator.owns(role)){try{stopWorldRecovery(reason);}catch(error){if(!(error instanceof RunCancelled))throw error;}}
+      if(acquired&&roleCoordinator.owns(role)){try{stopWorldRecovery(reason);}catch(error){if(!((error instanceof RunCancelled||isNativeRateLimit(error))))throw error;}}
       updatePanel();
     };
     try{
@@ -8768,7 +8845,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
         if(!state.active){if(!await retryGatheringOnce(option,material)){skipReason='重新啟動後仍無法完成活力消耗，略過採集';return true;}lastVigor=gatheringVigor();lastChanged=workNow();waitingSince=0;return false;}
         if(gatheringWaiting(state.state)){if(!waitingSince)waitingSince=workNow();}else waitingSince=0;
         if(workNow()-lastChanged>=5*60*1000){skipReason='活力五分鐘未消耗，略過剩餘採集';return true;}
-        if(gatheringShouldSwitch(state.state,vigor)&&(!lastSwitch||workNow()-lastSwitch>=1000)){try{await switchGatheringChannel();}catch(error){if(error instanceof RunCancelled)throw error;skipReason='換線未確認：'+error.message;return true;}lastSwitch=workNow();waitingSince=0;return false;}
+        if(gatheringShouldSwitch(state.state,vigor)&&(!lastSwitch||workNow()-lastSwitch>=1000)){try{await switchGatheringChannel();}catch(error){if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;skipReason='換線未確認：'+error.message;return true;}lastSwitch=workNow();waitingSince=0;return false;}
         runtime.message=option.gatheringType+' T'+option.gatheringTier+' '+material+'；活力'+vigor+'；'+state.state;return false;
       },'等待指定材料採集結束',90*60*1000);return skipReason||material+'採集至活力耗盡';
     },{repeat:true});finishGatherNet();
@@ -8815,7 +8892,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
 
   async function exitVerifiedDailyDungeon(reason){
     if(!await cleanupOwnedActivities(reason))return false;if(!verifiedDailyDungeon()){blockScene(reason+'；原生副本場次不足，保留現場');return false;}
-    try{const result=await nativeActions.runDungeonResult('exit');if(!result.confirmed)throw new Error('原生退出未確認');delete dayState.dailyDungeonSession;persist();return true;}catch(error){if(error instanceof RunCancelled)throw error;blockScene(reason+'；'+error.message);return false;}
+    try{const result=await nativeActions.runDungeonResult('exit');if(!result.confirmed)throw new Error('原生退出未確認');delete dayState.dailyDungeonSession;persist();return true;}catch(error){if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;blockScene(reason+'；'+error.message);return false;}
   }
   function scanDungeonCombat(){
     const world=PAGE_WINDOW.__world,inside=verifiedDailyDungeon(),bossVisible=inside&&Array.isArray(world.mobs)&&world.mobs.some(mob=>mob.boss===true&&!mob.dead&&Number.isFinite(mob.hp)&&mob.hp>0);
@@ -8890,7 +8967,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   async function nativeOperationStep(label,perform,describe){
     runtime.phase=label;runtime.phaseStartedAt=now();
     try{const result=await perform();saveStep(label,result.confirmed?'done':'warn',describe(result));return result;}
-    catch(error){if(host.storageError){nativeActions.cancel();host.cancelAll();runtime.running=false;runtime.paused=false;runtime.warning='操作紀錄保存失敗，已停止；未明紀錄保留';const task=currentTask();if(task){dayState.tasks[task.id].status='警示';dayState.tasks[task.id].message=runtime.warning;}syncIntegratedPending();updatePanel();return null;}if(error instanceof RunCancelled||error instanceof NativeTradePrivilegeExpired)throw error;saveStep(label,'warn',error.message);runtime.warning=label+'：'+error.message;updatePanel();return null;}
+    catch(error){if(host.storageError){nativeActions.cancel();host.cancelAll();runtime.running=false;runtime.paused=false;runtime.warning='操作紀錄保存失敗，已停止；未明紀錄保留';const task=currentTask();if(task){dayState.tasks[task.id].status='警示';dayState.tasks[task.id].message=runtime.warning;}syncIntegratedPending();updatePanel();return null;}if((error instanceof RunCancelled||isNativeRateLimit(error))||error instanceof NativeTradePrivilegeExpired)throw error;saveStep(label,'warn',error.message);runtime.warning=label+'：'+error.message;updatePanel();return null;}
   }
   const nativeRewardStep=(label,config)=>nativeOperationStep(label,()=>nativeActions.run(config),result=>'原生結果已確認；本次領取 '+result.claimed+'、已領取 '+result.alreadyClaimed);
   async function handleActivity(){
@@ -9038,7 +9115,8 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       await HANDLERS[task.id]?.();
       updatePanel();
     } catch (error) {
-      if (error instanceof RunCancelled) { ensureCurrentDay();if(scanState===dayState&&scanEpoch===runEpoch)queueOwnedCleanup('流程已取消');return; }
+      if(isNativeRateLimit(error)){if(scanState===dayState&&scanEpoch===runEpoch)pauseForNativeRateLimit(error);return;}
+      if ((error instanceof RunCancelled||isNativeRateLimit(error))) { ensureCurrentDay();if(scanState===dayState&&scanEpoch===runEpoch)queueOwnedCleanup('流程已取消');return; }
       ensureCurrentDay();if(scanState!==dayState||scanEpoch!==runEpoch)return;
       console.error('[每日任務] 掃描失敗', error);
       await cleanupOwnedActivities('階段異常');
@@ -9362,9 +9440,18 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     return entries;
   }
   function syncIntegratedPending(){if(PAGE_WINDOW.__world?.charId!==host.characterId)return;const entries=pendingEntries();if(entries.length)integratedPendingKnown=true;if(!entries.length&&missingSourcePending())return;host.pending(entries.length?{kind:'daily-journal',taskKind:'daily',taskDay:dayState.day,entries}:null);if(!entries.length)integratedPendingKnown=false;}
+  function isNativeRateLimit(error){return error?.code==='native_rate_limited'&&error.status===429;}
+  function pauseForNativeRateLimit(error){
+    if(!host.canOperate(integratedContext))return;
+    const message='遊戲請求過多，已暫停在原每日階段；等待安全接續快照或未明結果核對';
+    runtime.rateLimit={code:'native_rate_limited',retryAt:Number.isFinite(error.retryAt)?error.retryAt:now(),message,requestSent:error.requestSent===true};
+    runtime.paused=true;runtime.warning=message;runtime.message=message;syncPauseClock();
+    nativeActions.cancel();if(driverTimer)host.cancel(driverTimer);driverTimer=0;
+    persist();syncIntegratedPending();updatePanel();
+  }
   function observeIntegrated(){const entries=pendingEntries();return {state:missingSourcePending()?'reconciling':runtime.paused?'pausing':runtime.running?'running':dayState.integratedCompletedAt&&entries.length===0?'completed':integratedStarted?'stopped':'idle',
     phase:runtime.phase,message:runtime.message,warning:missingSourcePending()?'來源日誌缺少未明交易，保留統一pending等待核對':runtime.warning,taskId:currentTask()?.id??null,taskDay:dayState.day,completedAt:dayState.integratedCompletedAt??null,
-    tasks:structuredClone(dayState.tasks),pending:entries,cleanupRunning:Boolean(cleanupPromise),sourceVersion:'2.21.13'};}
+    tasks:structuredClone(dayState.tasks),pending:entries,rateLimit:structuredClone(runtime.rateLimit??null),cleanupRunning:Boolean(cleanupPromise),sourceVersion:'2.21.13'};}
   function requestIntegratedReload(){host.reload({kind:'daily',runId:integratedContext.runId,characterId:integratedContext.characterId,sourceVersion:'2.21.13',sourceCheckpoint:{role,taskDay:dayState.day,taskId:currentTask()?.id??null}});}
   let driverTimer=0;
   function beginDriver(){if(driverTimer)host.cancel(driverTimer);driverTimer=host.interval(()=>{void scan().then(()=>{syncIntegratedPending();host.observed(observeIntegrated());}).catch(error=>{runtime.warning='每日掃描核對失敗：'+error.message;});},SCAN_MS);}
@@ -9391,7 +9478,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     async tick(){await scan();syncIntegratedPending();host.observed(observeIntegrated());},
     async pause(context){host.assert(context,{allowPending:true});if(scanBusy||nativeActions.busy()||pendingEntries().some(entry=>entry.key!=='owned-npcMove')||PAGE_WINDOW.__world?.mode==='dungeon')return {safe:false};if(!npcMoveOwner.release('daily-npc-pause')){blockScene('NPC原生移動尚未确认停止');syncIntegratedPending();return {safe:false};}runtime.paused=true;stopHuntCombat();syncPauseClock();persist();host.cancel(driverTimer);driverTimer=0;return {safe:true,checkpointId:context.runId+'-daily-'+now(),sourceVersion:'2.21.13',sourceCheckpoint:{role,taskDay:dayState.day,taskId:currentTask()?.id??null}};},
     async stop(context,reason){nativeActions.cancel();host.cancelAll();integratedCleanup=true;try{stopRun(reason);if(cleanupPromise)await cleanupPromise;}finally{integratedCleanup=false;roleCoordinator.release();}syncIntegratedPending();},
-    async resume(context,checkpoint){if(checkpoint.sourceVersion!=='2.21.13'||checkpoint.sourceCheckpoint?.role!==readCurrentRole())throw new Error('每日接續角色或來源不符');integratedContext=context;integratedStarted=true;host.assert(context,{allowPending:true});if(!await roleCoordinator.acquire(role))throw new Error('每日接續未取得分頁鎖');validate(context.settings);const {taskId,rerunAll,...preferences}=context.settings;integratedOptions=normalizeRoleSettings({...permanentDailyOptions(),...preferences});integratedOptions.friendTargets=currentFriendTargets();persist();if(checkpoint.automaticReload===true&&checkpoint.safe===false){await resumeGatherSkillReload();}else if(runtime.running&&runtime.paused){runtime.paused=false;syncPauseClock();persist();}else{await resumeRun();}if(!runtime.running)throw new Error('每日沒有可安全接續的來源進度');beginDriver();},
+    async resume(context,checkpoint){if(checkpoint.sourceVersion!=='2.21.13'||checkpoint.sourceCheckpoint?.role!==readCurrentRole())throw new Error('每日接續角色或來源不符');integratedContext=context;integratedStarted=true;host.assert(context,{allowPending:true});if(!await roleCoordinator.acquire(role))throw new Error('每日接續未取得分頁鎖');validate(context.settings);const {taskId,rerunAll,...preferences}=context.settings;integratedOptions=normalizeRoleSettings({...permanentDailyOptions(),...preferences});integratedOptions.friendTargets=currentFriendTargets();if(runtime.rateLimit){if(runtime.paused&&Number.isFinite(runtime.pauseStartedAt)&&runtime.phase==='final-return'){const pausedMs=Math.max(0,now()-runtime.pauseStartedAt);if(Number.isFinite(runtime.counters?.finalReturnStartedAt))runtime.counters.finalReturnStartedAt+=pausedMs;else runtime.phaseStartedAt+=pausedMs;}if(runtime.warning===runtime.rateLimit.message)runtime.warning='';delete runtime.rateLimit;runtime.message='依原每日階段接續，保留已確認交易';}persist();if(checkpoint.automaticReload===true&&checkpoint.safe===false){await resumeGatherSkillReload();}else if(runtime.running&&runtime.paused){runtime.paused=false;syncPauseClock();persist();}else{await resumeRun();}if(!runtime.running)throw new Error('每日沒有可安全接續的來源進度');beginDriver();},
     async reconcile(){reconcileSafetyBlock();await reconcileVisibleRewards();syncIntegratedPending();const confirmed=pendingEntries().length===0&&!missingSourcePending();return {confirmed,evidence:confirmed?'來源日誌與目前場景已核對':null};},
     result(){const taskId=integratedContext?.settings?.taskId||null,enabled=taskId?[taskId]:userOptions().enabledTasks||TASKS.map(t=>t.id),tasks=structuredClone(dayState.tasks),single=dayState.integratedSingleResult,completedAt=taskId&&single?.runId===integratedContext?.runId&&single.characterId===integratedContext?.characterId&&single.taskId===taskId?single.completedAt:dayState.integratedCompletedAt??null;return {confirmed:Boolean(completedAt)&&!runtime.running&&!cleanupPromise&&!nativeActions.busy()&&pendingEntries().length===0&&!missingSourcePending()&&enabled.every(id=>['完成','略過'].includes(tasks[id]?.status))&&Object.values(dayState.finalCleanup||{}).every(value=>typeof value!=='object'||value.status==='完成'),scope:taskId?'single':'all',selectedTasks:enabled,taskDay:dayState.day,completedAt,tasks,warning:runtime.warning};}
   };
@@ -13420,8 +13507,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.96.3';
-const RUNTIME_VERSION='0.96.3';
+const SCRIPT_VERSION='0.96.4';
+const RUNTIME_VERSION='0.96.4';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
@@ -13757,8 +13844,9 @@ async function loop() {
     routine?.rememberGarden(snapshot().planting.dueAt);await routine?.tick();
     if(controller?.active) {
       const active=controller.active;if(!active.adapter.selfDriven){const work=active.adapter.tick();if(work?.catch)work.catch(error=>{if(controller?.active===active)notice='流程核對失敗：'+error.message;});}const observed=active.adapter.observe();
-      if(observed.state==='pausing'&&!controller.settlement)controller.state='pausing';
-      if(!observed.cleanupRunning&&['stopped','completed','failed'].includes(observed.state)) {const result=active.adapter.result(),c=controller;await c.stop(observed.message,{manual:false});await routine?.completed(active.kind,result);notice=result.confirmed?'流程已完成並確認':'流程已停止，請查看原因';}
+      const rateLimitHandled=await safePause?.requestSourceRateLimit(observed.rateLimit,{routine});
+      if(controller.active===active&&observed.state==='pausing'&&!controller.settlement)controller.state='pausing';
+      if(!rateLimitHandled&&!observed.cleanupRunning&&['stopped','completed','failed'].includes(observed.state)) {const result=active.adapter.result(),c=controller;await c.stop(observed.message,{manual:false});await routine?.completed(active.kind,result);notice=result.confirmed?'流程已完成並確認':'流程已停止，請查看原因';}
     }
     if(!controller?.active&&controller?.checkpoint?.automaticReload&&controller.mode==='standalone'&&GM_getValue(PREFIX+':mode',null)!=='managed'&&!controller.manualPause&&!controller.pending){await acquireRoleLock();try{await controller.resume();routine?.adoptAutomaticResume();notice='自行重整後依原快照核對返場';}catch(e){if(!controller.active&&!controller.cleanup)release();throw e;}}
     if(session&&!routine?.state.enabled)await session.refreshBridge(GM_getValue(PREFIX+':mode',null));await session?.tick();await safePause?.tick();await coreReload?.tick();render();
