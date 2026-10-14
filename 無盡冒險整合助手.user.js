@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.95.5
+// @version      0.96.0
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -3242,9 +3242,10 @@ class TaskController {
     if(this.active) throw new ControlError('task_busy','先完成目前任務交接');
     const adapter = this.adapters.get(kind); if(!adapter) throw new ControlError('unsupported_task','任務尚未接入');
     adapter.validate(settings);
-    const context=this.context(runId,settings); this.active={kind,context,adapter}; this.state='running';
+    const previousCheckpoint=this.checkpoint,context=this.context(runId,settings); this.active={kind,context,adapter}; this.state='running';
     try { await adapter.start(context); this.assertAuthority(context,{allowPending:true}); }
     catch(error) { await this.stop(error.message,{manual:false});throw error; }
+    if(previousCheckpoint?.kind===kind&&this.checkpoint===previousCheckpoint&&previousCheckpoint.context?.runId!==context.runId)this.checkpoint=null;
     this.persist(); return adapter.observe();
   }
   async pause({reason='暫停', boundary='safe'} = {}) {
@@ -9306,8 +9307,19 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   loadData();syncIntegratedPending();
   return {
     kind:'daily',sourceVersion:'2.21.13',selfDriven:true,observe:observeIntegrated,validate,settings:openSettings,records:showTaskLog,getSettings:()=>{const {legacy,...options}=permanentDailyOptions();return structuredClone({...options,friendTargets:FRIEND_TARGETS.includes(role)&&readCurrentRole()===role?FRIEND_TARGETS.filter(name=>name!==role):[]});},
-    async start(context){validate(context.settings);integratedContext=context;integratedStarted=true;host.assert(context,{allowPending:true});
-      if(!await roleCoordinator.acquire(role))throw new Error('每日來源分頁鎖取得失敗');
+    async start(context){
+      validate(context.settings);const restarting=runtime.running&&runtime.paused,previousContext=integratedContext,expectedRole=role;
+      const verify=()=>{host.assert(context,{allowPending:!restarting});if(!expectedRole||role!==expectedRole||readCurrentRole()!==expectedRole)throw new Error('每日開始角色已改變');if(restarting&&(pendingEntries().length||missingSourcePending()))throw new Error('每日未明操作尚未核對，不能重新開始');};
+      verify();if(cleanupPromise||scanBusy||nativeActions.busy()||runtime.running&&!runtime.paused)throw new Error('每日原執行或收尾尚未完成');
+      if(!await roleCoordinator.acquire(role))throw new Error('每日來源分頁鎖取得失敗');verify();
+      if(restarting){
+        if(!previousContext||previousContext.characterId!==context.characterId)throw new Error('每日暫停來源角色不符，不能重新開始');
+        integratedCleanup=true;
+        try{nativeActions.cancel();host.cancelAll();stopRun('重新開始每日任務');if(cleanupPromise)await cleanupPromise;}finally{integratedCleanup=false;}
+        verify();if(cleanupPromise||dayState.operations||dayState.safetyBlock)throw new Error('每日原執行清理尚未確認，保留紀錄等待核對');
+        if(!await roleCoordinator.acquire(role))throw new Error('每日重新開始未取得分頁鎖');verify();
+      }
+      integratedContext=context;integratedStarted=true;
       refreshRoleState();
       const {taskId='',rerunAll=false,...preferences}=context.settings;integratedOptions=normalizeRoleSettings({...permanentDailyOptions(),...preferences});integratedOptions.friendTargets=currentFriendTargets();delete dayState.integratedCompletedAt;delete dayState.integratedSingleResult;persist();
       await startRun(taskId,rerunAll);if(!runtime.running)throw new Error(runtime.message||runtime.warning||'每日未啟動');beginDriver();host.observed(observeIntegrated());
@@ -13344,8 +13356,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.95.5';
-const RUNTIME_VERSION='0.95.5';
+const SCRIPT_VERSION='0.96.0';
+const RUNTIME_VERSION='0.96.0';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
@@ -13573,7 +13585,18 @@ button('指定隊伍與會合',()=>{initializeRole();if(!partyAdapter)throw new 
 button('首領倒數',()=>{initializeRole();if(!bossAdapter)throw new Error('等待角色載入');bossAdapter.timers();});
 button('野王紀錄',()=>{initializeRole();if(!bossAdapter)throw new Error('等待角色載入');bossAdapter.records();});
 button('安全暫停',async()=>{initializeRole();if(controller?.mode==='managed'){await session.manualTask({action:'pause',...(controller.active?{runId:controller.active.context.runId}:{})});notice='已請核心等待安全點暫停';render();return;}if(!safePause)throw new Error('等待角色載入');if(coreReload?.job)throw new ControlError('reload_busy','重整已等待安全點');routine?.suspend();const checkpoint=await safePause.requestLocal();if(checkpoint)routine?.archivePlan();notice=checkpoint?'已保存接續快照':'尚未到安全點，等待當前操作確認';render();});
-button('接續',async()=>{if(controller?.mode==='managed'){await session.manualTask({action:'resume',...(controller.checkpoint?{runId:controller.checkpoint.context.runId}:{})});notice='已請核心接續原安全快照';render();return;}if(!controller)throw new Error('等待角色載入');if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.active)throw new ControlError('task_busy','先完成目前任務交接');await acquireRoleLock();try{await controller.resume({manual:true});}catch(e){if(!controller.active&&!controller.cleanup)release();throw e;}notice='已接續';render();});
+async function resumePausedTask(){
+ initializeRole();assertSourcesReadable();if(!controller)throw new Error('等待角色載入');
+ if(controller.mode==='managed'){const runId=session.status?.()?.manualTask?.runId??controller.checkpoint?.context.runId;await session.manualTask({action:'resume',...(runId?{runId}:{})});notice='已請核心接續原安全快照與流程';render();return;}
+ if(controller.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(controller.active)throw new ControlError('task_busy','先完成目前任務交接');if(controller.pending)throw new ControlError('unknown_result','先核對未明操作再接續');
+ const checkpoint=controller.checkpoint,run=routine?.state.currentRun;
+ const savedFlow=checkpoint&&run&&run.runId===checkpoint.context?.runId&&run.kind===checkpoint.kind&&run.characterId===checkpoint.context?.characterId;
+ const backgroundFlow=routine?.state.phase==='primary'&&routine.state.options?.primaryKind==='idle'&&!run&&!checkpoint;
+ if(savedFlow||backgroundFlow){await routine.resumeSaved();notice='已接續原任務與後續流程';}
+ else {await acquireRoleLock();try{await controller.resume({manual:true});}catch(error){if(!controller.active&&!controller.cleanup)release();throw error;}notice='已接續原任務';}
+ render();
+}
+button('接續',resumePausedTask);
 button('停止',async()=>{if(controller?.mode==='managed'&&controller.active?.context.settings.manualAuto)return runManualAuto('stop');if(controller?.mode==='managed'){await session.manualTask({action:'stop',...(controller.active?{runId:controller.active.context.runId}:{})});notice='已請核心停止；等待收尾與未明操作核對';render();return;}safePause?.cancel('使用者停止取消暫停等待');reloadRequested=false;coreReload?.cancel('使用者已停止');routine?.suspend('使用者已停止日常流程');await controller?.stop();notice='使用者已停止；未明操作仍保存待核對';render();});
 button('核對未明操作',async()=>{if(controller?.mode==='managed'){await session.manualTask({action:'reconcile'});notice='已請核心核對原未明操作';render();return;}const result=await controller?.reconcile();notice=result?.confirmed?'已取得核對證據':'結果仍未確認，不重送';render();});
 modeToggle=button('核心模式',async()=>{
@@ -13600,14 +13623,16 @@ button('接續日常流程',async()=>{initializeRole();assertSourcesReadable();i
 button('安全重整',()=>{if(!controller)throw new Error('等待角色載入');if(controller.mode!=='standalone')throw new Error('核心模式的重整由核心安排');reloadRequested=true;notice='已排隊重整，等待目前操作與本場安全點';render();});
 const defaultPlans=()=>[[{kind:'daily',count:1},{kind:'battle',count:1}],[{kind:'daily',count:1},{kind:'boss',count:1}],[{kind:'daily',count:1},{kind:'dungeon',count:3},{kind:'boss',count:3},{kind:'battle',count:1}]];
 for(let i=0;i<3;i++){const option=document.createElement('option');option.value='plan-'+i;option.textContent='方案'+(i+1);compactPanel.choice.append(option);}
-async function executeSelection(rerun=false){initializeRole();assertSourcesReadable();if(!controller)throw new Error('等待角色載入');const selected=compactPanel.choice.value;if(selected.startsWith('plan-')){if(controller.mode==='managed'){
+async function executeSelection(rerun=false,restart=false){initializeRole();assertSourcesReadable();if(!controller)throw new Error('等待角色載入');if(restart){if(controller.cleanup||controller.settlement)throw new ControlError('cleanup_running','等待原執行收尾再重新執行');if(controller.pending)throw new ControlError('unknown_result','先核對未明操作再重新執行');if(controller.mode!=='managed'&&controller.active)throw new ControlError('task_busy','先安全暫停目前任務再重新執行');}const selected=compactPanel.choice.value;if(selected.startsWith('plan-')){if(controller.mode==='managed'){
  const savedTask=session.status().manualTask;
  if(rerun&&controller.checkpoint&&savedTask?.planId===selected&&savedTask.runId===controller.checkpoint.context.runId){await session.manualTask({action:'resume',runId:controller.checkpoint.context.runId});notice='已請核心接續原方案';render();return;}
  const plans=store.read(roleId,'settings',{})?.plans??defaultPlans(),steps=plans[Number(selected.slice(5))];validatePlanSteps(steps);const snapshots=steps.map(step=>({kind:step.kind,settings:planStepSettings(step,taskSnapshot(step.kind))}));for(const step of snapshots)controller.adapters.get(step.kind).validate(step.settings);
  await session.manualTask({action:'start',steps:snapshots,options:{planId:selected,farmEnabled:steps.some(step=>step.kind==='farm'),farmSettings:{...localSettings('farm'),limit:1},farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null,taskTeams:taskTeamsSnapshot()}});notice='已請核心執行'+'方案'+(Number(selected.slice(5))+1)+'；交接依安全點進行';render();return;
-}if(rerun){await routine.resumePlan(selected);}else{applyDraftBoundary();const plans=store.read(roleId,'settings',{})?.plans??defaultPlans();await routine.beginPlan(plans[Number(selected.slice(5))],{planId:selected,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null,taskTeams:taskTeamsSnapshot()});}if(!rerun){routine.state.planLabel='方案'+(Number(selected.slice(5))+1);routine.persist();}notice=rerun?'已接續原方案進度':'已開始角色方案';render();return;}if(rerun&&controller.checkpoint?.kind===selected&&controller.checkpoint.context?.settings.manualAuto!==true){if(controller.mode==='managed'){const savedTask=session.status().manualTask;if(savedTask?.planId!==null||savedTask.taskKind!==selected||savedTask.runId!==controller.checkpoint.context.runId)return startLocal(selected,rerun&&selected==='daily'?{rerunAll:true}:{});await session.manualTask({action:'resume',runId:controller.checkpoint.context.runId});notice='已請核心接續原單項快照';render();return;}if(!routine.state.steps&&routine.state.currentRun?.runId===controller.checkpoint.context.runId&&routine.state.options?.primaryKind===selected){await routine.resumeSaved();notice='已接續原單項任務與種植插隊安排';}else{await acquireRoleLock();await controller.resume({manual:true});notice='已接續原單項任務';}render();return;}return startLocal(selected,rerun&&selected==='daily'?{rerunAll:true}:{});}
+}if(rerun){await routine.resumePlan(selected);}else{applyDraftBoundary();const plans=store.read(roleId,'settings',{})?.plans??defaultPlans();await routine.beginPlan(plans[Number(selected.slice(5))],{planId:selected,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:store.read(roleId,'settings',{})?.routineTeam??null,taskTeams:taskTeamsSnapshot()});}if(!rerun){routine.state.planLabel='方案'+(Number(selected.slice(5))+1);routine.persist();}notice=rerun?'已接續原方案進度':'已開始角色方案';render();return;}if(rerun&&controller.checkpoint?.kind===selected&&controller.checkpoint.context?.settings.manualAuto!==true){if(controller.mode==='managed'){const savedTask=session.status().manualTask;if(savedTask?.planId!==null||savedTask.taskKind!==selected||savedTask.runId!==controller.checkpoint.context.runId)return startLocal(selected,(rerun||restart)&&selected==='daily'?{rerunAll:true}:{});await session.manualTask({action:'resume',runId:controller.checkpoint.context.runId});notice='已請核心接續原單項快照';render();return;}if(!routine.state.steps&&routine.state.currentRun?.runId===controller.checkpoint.context.runId&&routine.state.options?.primaryKind===selected){await routine.resumeSaved();notice='已接續原單項任務與種植插隊安排';}else{await acquireRoleLock();await controller.resume({manual:true});notice='已接續原單項任務';}render();return;}return startLocal(selected,(rerun||restart)&&selected==='daily'?{rerunAll:true}:{});}
 compactPanel.action('執行',()=>executeSelection());
 compactPanel.action('暫停',()=>compactPanel.execute('安全暫停'));
+compactPanel.action('接續',()=>resumePausedTask());
+compactPanel.action('重新執行',async()=>{const owner=controller,checkpoint=owner?.checkpoint;await executeSelection(false,true);if(owner&&controller===owner&&owner.mode==='standalone'&&owner.active&&checkpoint&&owner.checkpoint===checkpoint&&owner.active.context.runId!==checkpoint.context?.runId){owner.checkpoint=null;owner.persist();}});
 compactPanel.action('補跑',()=>executeSelection(true));
 const rerunLabel=document.createElement('span');rerunLabel.textContent='補跑按鈕：';buttons.append(rerunLabel);compactPanel.register('補跑說明',rerunLabel);
 compactPanel.feature('每日任務',['每日設定','每日日誌','補跑說明','補跑階段','開始補跑']);
