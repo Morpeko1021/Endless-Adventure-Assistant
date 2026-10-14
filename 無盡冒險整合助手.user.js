@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.96.2
+// @version      0.96.3
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -1821,6 +1821,7 @@ function createNativeBattleGuildMonitor({host,context,getWorld,skillIds,manualSk
 
 
 
+
 const nativeHomeCropIds=Object.freeze(['sunwheat','moonherb','stardew','emberbell','frostlace','maple_honey','abyss_pearl','thunderbud','dragonheart']);
 function readNativeHomeGardenObjects({world,readPlots,now=Date.now}){
   if(!isNativeOwnHome(world,'player_home_garden'))throw new Error('尚未確認自己的原生庭院');const time=now()+(Number.isFinite(world._serverTimeOffsetMs)?world._serverTimeOffsetMs:0);
@@ -1842,9 +1843,27 @@ function createNativeHomeTransport({transport}){
   const read=(characterId,suffix)=>transport.request({path:'/characters/'+encodeNativeId(characterId)+'/'+suffix,label:'原生家園核對'});
   return {readHome:characterId=>read(characterId,'home-economy'),readWorld:characterId=>read(characterId,'world-state'),readSupply:characterId=>read(characterId,'kingdom-supply'),submitSupply:(characterId,payload)=>transport.request({method:'POST',path:'/characters/'+encodeNativeId(characterId)+'/kingdom-supply/submit',body:payload,label:'原生家園收購'})};
 }
-function createNativeHomeView({document,getWorld,characterId,verify}){
+function createNativeHomeView({document,getWorld,characterId,verify,now=Date.now}){
   const readHud=()=>readNativeViewProps({document,selector:'aside.home-v1-hud',accept:props=>props.characterId===characterId&&typeof props.onTravel==='function'&&props.state});
-  const readActions=()=>readNativeViewProps({document,selector:'.home-experience-panel',accept:props=>props.characterId===characterId&&props.homeState&&typeof props.onAction==='function'});
+  function farmingHud(){
+    const world=getWorld();if(world?.charId!==characterId||!isNativeOwnHome(world,'player_home_garden'))return null;
+    const rows=readNativeViewEntries({document,selector:'aside.home-v1-hud',accept:(props,node)=>props.characterId===characterId&&props.state&&props.visitingHome==null&&Boolean(nativeViewWorldOwner(node,world))});
+    if(rows.length!==1)return null;
+    const plots=readSixGardenPlots(world),ids=plots.map(plot=>plot.plotId),state=rows[0].props.state;
+    if(JSON.stringify(Object.keys(state.plots??{}).sort())!==JSON.stringify([...ids].sort()))return null;
+    return {world,props:rows[0].props,plots,state,values:nativeHomePlots(state,ids)};
+  }
+  function readActions(plotId=null){
+    const hud=farmingHud();if(!hud)return null;
+    return readNativeViewProps({document,selector:'.home-experience-panel',accept:(props,node)=>{
+      if(props.characterId!==characterId||props.homeOwnerCharacterId!==characterId||props.facility?.facilityType!=='garden_plot'||typeof props.onAction!=='function'||!nativeViewWorldOwner(node,hud.world))return false;
+      const plot=hud.plots.find(plot=>props.facility.plotId===plot.plotId||props.facility.plotId==null&&props.facility.id===plot.id);
+      if(!plot||props.facility.id!==plot.id||plotId!==null&&plot.plotId!==plotId)return false;
+      try{return nativeHomePlotFingerprint(nativeHomePlots(props.homeState,hud.values.map(plot=>plot.plotId)))===nativeHomePlotFingerprint(hud.values);}catch{return false;}
+    }});
+  }
+  const targets=(plots,action,time)=>plots.filter(plot=>plot.cropId&&(action.startsWith('harvest')?plot.readyAt<=time:plot.readyAt>time&&!plot.watered)).map(plot=>plot.plotId).sort();
+  const sameTargets=(a,b)=>Array.isArray(b)&&JSON.stringify([...a].sort())===JSON.stringify([...b].sort());
   const menu=createNativeMenuView({document,verify,targetId:'home'});
   const leaveTickets=new WeakMap();
   function leaveEntry(allowVisitor){
@@ -1862,10 +1881,36 @@ function createNativeHomeView({document,getWorld,characterId,verify}){
     hud:readHud,actions:readActions,
     prepareEntry(){verify();return Boolean(readHud())||menu.prepare();},
     enter(regionId){verify();if(!nativeHomeRegions.has(regionId))throw new Error('原生家園目的地無效');const hud=readHud();if(hud){hud.onTravel(regionId,{ownerCharacterId:characterId});verify();return;}if(regionId!=='player_home')throw new Error('尚未抵達自己的家園');if(!menu.open())throw new Error('原生家園選單入口未就緒');verify();},
-    prepareActions(){verify();if(readActions())return true;const hud=readHud();if(!isNativeOwnHome(getWorld())||typeof hud?.onDashboard!=='function')throw new Error('原生家園總覽入口未就緒');verify();hud.onDashboard();verify();return false;},
+    prepareActions(action='plant_all',{plotId=null}={}){
+      verify();const hud=farmingHud();if(!hud)throw new Error('原生菜圃操作入口或屋主未確認');
+      if(action!=='plant_all')return typeof hud.props[action==='harvest_all'?'onQuickHarvest':action==='water_all'?'onWaterAll':action==='claim_yield'?'onClaimYield':'onOpenGardenPlot']==='function';
+      const empty=hud.plots.find(plot=>!hud.state.plots[plot.plotId]?.cropId&&(plotId===null||plot.plotId===plotId));
+      if(!empty)throw new Error('沒有可安全開啟種植選單的空格');
+      if(readActions(empty.plotId))return true;
+      if(typeof hud.props.onOpenGardenPlot!=='function')throw new Error('原生菜圃選單入口未就緒');
+      verify();if(getWorld()!==hud.world||hud.state.plots[empty.plotId]?.cropId)throw new Error('開啟種植選單前菜圃已改變');hud.props.onOpenGardenPlot(empty.plotId);verify();return false;
+    },
     prepareLeave,
     leave({ticket=null,beforeSend=()=>{}}={}){verify();ticket??=prepareLeave();const saved=ticket&&leaveTickets.get(ticket);if(!saved||!sameLeaveEntry(saved.entry,leaveEntry(saved.allowVisitor)))throw new Error('原生離開家園入口未就緒');verify();beforeSend();verify();if(!sameLeaveEntry(saved.entry,leaveEntry(saved.allowVisitor)))throw new Error('保存後原生離家入口或屋主已變');leaveTickets.delete(ticket);const result=saved.entry.onLeaveHome();result?.catch?.(()=>{});verify();return result;},
-    send(action,payload,before){verify();const props=readActions();if(!props||props.homeEconomyBusy!==false||props.homeOwnerCharacterId&&props.homeOwnerCharacterId!==characterId||!isNativeOwnHome(getWorld(),'player_home_garden'))throw new Error('原生家園操作入口或屋主未確認');const current=nativeHomePlots(props.homeState,before.plots.map(plot=>plot.plotId));if(nativeHomePlotFingerprint(current)!==nativeHomePlotFingerprint(before.plots))throw new Error('原生家園介面與伺服器資料不同，未送出');verify();return props.onAction(action,payload);}
+    actionState(){verify();const hud=farmingHud();return hud?{home:hud.state,plots:hud.values}:null;},
+    send(action,payload,before,plannedTargets=[],nativeNow=now){
+      verify();const hud=farmingHud();if(!hud)throw new Error('原生家園操作入口或屋主未確認');
+      if(nativeHomePlotFingerprint(hud.values)!==nativeHomePlotFingerprint(before.plots))throw new Error('原生家園介面與伺服器資料不同，未送出');
+      if(action==='plant_all'){
+        const props=readActions();if(!props||props.homeEconomyBusy!==false||hud.state.plots[props.facility.plotId]?.cropId)throw new Error('原生種植選單或空格未確認');
+        verify();return props.onAction(action,payload);
+      }
+      if(action==='claim_yield'){if(typeof hud.props.onClaimYield!=='function')throw new Error('原生特產入口未確認');verify();return hud.props.onClaimYield();}
+      if(!['harvest','harvest_all','water','water_all'].includes(action))throw new Error('未核准的原生菜圃動作');
+      const readTime=typeof nativeNow==='function'?nativeNow:()=>nativeNow,actual=targets(hud.values,action,readTime());
+      if(action==='harvest'||action==='water'){
+        const plot=hud.plots.find(plot=>plot.plotId===payload.plotId);
+        if(!plot||plot.id!==payload.id||!actual.includes(plot.plotId)||!sameTargets([plot.plotId],plannedTargets)||typeof hud.props.onOpenGardenPlot!=='function')throw new Error('單格原生動作或成熟時點已改變，未送出');
+        verify();if(!targets(hud.values,action,readTime()).includes(plot.plotId))throw new Error('單格成熟時點已改變，未送出');return hud.props.onOpenGardenPlot(plot.plotId);
+      }
+      if(!actual.length||!sameTargets(actual,plannedTargets))throw new Error('原生批次範圍與保存目標不同，未送出');
+      const callback=hud.props[action==='harvest_all'?'onQuickHarvest':'onWaterAll'];if(typeof callback!=='function')throw new Error('原生批次菜圃入口未確認');verify();if(!sameTargets(targets(hud.values,action,readTime()),plannedTargets))throw new Error('原生批次範圍已改變，未送出');return callback();
+    }
   };
 }
 
@@ -1959,7 +2004,6 @@ function createNativeHomeFlow({api,view,getWorld,context,day,verify,readRecord,w
   async function perform(action,{cropId=null,scopeId='default',plotId=null}={}){
     if(!['harvest','harvest_all','plant_all','water','water_all','claim_yield'].includes(action))throw new Error('未核准的原生家園操作');
     await reconcile();if(pendingEntries().length)throw new Error('原生家園仍有未明操作，不重送');
-    await wait(()=>ready()&&view.prepareActions(),'等待原生家園操作入口',16000);
     const initial=await readGarden();verify();let targets,quantity=0;
     if(['harvest','harvest_all'].includes(action))targets=initial.plots.filter(plot=>plot.cropId&&plot.readyAt<=clock()).map(plot=>plot.plotId);
     if(['water','water_all'].includes(action))targets=initial.plots.filter(plot=>plot.cropId&&plot.readyAt>clock()&&!plot.watered).map(plot=>plot.plotId);
@@ -1974,6 +2018,7 @@ function createNativeHomeFlow({api,view,getWorld,context,day,verify,readRecord,w
       if(initial.home.economy?.careDayKey!==day||!nativeHomeInteger(initial.home.economy?.carePoints)||initial.home.economy.carePoints<20)throw new Error('原生今日打理未滿20點，未領取');targets=[];
     }
     if(action!=='claim_yield'&&!targets.length)return {confirmed:true,sent:false,quantity:0};
+    await wait(()=>ready()&&view.prepareActions(action,{plotId}),'等待原生菜圃操作入口',16000);
     quantity=action==='plant_all'?quantity:targets.length;
     encodeNativeId(scopeId);const revision=action==='claim_yield'?day:JSON.stringify([context.runId,scopeId,cropId,nativeHomePlotFingerprint(initial.plots)]),key=nativeHomeRecordKey({day,action,revision});
     const selected=plotId?getWorld().region?.decorations?.find(plot=>plot.plotId===plotId):null;if(plotId)encodeNativeId(selected?.id);
@@ -1983,7 +2028,10 @@ function createNativeHomeFlow({api,view,getWorld,context,day,verify,readRecord,w
       if(plotId&&getWorld().region?.decorations?.find(plot=>plot.plotId===plotId)?.id!==record.payload.id)throw new Error('原生菜圃物件識別碼在保存後已改變，未送出');
       if(action==='plant_all'&&JSON.stringify(plantPlan(fresh,cropId))!==JSON.stringify(plantPlan(initial,cropId)))throw new Error('保存後原生種植材料／成本改變，未送出');
       if(action==='claim_yield'&&(fresh.home.economy?.careDayKey!==day||!nativeHomeInteger(fresh.home.economy?.carePoints)||fresh.home.economy.carePoints<20))throw new Error('保存後原生打理點改變，未領取');
-      const receipt=await awaitNative(view.send(action,record.payload,fresh));verify();return receipt;
+      const receipt=await awaitNative(view.send(action,record.payload,fresh,record.targets,now));verify();
+      // HUD 快捷回呼不回傳交易 Promise；仍在原 ledger 內等待原生結果，再由 API 核對。
+      if(receipt===undefined&&['harvest','harvest_all','water','water_all'].includes(action))await wait(()=>{if(!ready())return false;const state=view.actionState();return state&&proof({...record,characterId:context.characterId},state);},'原生結果尚未確認，保留紀錄',16000);
+      verify();return receipt;
     }});
     return {...result,quantity};
   }
@@ -13372,8 +13420,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.96.2';
-const RUNTIME_VERSION='0.96.2';
+const SCRIPT_VERSION='0.96.3';
+const RUNTIME_VERSION='0.96.3';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
