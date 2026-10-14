@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.96.0
+// @version      0.96.1
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -3312,7 +3312,7 @@ class TaskController {
     if(!adapter) throw new ControlError('unsupported_task','未明操作的任務尚未接入');
     if(pending.characterId !== identity) throw new ControlError('identity_mismatch','禁止核對其他角色的未明操作');
     let evidence;try{if(readOnlyCommand)this.readOnlyReconcilePending={pending,record};evidence=await adapter.reconcile(pending);if(this.identity()?.characterId!==identity||this.pageEpoch!==epoch||this.generation!==generation||this.roleId!==roleId||this.pending!==null&&(this.pending!==pending||JSON.stringify(this.pending)!==record))throw new ControlError('pending_changed','核對期間角色、頁面或未明紀錄已改變');if(readOnlyCommand)readOnlyGuard();}catch(error){if(this.pending===null){this.pending=pending;this.persist();}throw error;}finally{if(readOnlyCommand)this.readOnlyReconcilePending=null;}
-    if(evidence?.confirmed === true) {this.pending=null;this.state='paused';this.persist();}
+    if(evidence?.confirmed === true) {const previousState=this.state;this.pending=null;this.state=this.active||this.cleanup||this.settlement||this.checkpoint?'paused':'idle';try{this.persist();}catch(error){if(this.pending===null)this.pending=pending;this.state=previousState;throw error;}}
     else if(this.pending===null){this.pending=pending;this.persist();}
     return evidence;
   }
@@ -4453,14 +4453,30 @@ function createNativeConfirmationView({document,getWorld}){
 
 
 
+
 function createNativePartyView({document,getWorld}){
   function entries(selector,accept){const world=getWorld();return readNativeViewEntries({document,selector,accept:(props,node)=>Boolean(nativeViewWorldOwner(node,world))&&accept(props,node,world)});}
   const unique=rows=>rows.length===1?rows[0]:null;
-  function party(){const rows=entries('.qt-party-empty,.qt-party,.window-party',(props,node,world)=>props.myCharacterId===world.charId&&typeof props.onCreate==='function'&&(world.party?props.party?.id===world.party.id&&props.party?.leaderId===world.party.leaderId:props.party==null));const full=rows.filter(row=>typeof row.props.onClose==='function');return unique(full.length?full:rows);}
+  const partyIdentity=(props,world)=>props.myCharacterId===world.charId&&(world.party?props.party?.id===world.party.id&&props.party?.leaderId===world.party.leaderId:props.party==null);
+  function partyRows(accept){return [...new Map([...entries('.qt-party-empty,.qt-party,.window-party',accept),...entries('.qt-party-panel',accept)].map(row=>[row.node,row])).values()];}
+  function party(){const rows=partyRows((props,node,world)=>partyIdentity(props,world)&&typeof props.onCreate==='function');const full=rows.filter(row=>typeof row.props.onClose==='function');return unique(full.length?full:rows);}
   function rootValues(entry){const node=nativeViewWorldOwner(entry.node,getWorld());return node?readNativeViewStateValues(node,{maxHooks:1024}):null;}
+  function open(verify=()=>{}){
+    const world=getWorld(),characterId=world?.charId;if(!characterId)return false;
+    const guard=()=>{verify();if(getWorld()!==world||world.charId!==characterId)throw new ControlError('identity_mismatch','隊伍開窗角色或世界已變更');};
+    const quick=()=>partyRows((props,node,w)=>partyIdentity(props,w)&&typeof props.onOpen==='function');
+    guard();const quickRows=quick();if(quickRows.length>1)return false;
+    const menuRows=quickRows.length?null:entries('.portrait-quick-rail,.mobile-menu-panel',props=>typeof props.onOpen==='function');
+    if(menuRows?.length>1)return false;const direct=quickRows[0]??unique(menuRows??[]);
+    if(direct){const callback=direct.props.onOpen;guard();const fresh=quickRows.length?unique(quick()):unique(entries('.portrait-quick-rail,.mobile-menu-panel',props=>typeof props.onOpen==='function'));if(!fresh||fresh.node!==direct.node||fresh.props.onOpen!==callback)return false;quickRows.length?callback():callback('party');guard();return true;}
+    // 共用原生選單負責桌面展開／功能入口；先限縮為目前掛載世界的節點。
+    const scopedDocument={querySelectorAll:selector=>[...document.querySelectorAll(selector)].filter(element=>readNativeViewEntries({document:{querySelectorAll:()=>[element]},selector,accept:(props,node)=>Boolean(nativeViewWorldOwner(node,world))}).length===1)};
+    const menu=createNativeMenuView({document:scopedDocument,targetId:'party',verify:guard});
+    if(menu.open())return true;menu.prepare();return false;
+  }
   return {party,
     friend(characterId){const w=getWorld(),entry=unique(entries('.window-friends',props=>Array.isArray(props.friendsState?.friends)&&typeof props.onInvite==='function'&&props.party?.id===w.party?.id));if(!entry||!w.party||w.party.leaderId!==w.charId||w.party.members?.length>=4||w.party.members?.some(row=>row.characterId===characterId))return null;const rows=entry.props.friendsState.friends.filter(row=>row.characterId===characterId);if(rows.length!==1||rows[0].presence?.online!==true)return null;return {entry,friend:rows[0],signature:JSON.stringify(rows[0])};},
-    open(){const entry=unique(entries('.portrait-quick-rail,.mobile-menu-panel',props=>typeof props.onOpen==='function'));if(!entry)return false;entry.props.onOpen('party');return true;},
+    open,
     remote(characterId){const world=getWorld(),remote=world?.remotes?.[characterId];if(!remote)return null;const current=unique(entries('.rpm-frame[role="dialog"]',(props)=>typeof props.onInvite==='function'&&props.remote?.name===remote.name&&props.inSameParty===false&&props.partyFull===false&&!props.inviteDisabledReason));if(!current)return null;
       const id=current.props.remote.characterId??current.props.remote.id;if(id!=null&&id!==characterId)return null;return rootValues(current)?.some(row=>row.value===characterId)?current:null;},
     invitation(invitation){const current=unique(entries('.party-invite-toast',props=>props.fromName===invitation.fromName&&typeof props.onAccept==='function'&&typeof props.onDecline==='function'&&props.dungeonName===undefined));if(!current)return null;
@@ -4546,7 +4562,7 @@ class NativePartyGateway {
   }
   refresh(){const world=this.world();if(world===this.boundWorld)return;this.off?.();this.off=null;this.invite=null;this.leaveConfirmation=null;this.openedRemote=null;this.boundWorld=world;if(typeof world?.on==='function')this.off=world.on('partyInvite',value=>{if(world!==this.world()||value?.type!=='invite'||typeof value.fromCharacterId!=='string')return;this.invite={fromCharacterId:value.fromCharacterId,fromName:String(value.fromName??''),fromChannelId:value.fromChannelId??null,receivedAt:this.now()};});}
   guard(context,{city=false,allowPending=false}={}){this.refresh();this.authorize(context,allowPending?{allowPending:true}:{});const world=this.world();if(world!==this.boundWorld||world?.charId!==context?.characterId)throw new ControlError('identity_mismatch','隊伍入口角色或世界已變更');if(world.mode!=='open'||world.dead||world.player?.hp===0||world.isWorldInteractionLocked?.()||world.pendingSkill||world.castingState||world.autoBattle||world.followTarget)throw new ControlError('party_not_ready','目前戰鬥／施法／跟隨或世界狀態不允許隊伍操作');if(city&&!['holy_city','village'].includes(world.regionId))throw new ControlError('party_safe_location','請先在王都或村莊集合，再建立或邀請隊伍');return world;}
-  openParty(context){this.guard(context);const entry=this.view.party();if(entry&&typeof entry.props.onClose==='function')return true;if(this.now()-this.openedAt<1200)return false;this.openedAt=this.now();if(typeof entry?.props.onOpen==='function')entry.props.onOpen();else this.view.open();return false;}
+  openParty(context){this.guard(context);const entry=this.view.party();if(entry&&typeof entry.props.onClose==='function')return true;if(this.now()-this.openedAt<1200)return false;this.openedAt=this.now();this.view.open(()=>this.guard(context));return false;}
   create(context){const world=this.guard(context,{city:true});if(world.party)throw new ControlError('party_exists','目前已有隊伍');const entry=this.view.party();if(!entry){this.openParty(context);return {sent:false,reason:'等待原生建立隊伍入口'};}this.pending({kind:'party-create',taskKind:this.taskKind});this.guard(context,{city:true,allowPending:true});if(this.world()!==world||this.view.party()?.props!==entry.props)throw new ControlError('identity_mismatch','保存後隊伍入口已變');entry.props.onCreate();return {sent:true};}
   inviteMember(context,characterId){const world=this.guard(context,{city:true});if(world.party?.leaderId!==world.charId)throw new ControlError('party_leader_required','只有原生隊長能邀請');if(typeof characterId!=='string'||!characterId||characterId===world.charId)throw new ControlError('party_target_unknown','指定原生角色ID無效');const remote=world.remotes?.[characterId];if(!remote?.name||remote.regionId&&remote.regionId!==world.regionId){const friend=this.view.friend(characterId);if(!friend){if(this.now()-this.openedAt>=1200){this.openedAt=this.now();const menu=createNativeMenuView({document:this.document,targetId:'friend',verify:()=>this.guard(context,{city:true})});if(!menu.open())menu.prepare();}return {sent:false,reason:'等待指定角色原生好友邀請入口（可跨分線）'};}const partyId=world.party.id;this.pending({kind:'party-invite',taskKind:this.taskKind,targetCharacterId:characterId,partyId,sourceEntry:'native-friend'});this.guard(context,{city:true,allowPending:true});const fresh=this.view.friend(characterId);if(this.world()!==world||world.party?.id!==partyId||!fresh||fresh.entry.props.onInvite!==friend.entry.props.onInvite||fresh.signature!==friend.signature)throw new ControlError('identity_mismatch','保存後好友身分／在線或隊伍已變');const result=fresh.entry.props.onInvite(characterId);this.trackInvitation(result,context,world,{kind:'party-invite',targetCharacterId:characterId,partyId});return {sent:true};}if(!characterId||characterId===world.charId||!remote?.name||remote.regionId&&remote.regionId!==world.regionId)throw new ControlError('party_target_unknown','邀請對象缺少目前原生同地圖資料');if(Object.values(world.remotes??{}).filter(value=>value?.name===remote.name).length!==1)throw new ControlError('party_target_ambiguous','原生玩家名稱重複，不能核對名片');
     const renderer=this.renderer();if(renderer?.world!==world||typeof renderer.onRemoteClick!=='function')throw new ControlError('party_entry_unavailable','原生玩家選單入口不可用');
@@ -13356,8 +13372,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.96.0';
-const RUNTIME_VERSION='0.96.0';
+const SCRIPT_VERSION='0.96.1';
+const RUNTIME_VERSION='0.96.1';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
@@ -13551,7 +13567,7 @@ function taskSnapshot(kind,overrides={}){const settings=kind==='party'&&Object.k
 async function startLocal(kind,overrides={}){
  initializeRole();if(modeInitializing)throw new ControlError('mode_initializing','正在確認控制模式，請稍候');assertSourcesReadable();if(!controller)throw new Error('等待角色載入');const c=controller,owner=roleId,adapter=c.adapters.get(kind);if(!adapter)throw new Error('任務尚未接入');
  applyDraftBoundary();const settings=taskSnapshot(kind,overrides);if(kind==='battle'&&!settings.manualAuto&&settings.level==='current')throw new Error('請先在刷怪設定選擇目標地圖；目前地圖可使用自動戰鬥');adapter.validate(settings);
- if(c.mode==='managed'){closeSourceEditors();const options={team:taskTeam(kind),taskTeams:taskTeamsSnapshot(),farmEnabled:false,farmInterrupt:farmInterruptSettings()};await session.manualTask({action:'start',taskKind:kind,settings,options});notice='已請核心執行'+(PLAN_TASK_LABELS[kind]??kind)+'，等待安全交接與原生確認';render();return;}
+ if(c.mode==='managed'){const options={team:taskTeam(kind),taskTeams:taskTeamsSnapshot(),farmEnabled:false,farmInterrupt:farmInterruptSettings()};try{await session.manualTask({action:'start',taskKind:kind,settings,options});closeSourceEditors();notice='已請核心執行'+(PLAN_TASK_LABELS[kind]??kind)+'，等待安全交接與原生確認';render();}catch(error){if(controller===c&&roleId===owner){notice='無法開始'+(kind==='party'?'隊伍集合':PLAN_TASK_LABELS[kind]??kind)+'：'+(error.code==='safe_checkpoint_required'?'目前任務尚未到安全交接點，請先停止或核對原未明操作':error.message||'核心尚未接受');render();}throw error;}return;}
  if(c.cleanup)throw new ControlError('cleanup_running','等待原執行收尾');if(c.active)throw new ControlError('task_busy','先安全停止目前任務再切換');if(c.pending)throw new ControlError('unknown_result','先核對未明操作再開始');if(c.manualPause){c.manualPause=false;c.persist();}routine?.suspend('使用者改以單項任務操作');routine?.archivePlan();
  if(['battle','dungeon','boss'].includes(kind)&&((routineFarm.checked&&farmInterruptControls[kind].checked)||taskTeam(kind))&&!overrides.manualAuto){await routine.begin({primaryKind:kind,dailyEnabled:false,farmEnabled:routineFarm.checked,farmInterrupt:farmInterruptSettings(),team:taskTeam(kind),taskTeams:taskTeamsSnapshot()});notice='單項任務已啟動，組隊與種植等待安全點';render();return;}
  closeSourceEditors();await acquireRoleLock(owner,c);if(controller!==c||identity().characterId!==owner)throw new ControlError('identity_changed','角色已切換，原操作已取消');try{await c.start(kind,{runId:crypto.randomUUID(),settings});notice='流程已開始，成果由原生回讀確認';}catch(error){if(controller===c&&!c.active&&!c.cleanup)release();throw error;}render();
