@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.96.4
+// @version      0.96.5
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -1224,6 +1224,15 @@ function normalizeNativeKingdomOrders(value,{day,kingdomId=null}){
   return {scope:'kingdom',cycleKey:day,orders:selected};
 }
 
+// 公會領地是遊戲的本機場景；伺服器 world-state 仍可保留進入前的地圖。
+// 僅由同角色、同公會且已解鎖的原生世界確認，不把訪客領地視為自己的領地。
+function readNativeGuildRegion(world,{characterId,role,guildId,verify}){
+  verify();
+  if(world?.regionId!=='guild_territory')return null;
+  if(world.charId!==characterId||world.player?.name!==role||typeof guildId!=='string'||!guildId||world.player.guildId!==guildId||world.guildTerritoryContext?.guildId!==guildId||world.guildTerritoryContext.visiting||world.mode!=='open'||world.instanceId!=null||world.serverAuthoritativeResources!==false||world.isWorldInteractionLocked?.()!==false)throw new Error('原生公會領地角色、歸屬或載入狀態未確認');
+  verify();return world.regionId;
+}
+
 function createNativeDailyTradeTransport({transport,acceptWorld=()=>true}){
   const characterPath=characterId=>'/characters/'+encodeNativeId(characterId);
   const request=async(path,body)=>nativeTradeData(await transport.request({method:body===undefined?'GET':'POST',path,...(body===undefined?{}:{body}),label:'公會／王國原生操作'}));
@@ -1266,7 +1275,7 @@ function nativeDailyTradeProof(record,state){
   return record.action==='downgrade'||Number.isSafeInteger(record.before)&&Number.isSafeInteger(order.rerollsUsed)&&order.rerollsUsed>=record.before+1;
 }
 
-function createNativeDailyTradeFlow({api,context,verify,readRecord,writeRecord,listRecords,day,isLegendaryActive=()=>false,isFatal=()=>false,onSignedIn=()=>{},onDaily=()=>{},canInteractFacility=()=>false,now=Date.now}){
+function createNativeDailyTradeFlow({api,context,verify,readRecord,writeRecord,listRecords,day,isLegendaryActive=()=>false,isFatal=()=>false,onSignedIn=()=>{},onDaily=()=>{},canInteractFacility=()=>false,readGuildRegion=()=>null,now=Date.now}){
   const journal=createNativeMutationLedger({context,verify,readRecord,writeRecord,now});
   const readGuild=async()=>{verify();const state=normalizeNativeGuild(await api.readGuild(context.characterId),{day,characterId:context.characterId});verify();return state;};
   const readOrders=async kingdomId=>{verify();const state=normalizeNativeKingdomOrders(await api.readOrders(context.characterId),{day,kingdomId});verify();return state;};
@@ -1296,14 +1305,16 @@ function createNativeDailyTradeFlow({api,context,verify,readRecord,writeRecord,l
       await journal.perform({key,observe:()=>read(record),confirmed:state=>nativeDailyTradeProof(record,state),readOnly:true});
     }
   }
-  async function runGuild({includeDungeon=false,useWarehouse=false}={}){
+  async function runGuild({includeDungeon=false,useWarehouse=false,stage='all'}={}){
+    if(!['all','sign-in','donations'].includes(stage))throw new Error('原生公會作業階段未確認');
     requireWarehouse(useWarehouse);const initial=await readGuild();
     if(listRecords().some(([key,record])=>key.startsWith('native-daily:')&&record?.state==='pending'&&record.scope==='guild'&&record.ownerId!==initial.ownerId))throw new Error('先前公會交易與目前公會不同，保留待核對');
     if(initial.absent)return {confirmed:true,skipped:true,reason:'角色未加入公會',warnings:[],signedIn:0,supported:0,donated:0};
     const result={confirmed:true,guild:initial.guild,warnings:[],signedIn:0,supported:0,donated:0,reserved:0};
     const read=()=>withInventory(readGuild,useWarehouse),attempt=async(label,perform)=>{try{await perform();}catch(error){verify();if(isFatal(error)||error instanceof NativeTradePrivilegeExpired)throw error;result.warnings.push(label+'：'+error.message);}};
-    await reconcileRecords('guild',record=>record.action.startsWith('hunt-')?readHunt(record.targetId):readGuild());
-    await attempt('公會簽到',async()=>{const outcome=await commit({scope:'guild',ownerId:initial.ownerId,action:'sign-in',targetId:'sign-in',read:readGuild,done:state=>state.signedIn,plan:()=>({}),send:()=>api.guild(context.characterId,initial.ownerId,'sign-in',{})});if(outcome.sent){result.signedIn++;onSignedIn();}});
+    await reconcileRecords('guild',record=>record.action.startsWith('hunt-')?readHunt(record.targetId):record.action==='travel'?readGuildDestination():readGuild());
+    if(stage!=='donations')await attempt('公會簽到',async()=>{const outcome=await commit({scope:'guild',ownerId:initial.ownerId,action:'sign-in',targetId:'sign-in',read:readGuild,done:state=>state.signedIn,plan:()=>({}),send:()=>api.guild(context.characterId,initial.ownerId,'sign-in',{})});if(outcome.sent){result.signedIn++;onSignedIn();}});
+    if(stage==='sign-in'){result.confirmed=!result.warnings.length;return result;}
     for(const task of initial.tasks)await attempt('支援 '+task.id,async()=>{
       let state=await read(),current=state.tasks.find(entry=>entry.id===task.id);if(!current||current.itemId!==task.itemId)throw new Error('原生支援委託已變更');
       const outcome=await commit({scope:'guild',ownerId:initial.ownerId,action:'support',targetId:task.id,revision:String(current.currentQty),read,done:state=>state.tasks.find(entry=>entry.id===task.id)?.completed===true,
@@ -1338,9 +1349,11 @@ function createNativeDailyTradeFlow({api,context,verify,readRecord,writeRecord,l
     return {...guild,daily,quest:{id,accepted,current,target:Number(id.slice(3)),claimed}};
   }
   async function readGuildDestination(){
-    const guild=await readGuild(),world=await api.readWorld(context.characterId);verify();
-    if(typeof world?.regionId!=='string')throw new Error('原生公會傳送結果未確認');
-    return {...guild,regionId:world.regionId};
+    const guild=await readGuild();
+    const nativeRegion=readGuildRegion(guild);verify();
+    const regionId=nativeRegion??(await api.readWorld(context.characterId))?.regionId;verify();
+    if(typeof regionId!=='string')throw new Error('原生公會傳送結果未確認');
+    return {...guild,regionId};
   }
   async function runGuildTravel({travel,wait}){
     const initial=await readGuildDestination();if(initial.absent)throw new Error('角色未加入公會');
@@ -2929,7 +2942,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
       if(!allowedModes.includes(world.mode))throw new Error('等待允許的原生世界狀態');
       if(!allowInteractionLocked&&world.isWorldInteractionLocked?.())throw new Error('等待原生操作鎖解除');
     };
-    verify();const records=getLedger();
+    verify();if(typeof synchronizeWorld==='function')synchronizeWorld({world,verify});const records=getLedger();
     if(Object.entries(records).some(([key,record])=>record?.state==='pending'&&!key.startsWith(prefix)))throw new Error('仍有其他原生或舊操作待核對，未追加操作');
     operation=state;
     const cancelled=new Promise(resolve=>state.cancelNative=resolve),awaitNative=promise=>Promise.race([Promise.resolve(promise),cancelled.then(()=>{throw cancelError();})]);
@@ -2937,7 +2950,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
       state.api=transport(verify);
       const journal={context,verify,now,readRecord:key=>records[key],listRecords:()=>Object.entries(records),writeRecord:(key,record)=>{verify();const previous=records[key];records[key]=record;try{if(record.state==='pending')syncPending();if(persist()===false)throw new Error('原生操作保存未確認');return true;}catch(error){if(record.state!=='pending'&&previous)records[key]=previous;throw error;}finally{syncPending();}}};
       const result=await perform({transport:state.api,journal,world,day,awaitNative});verify();
-      if(!synchronizeWorld)return result;
+      if(!synchronizeWorld||typeof synchronizeWorld==='function'&&!synchronizeWorld({world,verify}))return result;
       const response=await createNativeRewardsTransport({transport:state.api}).readWorldState(context.characterId);verify();
       const snapshot=response?.worldState||(response?.player&&response?.regionId?response:null);
       acceptNativeWorld(snapshot,world,verify);
@@ -2949,15 +2962,17 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
     if(typeof world.progressDailyQuest!=='function')throw new Error('原生讚賞任務入口未就緒');
     return createNativeFriendsFlow({...journal,day,readFriends,api:createNativeSocialTransport({transport}),onCreated:()=>{journal.verify();world.progressDailyQuest('praise',1);journal.verify();}}).run(names);
   });
-  const tradeFlow=({transport,journal,world,day})=>createNativeDailyTradeFlow({...journal,day,api:createNativeDailyTradeTransport({transport,acceptWorld:snapshot=>{journal.verify();return snapshot.player?.name===world.player.name&&snapshot.regionId===world.regionId;}}),isLegendaryActive:()=>{journal.verify();return world.player?.legendaryActive;},isFatal:error=>Boolean(host.storageError)||error?.code==='native_rate_limited'&&error.status===429,onSignedIn:()=>{journal.verify();world.progressDailyQuest?.('guild_signin',1);journal.verify();},onDaily:daily=>{journal.verify();if(typeof world.setDaily!=='function')throw new Error('原生每日同步入口未就緒');world.setDaily(daily);journal.verify();},canInteractFacility:(guildId,id)=>{
-    journal.verify();if(world.regionId!=='guild_territory'||world.guildTerritoryContext?.guildId!==guildId||world.guildTerritoryContext?.visiting)return false;
+  const guildRegion=(world,guildId,verify)=>readNativeGuildRegion(world,{characterId:host.characterId,role:getRole(),guildId,verify});
+  const synchronizeGuildWorld=({world,verify})=>guildRegion(world,world.player?.guildId,verify)===null;
+  const tradeFlow=({transport,journal,world,day})=>createNativeDailyTradeFlow({...journal,day,readGuildRegion:state=>guildRegion(world,state.ownerId,journal.verify)??world.regionId,api:createNativeDailyTradeTransport({transport,acceptWorld:snapshot=>{journal.verify();return snapshot.player?.name===world.player.name&&(snapshot.regionId===world.regionId||guildRegion(world,world.player.guildId,journal.verify)!==null&&snapshot.player.guildId===world.player.guildId)&&(snapshot.instanceId??null)===(world.instanceId??null);}}),isLegendaryActive:()=>{journal.verify();return world.player?.legendaryActive;},isFatal:error=>Boolean(host.storageError)||error?.code==='native_rate_limited'&&error.status===429,onSignedIn:()=>{journal.verify();world.progressDailyQuest?.('guild_signin',1);journal.verify();},onDaily:daily=>{journal.verify();if(typeof world.setDaily!=='function')throw new Error('原生每日同步入口未就緒');world.setDaily(daily);journal.verify();},canInteractFacility:(guildId,id)=>{
+    journal.verify();if(guildRegion(world,guildId,journal.verify)!=='guild_territory')return false;
     const objects=world.region?.decorations?.filter(item=>item?.hidden!==true&&item.kind==='guildFacility'&&item.facilityId===id);
     return Array.isArray(objects)&&objects.length===1&&[objects[0].x,objects[0].y,world.player.x,world.player.y].every(Number.isFinite)&&Math.hypot(objects[0].x-world.player.x,objects[0].y-world.player.y)<=200;
   }});
-  const runGuild=config=>withOperation('native-daily:',args=>tradeFlow(args).runGuild(config));
-  const runGuildHunt=(id,reporting=false)=>withOperation('native-daily:',args=>tradeFlow(args).runHunt(id,reporting));
-  const runGuildFacility=id=>withOperation('native-daily:',args=>tradeFlow(args).runFacility(id));
-  const runGuildTravel=callbacks=>withOperation('native-daily:',args=>tradeFlow(args).runGuildTravel(callbacks),{allowRegionChange:true});
+  const runGuild=config=>withOperation('native-daily:',args=>tradeFlow(args).runGuild(config),{synchronizeWorld:synchronizeGuildWorld});
+  const runGuildHunt=(id,reporting=false)=>withOperation('native-daily:',args=>tradeFlow(args).runHunt(id,reporting),{synchronizeWorld:synchronizeGuildWorld});
+  const runGuildFacility=id=>withOperation('native-daily:',args=>tradeFlow(args).runFacility(id),{synchronizeWorld:synchronizeGuildWorld});
+  const runGuildTravel=callbacks=>withOperation('native-daily:',args=>tradeFlow(args).runGuildTravel(callbacks),{allowRegionChange:true,synchronizeWorld:synchronizeGuildWorld});
   const runKingdomOrders=config=>withOperation('native-daily:',args=>tradeFlow(args).runOrders(config));
   const homeFlow=({transport,journal,day,awaitNative})=>createNativeHomeFlow({...journal,day,getWorld,api:createNativeHomeTransport({transport}),view:createNativeHomeView({document:page.document??document,getWorld,characterId:journal.context.characterId,verify:journal.verify}),readPlotIds:readHomePlotIds,wait,awaitNative,beforeAction:beforeHomeAction,mutationId:()=>page.crypto.randomUUID()});
   const runHome=(action,options)=>withOperation('native-home:',args=>{const flow=homeFlow(args);return action==='enter'?flow.enterGarden(options):action==='leave'?flow.leaveHome(options?.phase):action==='supply'?flow.supply():flow.perform(action,options);},{allowRegionChange:true,allowInteractionLocked:true,synchronizeWorld:false});
@@ -3054,7 +3069,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
     });
     const legacyGoal=getVigorGoal(),legacyPending=legacyGoal?.pending!==undefined;
     if(!records.length&&!legacyPending)return false;
-    const api=transport(verify),rewards=rewardApi(api,verify,day),social=createNativeSocialTransport({transport:api}),trades=createNativeDailyTradeFlow({api:createNativeDailyTradeTransport({transport:api,acceptWorld:snapshot=>snapshot.player?.name===role}),context:{characterId},verify,day});readOnlyApi=api;let changed=false;
+    const api=transport(verify),rewards=rewardApi(api,verify,day),social=createNativeSocialTransport({transport:api}),trades=createNativeDailyTradeFlow({api:createNativeDailyTradeTransport({transport:api,acceptWorld:snapshot=>snapshot.player?.name===role}),context:{characterId},verify,day,readGuildRegion:state=>guildRegion(getWorld(),state.ownerId,verify)??getWorld()?.regionId});readOnlyApi=api;let changed=false;
     try{
       const snapshots=new Map();
       const supplies=createNativeDailySupplyTransport({transport:api,characterId,role,day});
@@ -8352,9 +8367,11 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   }
   async function handleGuild(){
     const options=userOptions();
-    const result=await nativeOperationStep('公會簽到與捐獻',()=>nativeActions.runGuild({includeDungeon:options.guildDungeonDonation,useWarehouse:options.legendary&&runtime.effectiveLegendary!==false&&PAGE_WINDOW.__world?.player?.legendaryActive===true}),result=>'簽到 '+result.signedIn+'、支援投入 '+result.supported+'、金庫投入 '+result.donated+(result.warnings.length?'；'+result.warnings.join('；'):''));
+    const config=()=>({includeDungeon:options.guildDungeonDonation,useWarehouse:options.legendary&&runtime.effectiveLegendary!==false&&PAGE_WINDOW.__world?.player?.legendaryActive===true});
+    const result=await nativeOperationStep('公會簽到',()=>nativeActions.runGuild({...config(),stage:'sign-in'}),result=>'簽到 '+result.signedIn+(result.warnings.length?'；'+result.warnings.join('；'):''));
     if(result?.skipped){finishTask('略過',result.reason);return;}
     for(const name of HUNTS)if(runtime.running)await nativeOperationStep('接取'+name,()=>nativeActions.runGuildHunt(nativeGuildHuntId(name)),result=>result.quest.claimed?'今日已回報':'已接取');
+    if(runtime.running)await nativeOperationStep('公會捐獻',()=>nativeActions.runGuild({...config(),stage:'donations'}),result=>'支援投入 '+result.supported+'、金庫投入 '+result.donated+(result.warnings.length?'；'+result.warnings.join('；'):''));
     for(const facility of FACILITIES)if(runtime.running)await nativeOperationStep('領地'+facility.name,()=>interactTerritoryFacility(facility),result=>result.confirmed?'原生同設施今日互動已確認':'原生設施互動尚未確認');
     if(runtime.running)finishRecipe();
   }
@@ -13507,8 +13524,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.96.4';
-const RUNTIME_VERSION='0.96.4';
+const SCRIPT_VERSION='0.96.5';
+const RUNTIME_VERSION='0.96.5';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
