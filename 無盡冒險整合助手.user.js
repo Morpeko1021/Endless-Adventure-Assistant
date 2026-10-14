@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.95.4
+// @version      0.95.5
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -1497,13 +1497,13 @@ function nativeChannelRecordKey({day,runId,sequence}){
   if(!/^\d{4}-\d{2}-\d{2}$/.test(day)||typeof runId!=='string'||!runId||!Number.isSafeInteger(sequence)||sequence<1)throw new Error('原生分線紀錄身分未確認');
   return ['native-channel',day,runId,sequence].map(encodeURIComponent).join(':');
 }
-function readNativeChannelSnapshot(world){
-  const facts=readNativeWorldFacts(world);
+function readNativeChannelSnapshot(world,options={}){
+  const facts=readNativeWorldFacts(world,options);
   if(!world?.charId||world.mode!=='open'||!facts.channel||typeof world.regionId!=='string')throw new Error('原生角色／地圖／分線尚未確認');
   return {world,channelId:facts.channelId,channel:facts.channel,regionId:world.regionId,instanceId:world.instanceId??null,ready:world.isWorldInteractionLocked?.()===false&&world.serverAuthoritativeResources===true&&!world.dead&&Number.isFinite(world.player?.hp)&&world.player.hp>0};
 }
-function readNativeRoomSnapshot(world){
-  const current=readNativeChannelSnapshot(world),room=readNativeRiftRoom(current.instanceId);
+function readNativeRoomSnapshot(world,options={}){
+  const current=readNativeChannelSnapshot(world,options),room=readNativeRiftRoom(current.instanceId);
   if(!room||room.regionId!==current.regionId)throw new Error('原生裂痕地圖／房間尚未確認');
   return {...current,room:room.room,ready:current.ready&&(world.player.instanceId==null||world.player.instanceId===current.instanceId)};
 }
@@ -1522,9 +1522,9 @@ const switchTypes={
     mapMatches:(owner,value)=>owner.riftInstanceId===value.instanceId&&owner.regionId===value.regionId}
 };
 function nativeSwitchRecordKey(record,type){return nativeChannelRecordKey(record).replace(/^native-channel:/,switchTypes[type].prefix+':');}
-function createNativeChannelFlow({getWorld,view,roomView,context,day,verify,readRecord,writeRecord,listRecords,now=Date.now}){
+function createNativeChannelFlow({getWorld,document,view,roomView,context,day,verify,readRecord,writeRecord,listRecords,now=Date.now}){
   const ledger=createNativeMutationLedger({context,verify,readRecord,writeRecord,now});
-  function state(type){verify();const value=switchTypes[type].snapshot(getWorld());if(value.world.charId!==context.characterId)throw new Error('原生分線／房間角色不符');return value;}
+  function state(type){verify();const value=switchTypes[type].snapshot(getWorld(),{document,getWorld});if(value.world.charId!==context.characterId)throw new Error('原生分線／房間角色不符');return value;}
   function valid(record,type){return record?.day===day&&record.characterId===context.characterId&&record.kind===switchTypes[type].kind&&switchTypes[type].valid(record)&&typeof record.regionId==='string'&&Number.isFinite(record.sentAt);}
   const matches=(record,current,type)=>valid(record,type)&&current.ready&&current.regionId===record.regionId&&switchTypes[type].matches(record,current);
   const pending=()=>listRecords().filter(([key,record])=>/^(native-channel|native-room):/.test(key)&&record.state==='pending');
@@ -1572,10 +1572,10 @@ function createSourceNativeChannelAdapter({host,kind,key,getContext,getWorld,isR
   const day=()=>entries()[0]?.[1].day??new Date(now()).toISOString().slice(0,10);
   function travelPending(){const rows=entries().filter(([,record])=>record.kind==='native-map-travel');if(rows.length>1)throw new Error('來源存在多筆未明傳送，未追加操作');if(!rows.length)return null;const [key,record]=rows[0];if(record.nativeKey!==key||nativeChannelRecordKey(record).replace(/^native-channel:/,'native-travel:')!==key)throw new Error('來源傳送紀錄身分未確認');return record;}
   function flow(context,verify){
-    const options={document,verify,requestMap},switches=createNativeChannelFlow({context,day:day(),getWorld,verify,now,view:createNativeChannelView(options),roomView:createNativeRoomView(options),readRecord:key=>records[key],writeRecord:(key,record)=>writeRecord(verify,key,record),listRecords:()=>Object.entries(records)});
+    const options={document,verify,requestMap},switches=createNativeChannelFlow({context,day:day(),getWorld,document,verify,now,view:createNativeChannelView(options),roomView:createNativeRoomView(options),readRecord:key=>records[key],writeRecord:(key,record)=>writeRecord(verify,key,record),listRecords:()=>Object.entries(records)});
     let api=null;
     const readWorldState=id=>{if(!page)throw new Error('來源原生傳送讀取接口未接入');if(!api){api=createGameNativeTransport({fetch:(...args)=>page.fetch(...args),getToken:()=>readGameNativeToken(page),verify,setTimer:(fn,ms)=>host.deadline(fn,ms),clearTimer:id=>host.cancel(id)});transports.add(api);}return createNativeRewardsTransport({transport:api}).readWorldState(id);};
-    const mapView=createNativeNavigationView(options),navigation=createNativeTravelFlow({getWorld,characterId:host.characterId,role:getWorld()?.player?.name,verify,ready:world=>{try{return readNativeChannelSnapshot(world).ready;}catch{return false;}},...(travelReconcileReady?{reconcileReady:travelReconcileReady}:{}),view:createTravelView?createTravelView(mapView):mapView,readWorldState,readPending:travelPending,resolved:destinations,now,allowRetry:travelRetry,interval:travelInterval,
+    const mapView=createNativeNavigationView(options),navigation=createNativeTravelFlow({getWorld,characterId:host.characterId,role:getWorld()?.player?.name,verify,ready:world=>{try{return readNativeChannelSnapshot(world,{document,getWorld}).ready;}catch{return false;}},...(travelReconcileReady?{reconcileReady:travelReconcileReady}:{}),view:createTravelView?createTravelView(mapView):mapView,readWorldState,readPending:travelPending,resolved:destinations,now,allowRetry:travelRetry,interval:travelInterval,
       saveTravel:(record,entry,verify)=>{
         verify();if(record&&entry&&!(typeof travelRetry==='function'?travelRetry(record.destination)===true:travelRetry===true))throw new Error('來源未確認傳送不重試');
         if(record&&entry){
@@ -1617,10 +1617,10 @@ function createSourceNativeChannelAdapter({host,kind,key,getContext,getWorld,isR
     operationId='readonly';operationContext=getContext();operation=Promise.resolve().then(()=>reconcilePending(pending)).finally(()=>{operation=null;operationContext=null;operationId=null;});return operation;
   }
   return {tick:target=>run('channel:'+target,service=>service.tick(target)),roomTick:target=>run('room:'+target,service=>service.tick(target,'room')),travel:destination=>run('travel:'+destination,service=>service.travel(destination)),reconcile,observePending,busy:()=>Boolean(operation),hasPending:()=>Boolean(observePending()),
-    destinationConfirmed(destination){const world=getWorld(),known=destinations.get(destination);try{return world?.charId===host.characterId&&(nativeDestinationMatches(world,destination)||known?.world===world&&known.regionId===world.regionId)&&readNativeChannelSnapshot(world).ready&&!observePending();}catch{return false;}},
-    confirmed(target){const state=readNativeChannelSnapshot(getWorld());return state.world.charId===host.characterId&&state.ready&&state.channel===target&&!observePending();},
+    destinationConfirmed(destination){const world=getWorld(),known=destinations.get(destination);try{return world?.charId===host.characterId&&(nativeDestinationMatches(world,destination)||known?.world===world&&known.regionId===world.regionId)&&readNativeChannelSnapshot(world,{document,getWorld}).ready&&!observePending();}catch{return false;}},
+    confirmed(target){const state=readNativeChannelSnapshot(getWorld(),{document,getWorld});return state.world.charId===host.characterId&&state.ready&&state.channel===target&&!observePending();},
     view:()=>createNativeChannelView({document,verify:()=>host.assert(getContext(),{allowPending:true}),requestMap}),
-    roomConfirmed(target){const state=readNativeRoomSnapshot(getWorld());return state.world.charId===host.characterId&&state.ready&&state.room===target&&!observePending();},
+    roomConfirmed(target){const state=readNativeRoomSnapshot(getWorld(),{document,getWorld});return state.world.charId===host.characterId&&state.ready&&state.room===target&&!observePending();},
     roomView:()=>createNativeRoomView({document,verify:()=>host.assert(getContext(),{allowPending:true}),requestMap}),
     navigationView:()=>createNativeNavigationView({document,verify:()=>host.assert(getContext(),{allowPending:true}),requestMap}),
     cancel(){epoch++;for(const api of transports)api.cancel();},
@@ -1736,10 +1736,10 @@ async function reconcileNativeRespawn(record,{world,readWorldState,verify}){
 }
 
 // mobDeath(server=true)與已完成的lootPickup；不採lootPickedUp（僅表示請求送出）。
-function createNativeEncounterMonitor({getWorld,characterId,verify,canObserve,onDrop,itemName=id=>id}){
+function createNativeEncounterMonitor({getWorld,document,characterId,verify,canObserve,onDrop,itemName=id=>id}){
   let world=null,offs=[],encounter=null,death=null,observedAlive=null,reliable=false;
   const seenDeaths=new Map(),seenDrops=new Set();
-  const tuple=w=>[w?.regionId,w?.instanceId??null,readNativeWorldFacts(w).channelId].join('|');
+  const tuple=w=>[w?.regionId,w?.instanceId??null,readNativeWorldFacts(w,{document,getWorld}).channelId].join('|');
   const valid=w=>w===world&&w===getWorld()&&w?.charId===characterId&&canObserve();
   const matches=mob=>mob&&encounter&&mob.templateId===encounter.templateId&&mob.boss===true&&typeof mob.id==='string'&&(!mob.regionId||mob.regionId===encounter.arenaRegionId);
   function detach(){for(const off of offs)try{off();}catch{}offs=[];world=null;reliable=false;death=null;observedAlive=null;}
@@ -2861,7 +2861,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
   const runKingdomOrders=config=>withOperation('native-daily:',args=>tradeFlow(args).runOrders(config));
   const homeFlow=({transport,journal,day,awaitNative})=>createNativeHomeFlow({...journal,day,getWorld,api:createNativeHomeTransport({transport}),view:createNativeHomeView({document:page.document??document,getWorld,characterId:journal.context.characterId,verify:journal.verify}),readPlotIds:readHomePlotIds,wait,awaitNative,beforeAction:beforeHomeAction,mutationId:()=>page.crypto.randomUUID()});
   const runHome=(action,options)=>withOperation('native-home:',args=>{const flow=homeFlow(args);return action==='enter'?flow.enterGarden(options):action==='leave'?flow.leaveHome(options?.phase):action==='supply'?flow.supply():flow.perform(action,options);},{allowRegionChange:true,allowInteractionLocked:true,synchronizeWorld:false});
-  const channelFlow=journal=>createNativeChannelFlow({...journal,day:getDay(),getWorld,view:createNativeChannelView({document:page.document??document,verify:journal.verify,requestMap})});
+  const channelFlow=journal=>createNativeChannelFlow({...journal,day:getDay(),getWorld,document:page.document??document,view:createNativeChannelView({document:page.document??document,verify:journal.verify,requestMap})});
   const runChannel=target=>withOperation('native-channel:',({journal})=>channelFlow(journal).tick(target),{allowInteractionLocked:true,synchronizeWorld:false});
   const supplyFlow=({transport,journal,world,day})=>createNativeDailySupplyFlow({...journal,day,getGoal:getVigorGoal,saveGoal:saveVigorGoal,beforePurchase,afterPurchase,api:createNativeDailySupplyTransport({transport,characterId:journal.context.characterId,role:getRole(),day,acceptWorld:snapshot=>acceptNativeWorld(snapshot,world,journal.verify)})});
   const escortFlow=({transport,journal,world,day})=>createNativeEscortFlow({...journal,day,role:getRole(),getWorld,beforePurchase,afterPurchase,wait,api:createNativeEscortTransport({transport,characterId:journal.context.characterId}),acceptWorld:snapshot=>acceptNativeWorld(snapshot,world,journal.verify,{localReturnRegion:world.caravanEscort?.returnTo?.regionId})});
@@ -3014,6 +3014,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
 }
 
 
+
 // 共用讀取遊戲原生世界，未知值維持 null；不讀畫面位置、圖片或文字。
 function readNativeRiftRoom(instanceId){
   const match=typeof instanceId==='string'?/^rift:([a-z0-9_]+_rift\d+):([1-9]\d{0,2})$/i.exec(instanceId):null;
@@ -3025,23 +3026,37 @@ function nativeChannelNumber(value){
   const match=/^(?:([A-Za-z0-9][A-Za-z0-9_-]*)-)?(0?[1-9]|10)$/.exec(value);
   return match?Number(match[2]):null;
 }
-function nativeReturnLocationMatches(world,location){
+function readNativeChannelFacts(world,{document,getWorld=()=>world}={}){
+  const unknown={channelId:null,channel:null,source:null};
+  if(!world||world!==getWorld())return unknown;
+  let rows=[],hasMiniMap=false;
+  try{if(typeof document?.querySelectorAll==='function'){hasMiniMap=Array.from(document.querySelectorAll('.minimap-wrap')).some(node=>node.isConnected===true);rows=readNativeViewEntries({document,selector:'.minimap-wrap',accept:props=>typeof props.onJump==='function'});}}catch{return unknown;}
+  if(hasMiniMap||rows.length){
+    if(rows.length!==1)return unknown;
+    const {props,node}=rows[0],channel=nativeChannelNumber(props.channelId);
+    if(channel===null||!nativeViewWorldOwner(node,world)||props.myCharacterId!==world.charId||!world.charId||props.player?.name!==world.player?.name||!world.player?.name||props.region?.id!==world.regionId||!world.regionId||world!==getWorld())return unknown;
+    return {channelId:props.channelId,channel,source:'minimap'};
+  }
+  // 玩家／世界直接欄位保留舊SDK相容；selfPartyChannelId是隊伍快取，不能作當前分線證據。
+  const channelId=world.player?.channelId??world.channelId??null,channel=nativeChannelNumber(channelId);
+  return channel===null||world!==getWorld()?unknown:{channelId,channel,source:'world'};
+}
+function nativeReturnLocationMatches(world,location,options={}){
   if(!world||!location||world.mode!=='open'||world.dead===true||world.player?.hp===0||world.pendingSkill||world.castingState||world.followTarget||world.autoBattle!==false)return false;
   let locked;try{locked=world.isWorldInteractionLocked?.();}catch{return false;}if(locked!==false)return false;
-  const facts=readNativeWorldFacts(world),channel=nativeChannelNumber(location.channelId),room=readNativeRiftRoom(world.instanceId);
+  const facts=readNativeWorldFacts(world,options),channel=nativeChannelNumber(location.channelId),room=readNativeRiftRoom(world.instanceId);
   if(channel===null||facts.channel!==channel||facts.regionId!==location.regionId||String(world.instanceId??'')!==String(location.instanceId??'')||!facts.position||![location.x,location.y].every(Number.isFinite))return false;
   if(location.roomNumber!==undefined&&(!room||room.regionId!==world.regionId||room.room!==location.roomNumber))return false;
   return Math.hypot(facts.position.x-location.x,facts.position.y-location.y)<=(location.radius??30);
 }
-function readNativeWorldFacts(world){
+function readNativeWorldFacts(world,options={}){
   const player=world?.player;
   const numeric=value=>Number.isFinite(value)?value:null;
   const bar=(current,maximum,requireMaximum=false)=>{
     const value=numeric(current),max=numeric(maximum);
     return value===null||requireMaximum&&(max===null||max<=0)?null:{now:value,max,pct:max!==null&&max>0?value/max*100:null};
   };
-  const nativeChannel=player?.channelId??world?.channelId??world?.selfPartyChannelId??null;
-  const channel=nativeChannelNumber(nativeChannel);
+  const {channelId:nativeChannel,channel}=readNativeChannelFacts(world,options);
   const x=numeric(player?.x),y=numeric(player?.y);
   return {
     characterId:world?.charId??null,characterName:typeof player?.name==='string'&&player.name?player.name:null,regionId:world?.regionId??null,
@@ -3838,7 +3853,7 @@ const bool=value=>typeof value==='boolean'?value:null;
 function observeIdentity(world) {
   return {characterId:str(world?.charId),characterName:str(world?.player?.name),worldReady:Boolean(world?.charId&&world?.player&&world?.regionId)};
 }
-function observeSnapshot(world,{controller,now=Date.now(),connection='unknown',verification=null,ownGarden=false,farmEnabled=false,cropId=null,daily=null,partyWait=null}={}) {
+function observeSnapshot(world,{controller,document,getWorld,now=Date.now(),connection='unknown',verification=null,ownGarden=false,farmEnabled=false,cropId=null,daily=null,partyWait=null}={}) {
   const identity=observeIdentity(world),active=controller?.active,task=active??controller?.cleanup;
   let locked=null;try{locked=bool(world?.isWorldInteractionLocked?.());}catch{}
   let plots=null,dueAt=null,farmState='unknown';
@@ -3857,7 +3872,7 @@ function observeSnapshot(world,{controller,now=Date.now(),connection='unknown',v
   const room=readNativeRiftRoom(world?.instanceId);
   return {
     identity,
-    location:{regionId:str(world?.regionId),regionName:str(world?.region?.name),channelId:world?.channelId??null,instanceId:str(world?.instanceId),...(room&&room.regionId===world?.regionId&&Number.isInteger(room.room)&&room.room>0?{roomNumber:room.room}:{}),x:num(world?.player?.x),y:num(world?.player?.y)},
+    location:{regionId:str(world?.regionId),regionName:str(world?.region?.name),channelId:readNativeChannelFacts(world,{document,getWorld}).channelId,instanceId:str(world?.instanceId),...(room&&room.regionId===world?.regionId&&Number.isInteger(room.room)&&room.room>0?{roomNumber:room.room}:{}),x:num(world?.player?.x),y:num(world?.player?.y)},
     game:{connection:['connected','disconnected','unknown'].includes(connection)?connection:'unknown',dead:bool(world?.dead),interactionLocked:locked,verification:bool(verification)},
     control:{mode:controller?.mode||'standalone',owner:active?(controller?.mode==='managed'?'core':'local'):null,manualPause:controller?.manualPause??false,leaseId:controller?.lease?.leaseId??null},
     task:{runId:task?.context.runId??null,kind:task?.kind??'idle',state:controller?.state??'idle',phase:observed?.phase??null,message:observed?.message??null,checkpointId:controller?.checkpoint?.checkpointId??null,pendingAction:controller?.pending??null},
@@ -3913,9 +3928,9 @@ function readNativeQuickbarBoundary(document) {
   }
   return left;
 }
-function formatCompactAssistantMetrics({world,snapshot}) {
+function formatCompactAssistantMetrics({world,snapshot,document}) {
   const percent=(value,max)=>finite(value)&&finite(max)&&max>0?`${(value/max*100).toFixed(1)}%`:'未讀取';
-  const p=world?.player,l=snapshot?.location??{},facts=readNativeWorldFacts(world),channel=facts.channel??nativeChannelNumber(l.channelId);
+  const p=world?.player,l=snapshot?.location??{},facts=readNativeWorldFacts(world,{document}),channel=document?facts.channel:facts.channel??nativeChannelNumber(l.channelId);
   // 房號只呈現原生可辨識的房間；庭院及副本識別碼不直接顯示。
   const room=readNativeRiftRoom(l.instanceId)?.room??null;
   return `HP：${percent(p?.hp,p?.maxHp)}｜SP：${percent(p?.mp,p?.maxMp)}\n位置：${l.regionName??l.regionId??'未讀取'}｜分線 ${channel??'未讀取'}｜房間 ${room??(l.instanceId?'特殊場次':'無')}\n座標：${finite(l.x)?Math.round(l.x):'未知'}, ${finite(l.y)?Math.round(l.y):'未知'}`;
@@ -4482,14 +4497,14 @@ function readNativePartyRoster(world){
   if(members.some(member=>typeof member.characterId!=='string'||!member.characterId||typeof member.name!=='string'||!member.name)||new Set(members.map(member=>member.characterId)).size!==members.length||members.filter(member=>member.self).length!==1||members.filter(member=>member.leader).length!==1||members.find(member=>member.self).name!==self)return unknown;
   return {self,members,leader:members.find(member=>member.leader),complete:true};
 }
-function readNativeLeaderLocation(world,party){
+function readNativeLeaderLocation(world,party,options={}){
   const leader=party?.leader,id=world?.party?.leaderId;
   if(!party?.complete||!leader||leader.self||typeof id!=='string'||leader.characterId!==id)return {state:'unknown',id:null,distance:null};
   const member=world.party.members.find(member=>member.characterId===id),remote=world.remotes?.[id];
   if(member?.name!==leader.name)return {state:'unknown',id:null,distance:null};
   if(['player_home','player_home_garden'].includes(member.regionId??remote?.regionId))return {state:'unavailable',reason:'garden',id,distance:null};
   if(member.online===false||member.dead===true||remote?.dead===true)return {state:'unavailable',id,distance:null};
-  const self=readNativeWorldFacts(world),channel=member.crossChannel?member.crossChannelId:member.channelId;
+  const self=readNativeWorldFacts(world,options),channel=member.crossChannel?member.crossChannelId:member.channelId;
   if(!member.regionId||channel==null||self.channelId==null||member.online!==true)return {state:'unknown',id,distance:null};
   if(member.regionId!==world.regionId||String(channel)!==String(self.channelId))return {state:'different',id,distance:null};
   if(member.instanceId==null&&world.instanceId!=null)return {state:'unknown',reason:'roomUnknown',id,distance:null};
@@ -4498,9 +4513,9 @@ function readNativeLeaderLocation(world,party){
   if(!remote||remote.regionId!==world.regionId||remote.channelId==null||String(remote.channelId)!==String(self.channelId)||![world.player?.x,world.player?.y,remote.x,remote.y].every(Number.isFinite))return {state:'unknown',id,distance:null};
   return {state:'same',id,distance:Math.hypot(world.player.x-remote.x,world.player.y-remote.y)};
 }
-function readNativeOutsiders(world,party){
+function readNativeOutsiders(world,party,options={}){
   if(!party?.complete||world?.serverAuthoritativeResources!==true||world?.mode!=='open'||world.isWorldInteractionLocked?.()!==false||!world.remotes||typeof world.remotes!=='object'||Array.isArray(world.remotes))return null;
-  const self=readNativeWorldFacts(world);if(self.channelId==null||!self.characterId||!self.regionId)return null;
+  const self=readNativeWorldFacts(world,options);if(self.channelId==null||!self.characterId||!self.regionId)return null;
   const ours=new Set([self.characterId,...party.members.map(member=>member.characterId)]),ids=[];
   for(const [id,remote] of Object.entries(world.remotes)){if(ours.has(id))continue;if(!id||!remote||typeof remote.name!=='string'||!remote.name||typeof remote.regionId!=='string'||remote.channelId==null||world.instanceId!=null&&!Object.hasOwn(remote,'instanceId'))return null;
     if(remote.regionId!==self.regionId||remote.channelId!=null&&String(remote.channelId)!==String(self.channelId)||remote.instanceId!=null&&String(remote.instanceId)!==String(world.instanceId??''))continue;
@@ -4508,8 +4523,8 @@ function readNativeOutsiders(world,party){
   }
   return ids;
 }
-function nativePartyGoToProof(record,world){
-  const facts=readNativeWorldFacts(world);
+function nativePartyGoToProof(record,world,options={}){
+  const facts=readNativeWorldFacts(world,options);
   return Boolean(record.kind==='native-party-go'&&record.partyId&&world?.charId===record.characterId&&facts.characterName===record.role&&world.party?.id===record.partyId&&world.party.leaderId===record.targetCharacterId&&world.mode==='open'&&!world.dead&&world.player.hp>0&&world.serverAuthoritativeResources===true&&world.isWorldInteractionLocked?.()===false&&world.regionId===record.regionId&&String(facts.channelId)===String(record.channelId)&&String(world.instanceId??'')===String(record.instanceId??''));
 }
 
@@ -4542,17 +4557,17 @@ class NativePartyGateway {
     this.pending({kind:'party-accept',taskKind:this.taskKind,leaderCharacterId});this.guard(context,{allowPending:true});if(this.world()!==world||this.view.invitation(invitation)?.props!==entry.props)throw new ControlError('identity_mismatch','保存後邀請已變');entry.props.onAccept();this.invite=null;return {sent:true};
   }
   rendezvous(context,characterId){const world=this.guard(context);const members=world.party?.members??[],member=members.find(value=>value.characterId===characterId);if(!member||member.online!==true||member.dead||!member.regionId||members.filter(value=>value.name===member.name).length!==1)throw new ControlError('party_target_unknown','會合對象缺少唯一原生隊伍資料');if(['player_home','player_home_garden'].includes(member.regionId))throw new ControlError('party_garden_target','隊友正在家園，等待返回主任務');
-    const channel=member.crossChannel?member.crossChannelId:member.channelId,selfChannel=world.selfPartyChannelId??world.channelId;
+    const channel=member.crossChannel?member.crossChannelId:member.channelId,selfChannel=readNativeWorldFacts(world,{document:this.document,getWorld:this.world}).channelId;
     if(channel!=null&&selfChannel!=null&&String(channel)===String(selfChannel)&&member.regionId===world.regionId&&(member.instanceId==null||String(member.instanceId)===String(world.instanceId??'')))return {arrived:true,sent:false,evidence:'原生隊伍地圖／分線／房間一致'};
     const entry=this.view.member(characterId);if(!entry)return {sent:false,reason:'等待指定隊員的原生前往入口'};
     this.pending({kind:'party-rendezvous',taskKind:this.taskKind,targetCharacterId:characterId,regionId:member.regionId,channelId:channel??null,instanceId:member.instanceId??null});this.guard(context,{allowPending:true});if(this.world()!==world||this.view.member(characterId)?.props!==entry.props)throw new ControlError('identity_mismatch','保存後隊員位置已變');entry.props.onGoToMember(characterId);return {sent:true,arrived:false};
   }
   stop(){this.off?.();this.off=null;this.invite=null;this.leaveConfirmation=null;this.boundWorld=null;}
-  readChannel(){const number=readNativeWorldFacts(this.world()).channel;return number===null?null:String(number);}
+  readChannel(){const number=readNativeWorldFacts(this.world(),{document:this.document,getWorld:this.world}).channel;return number===null?null:String(number);}
   readRoom(){const w=this.world(),room=readNativeRiftRoom(w?.instanceId);return room?.regionId===w?.regionId?room.room:null;}
   switchPosition(context,location,type){
     const world=this.guard(context),read=type==='channel'?readNativeChannelSnapshot:readNativeRoomSnapshot;
-    let before;try{before=read(world);}catch{return {sent:false,reason:'等待原生分線／房間資料'};}
+    let before;try{before=read(world,{document:this.document,getWorld:this.world});}catch{return {sent:false,reason:'等待原生分線／房間資料'};}
     if(!before.ready)return {sent:false,reason:'等待原生世界同步'};
     if(this.now()-(this.lastSwitchAt??-Infinity)<5000)return {sent:false,reason:'等待遊戲五秒切換間隔'};
     const target=type==='channel'?nativeChannelNumber(location.channelId):location.roomNumber;
@@ -4564,7 +4579,7 @@ class NativePartyGateway {
     const selected=view.choice(target);if(!selected||selected.disabled)throw new ControlError('party_entry_unavailable','指定原生分線／房間未開放或不唯一');
     if(type==='room'&&selected.roomId!==location.instanceId)throw new ControlError('party_entry_unavailable','目標房間識別碼與編號不符');
     const record={kind:'party-'+type,taskKind:this.taskKind,nativeNavigation:true,regionId:before.regionId,fromChannelId:before.channelId,fromInstanceId:before.instanceId,sentAt:this.now(),...(type==='channel'?{channelId:String(target),nativeChannelId:selected.channelId,instanceId:before.instanceId}:{channelId:before.channelId,instanceId:selected.roomId,roomNumber:target})};
-    this.pending(record);verify();const fresh=read(world);if(!fresh.ready||fresh.regionId!==before.regionId||fresh.channelId!==before.channelId||fresh.instanceId!==before.instanceId)throw new ControlError('identity_mismatch','保存後分線／房間已變，未切換');
+    this.pending(record);verify();const fresh=read(world,{document:this.document,getWorld:this.world});if(!fresh.ready||fresh.regionId!==before.regionId||fresh.channelId!==before.channelId||fresh.instanceId!==before.instanceId)throw new ControlError('identity_mismatch','保存後分線／房間已變，未切換');
     this.lastSwitchAt=this.now();const response=view.send(selected);response?.catch?.(()=>{});return {sent:true};
   }
   openMap(context){this.guard(context);if(this.now()-this.openedAt<1200)return;this.openedAt=this.now();createNativeNavigationView({document:this.document,verify:()=>this.guard(context),requestMap:()=>{}}).open();}
@@ -4598,7 +4613,7 @@ class NativePartyGateway {
 function createPartyNativeTravel({host,getContext,getWorld,document,page,requestMap,isRunning,verifyOperation=()=>{},now=Date.now,readWorldState=null}){
   let epoch=0,operation=null,transport=null,mirror=null;
   function readPending(){const pending=host.currentPending();if(pending?.kind!=='party-travel'||pending.nativeTravel!==true)return null;const record=pending.travel;if(!mirror||JSON.stringify(mirror)!==JSON.stringify(record))mirror=record;return mirror;}
-  function ready(world){try{return readNativeChannelSnapshot(world).ready;}catch{return false;}}
+  function ready(world){try{return readNativeChannelSnapshot(world,{document,getWorld}).ready;}catch{return false;}}
   async function run(destination,readOnly){
     if(operation)return readOnly?{confirmed:false}:{state:'waiting',message:'等待前次傳送收尾'};
     const context=getContext(),world=getWorld(),currentEpoch=epoch;
@@ -4626,8 +4641,8 @@ function validatePartyAssemblySettings(value,owner=null){
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!keys.includes(key))||value.action!=='assemble'||typeof value.groupId!=='string'||!value.groupId||value.groupId.length>100||typeof value.leaderCharacterId!=='string'||!value.leaderCharacterId||!Array.isArray(value.members)||!value.members.length||value.members.length>4||value.members.some(id=>typeof id!=='string'||!id)||new Set(value.members).size!==value.members.length||!value.members.includes(value.leaderCharacterId)||value.allowRegroup!==true||!['leader','member'].includes(value.role)||typeof value.waitForAll!=='boolean'||!Number.isInteger(value.waitMinutes)||value.waitMinutes<1||value.waitMinutes>60||!['battle','dungeon'].includes(value.purpose)||value.meetingRegionId!=='village'||value.meetingChannel!==10)throw new ControlError('invalid_party_members','集合需指定最多四名成員、隊長與CH.10曙光村');
   if(owner&&(!value.members.includes(owner)||(value.role==='leader')!==(value.leaderCharacterId===owner)))throw new ControlError('party_role_missing','隊伍身分與鎖定隊長不一致');return true;
 }
-function partyAssemblyReady(world,plan){
-  const party=world?.party;if(world?.regionId!=='village'||nativeChannelNumber(world.selfPartyChannelId??world.channelId)!==10||party?.leaderId!==plan.leaderCharacterId||!Array.isArray(party.members)||party.members.length!==plan.members.length||new Set(party.members.map(p=>p.characterId)).size!==party.members.length)return false;
+function partyAssemblyReady(world,plan,options={}){
+  const party=world?.party;if(world?.regionId!=='village'||readNativeWorldFacts(world,options).channel!==10||party?.leaderId!==plan.leaderCharacterId||!Array.isArray(party.members)||party.members.length!==plan.members.length||new Set(party.members.map(p=>p.characterId)).size!==party.members.length)return false;
   return plan.members.every(id=>party.members.some(p=>p.characterId===id&&p.online===true&&p.dead!==true&&p.regionId==='village'&&nativeChannelNumber(p.crossChannel?p.crossChannelId:p.channelId)===10));
 }
 function normalizePartyCommand(payload,action){const leader=payload.leaderCharacterId??payload.leader?.characterId;if(action==='ensure'&&(!leader||!Array.isArray(payload.members)||payload.members.some(member=>typeof member!=='object'||typeof member.characterId!=='string')))throw new ControlError('role_bindings_required','核心隊伍角色需附已核對的原生characterId');return action==='ensure'?{action,groupId:payload.groupId,leaderCharacterId:leader,members:payload.members.map(member=>member.characterId),allowRegroup:payload.allowRegroup===true}:{action,groupId:payload.groupId??'rendezvous',...(payload.location?{location:structuredClone(payload.location)}:{targetCharacterId:payload.targetCharacterId??payload.target?.characterId})};}
@@ -4642,7 +4657,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     else if(typeof settings.targetCharacterId!=='string'||!settings.targetCharacterId)throw new ControlError('invalid_rendezvous','需指定原生會合角色ID');if(settings.timeoutMs!==undefined&&(!Number.isInteger(settings.timeoutMs)||settings.timeoutMs<10000||settings.timeoutMs>600000))throw new ControlError('invalid_party_timeout','隊伍等待期限無效');return true;
   }
   function groupEvidence(){const party=world()?.party;if(!party||party.leaderId!==plan?.leaderCharacterId||!Array.isArray(party.members))return false;const ids=party.members.map(member=>member.characterId);return ids.length===plan.members.length&&new Set(ids).size===ids.length&&plan.members.every(id=>ids.includes(id))&&party.members.every(member=>member.online===true&&member.dead!==true);}
-  function arrivalEvidence(pending){const w=world(),member=w?.party?.members?.find(value=>value.characterId===pending.targetCharacterId);if(!member||member.online!==true||member.dead||['player_home','player_home_garden'].includes(member.regionId))return false;const channel=member.crossChannel?member.crossChannelId:member.channelId,self=w.selfPartyChannelId??w.channelId;return Boolean(member.regionId&&member.regionId===w.regionId&&channel!=null&&self!=null&&String(channel)===String(self)&&(member.instanceId==null||String(member.instanceId)===String(w.instanceId??'')));}
+  function arrivalEvidence(pending){const w=world(),member=w?.party?.members?.find(value=>value.characterId===pending.targetCharacterId);if(!member||member.online!==true||member.dead||['player_home','player_home_garden'].includes(member.regionId))return false;const channel=member.crossChannel?member.crossChannelId:member.channelId,self=readNativeWorldFacts(w,{document,getWorld:world}).channelId;return Boolean(member.regionId&&member.regionId===w.regionId&&channel!=null&&self!=null&&String(channel)===String(self)&&(member.instanceId==null||String(member.instanceId)===String(w.instanceId??'')));}
   function reconcile(pending){if(pending?.kind==='party-travel'&&pending.nativeTravel===true)return travel.reconcile();if(!pending)return {confirmed:true};const w=world();if(w?.charId!==pending.characterId)return {confirmed:false};let confirmed=false;
     if(pending.kind==='party-create')confirmed=w.party?.leaderId===w.charId&&w.party.members?.some(member=>member.characterId===w.charId);
     if(pending.kind==='party-leave')confirmed=w.party===null;
@@ -4650,9 +4665,9 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     if(pending.kind==='party-accept')confirmed=w.party?.leaderId===pending.leaderCharacterId&&w.party.members?.some(member=>member.characterId===w.charId);
     if(pending.kind==='party-home-leave')confirmed=isNativeOutsideHome(w)&&w.mode==='open'&&w.isWorldInteractionLocked?.()===false;
     if(pending.kind==='party-rendezvous')confirmed=arrivalEvidence(pending);
-    if(pending.kind==='party-channel'){if(pending.nativeNavigation){try{const current=readNativeChannelSnapshot(w);confirmed=current.ready&&current.regionId===pending.regionId&&current.channelId===pending.nativeChannelId&&current.instanceId===pending.instanceId;}catch{}}else confirmed=[pending.channelId,pending.nativeChannelId].includes(gateway.readChannel());if(confirmed)channelAlias=gateway.readChannel();}
+    if(pending.kind==='party-channel'){if(pending.nativeNavigation){try{const current=readNativeChannelSnapshot(w,{document,getWorld:world});confirmed=current.ready&&current.regionId===pending.regionId&&current.channelId===pending.nativeChannelId&&current.instanceId===pending.instanceId;}catch{}}else confirmed=[pending.channelId,pending.nativeChannelId].includes(gateway.readChannel());if(confirmed)channelAlias=gateway.readChannel();}
     if(pending.kind==='party-travel')confirmed=w.regionId===pending.regionId&&!w.isWorldInteractionLocked?.();
-    if(pending.kind==='party-room'){if(pending.nativeNavigation){try{const current=readNativeRoomSnapshot(w);confirmed=current.ready&&current.regionId===pending.regionId&&current.channelId===pending.channelId&&current.instanceId===pending.instanceId;}catch{}}else confirmed=w.instanceId===pending.instanceId&&!w.isWorldInteractionLocked?.();}
+    if(pending.kind==='party-room'){if(pending.nativeNavigation){try{const current=readNativeRoomSnapshot(w,{document,getWorld:world});confirmed=current.ready&&current.regionId===pending.regionId&&current.channelId===pending.channelId&&current.instanceId===pending.instanceId;}catch{}}else confirmed=w.instanceId===pending.instanceId&&!w.isWorldInteractionLocked?.();}
     if(pending.kind==='party-move')confirmed=pending.cancelled===true||gateway.positionEvidence(pending.location,pending.channelAlias);
     if(confirmed)host.pending(null);return {confirmed:Boolean(confirmed),evidence:confirmed?'原生隊伍／場景回讀已確認':null};
   }
@@ -4681,7 +4696,7 @@ function createPartyAdapter({host,world,renderer,document,now=Date.now,KeyboardE
     if(w.charId===plan.leaderCharacterId){
       if(!w.party){const result=gateway.create(context);message=result.reason??'已建立隊伍，等待原生確認';return;}
       for(const p of w.party.members??[])assemblyInvited.add(p.characterId);
-      if(partyAssemblyReady(w,plan)){completeAssembly('全員已於CH.10曙光村集合，隊長可以出發');return;}
+      if(partyAssemblyReady(w,plan,{document,getWorld:world})){completeAssembly('全員已於CH.10曙光村集合，隊長可以出發');return;}
       const searched=plan.members.every(id=>assemblyInvited.has(id)||assemblySearched.has(id));
       if(searched&&assemblyWaitAt===null)assemblyWaitAt=now();
       if(!plan.waitForAll&&searched&&now()-assemblyWaitAt>=plan.waitMinutes*60000){completeAssembly('集合等待已到，帶目前已確認成員出發');return;}
@@ -5588,11 +5603,11 @@ let integratedContext=null,integratedPausing=false,integratedFollowWorld=null;
   function invalidateDom(){if(domRound)domRound={};slowDomCache.clear()}
   const num=(v)=>Number(String(v||'').replace(/[^\d]/g,''));
 
-  function location(){return roundValue('location',()=>{const facts=readNativeWorldFacts(PAGE.__world);return (facts.location??'')+(facts.channel?' CH.'+facts.channel:'');});}
+  function location(){return roundValue('location',()=>{const facts=readNativeWorldFacts(PAGE.__world,{document,getWorld:()=>PAGE.__world});return (facts.location??'')+(facts.channel?' CH.'+facts.channel:'');});}
   function isTown(){return /王都聖輝城|曙光村/.test(location())}
 
 
-  function readHud(){return roundValue('hud',()=>{const data=readNativeWorldFacts(PAGE.__world);return {hp:data.hp,sp:data.sp,exp:data.exp,where:data.location??'',regionId:data.regionId,channelId:data.channelId};});}
+  function readHud(){return roundValue('hud',()=>{const data=readNativeWorldFacts(PAGE.__world,{document,getWorld:()=>PAGE.__world});return {hp:data.hp,sp:data.sp,exp:data.exp,where:data.location??'',regionId:data.regionId,channelId:data.channelId};});}
   function key(code,key){host.assert(integratedContext);invalidateDom();const opts={bubbles:true,cancelable:true,code,key};document.dispatchEvent(new PAGE.KeyboardEvent('keydown',opts));document.dispatchEvent(new PAGE.KeyboardEvent('keyup',opts));}
 
 
@@ -5637,7 +5652,7 @@ let integratedContext=null,integratedPausing=false,integratedFollowWorld=null;
   // 只借用原生 AUTO 喚醒寵物；確認開啟後計時，確認關閉才交回腳本。
 function 建立抵達啟動寵物({now=Date.now}={}){
  let world=null,place='',done='',stage='',since=0,until=0,lastAttempt=0,closeFailures=0;
- const key=w=>w?[w.charId,w.regionId,w.instanceId,w.selfPartyChannelId].join('|'):'';
+ const key=w=>w?[w.charId,w.regionId,w.instanceId,readNativeWorldFacts(w,{document,getWorld:()=>PAGE.__world}).channelId].join('|'):'';
  function requestStop(){if(world&&world===PAGE.__world&&world.charId===integratedContext?.characterId&&(world.autoBattlePendingAction==='start'||world.autoBattle===true&&world.autoBattlePendingAction!=='stop'))world.toggleAutoBattle?.();}
  function cancel(){if(stage)requestStop();stage='';until=0;closeFailures=0;}
  function reset(){cancel();world=null;place='';done='';since=0;}
@@ -5723,7 +5738,7 @@ function 建立隊員移動({now=Date.now}={}){
   const roster=(w.party?.members||[]).filter(m=>String(m.characterId)!==String(w.charId));
   if(!roster.length||t<retryAt)return {idle:true,kind:mode};
   index%=roster.length;
-  function visible(m){const r=w.remotes?.[String(m.characterId)];return m.online!==false&&!m.dead&&r&&!r.dead&&r.hp!==0&&(!m.regionId||m.regionId===w.regionId)&&(!r.regionId||r.regionId===w.regionId)&&(!m.channelId||!w.selfPartyChannelId||m.channelId===w.selfPartyChannelId)&&(!r.channelId||!w.selfPartyChannelId||r.channelId===w.selfPartyChannelId)&&(r.instanceId==null||r.instanceId===(w.instanceId??null))&&Number.isFinite(r.x)&&Number.isFinite(r.y)?r:null;}
+  function visible(m){const r=w.remotes?.[String(m.characterId)],channel=readNativeWorldFacts(w,{document,getWorld:()=>PAGE.__world}).channel;return channel!==null&&m.online!==false&&!m.dead&&r&&!r.dead&&r.hp!==0&&(!m.regionId||m.regionId===w.regionId)&&(!r.regionId||r.regionId===w.regionId)&&(!m.channelId||nativeChannelNumber(m.channelId)===channel)&&(!r.channelId||nativeChannelNumber(r.channelId)===channel)&&(r.instanceId==null||r.instanceId===(w.instanceId??null))&&Number.isFinite(r.x)&&Number.isFinite(r.y)?r:null;}
   if(targetId){const found=roster.findIndex(m=>String(m.characterId)===targetId);if(found>=0)index=found;else next();}
   for(let n=0;n<roster.length;n++){
    const m=roster[index%roster.length],r=visible(m);
@@ -5871,10 +5886,10 @@ function 建立隊員移動({now=Date.now}={}){
 
   // 只讀取當前隊伍與小地圖 DOM，不保存固定玩家排除名單。
   function currentMapName(hud=readHud()){return compactMapLabel(hud.where.split(/CH\.?\s*\d+/i)[0])}
-  function currentChannel(hud=readHud()){return readNativeWorldFacts(PAGE.__world).channel??0;}
+  function currentChannel(hud=readHud()){return readNativeWorldFacts(PAGE.__world,{document,getWorld:()=>PAGE.__world}).channel??0;}
   function locationKey(hud){return currentMapName(hud)+'@'+currentChannel(hud)}
   function syncPending(){const raw=roundValue('connection',connectionState);return raw.sync&&!(run?.syncUiReleased===syncPlaceKey()&&nativeArrivalReady()&&!raw.disconnected)}
-  function syncPlaceKey(){const w=PAGE.__world;return w?[w.charId,w.regionId,w.instanceId,w.selfPartyChannelId,currentMapName()].join('|'):'';}
+  function syncPlaceKey(){const w=PAGE.__world;return w?[w.charId,w.regionId,w.instanceId,readNativeWorldFacts(w,{document,getWorld:()=>PAGE.__world}).channelId,currentMapName()].join('|'):'';}
   function nativeArrivalReady(){const w=PAGE.__world;return !!w?.regionId&&!!w?.player&&Number(w.player.hp)>0&&!w.dead&&worldResourcesReady()&&typeof w.isWorldInteractionLocked==='function'&&!w.isWorldInteractionLocked()&&[w.player.x,w.player.y].every(Number.isFinite)&&trainingMap(readHud())&&autoAreaState()==='field';}
   function reconcileRiftArrival(hud){
     if(currentMode()||routeDestination()!=='rift'||!run.target||!atNormalTarget(hud,run.target))return;
@@ -5889,8 +5904,8 @@ function 建立隊員移動({now=Date.now}={}){
   function partyState(){return roundValue('party',()=>readNativePartyRoster(PAGE.__world));}
   function ensurePartyPanel(){if(Date.now()-Number(run.partyOpenedAt||0)<1500)return;const view=createNativePartyView({document,getWorld:()=>PAGE.__world});if(view.party())return;host.assert(integratedContext);if(view.open())run.partyOpenedAt=Date.now();}
   function leaderTogether(party){return leaderFollowInfo(party).state==='same';}
-  function leaderFollowInfo(party){return roundValue('leaderFollowInfo',()=>readNativeLeaderLocation(PAGE.__world,party));}
-  function outsiders(party){return readNativeOutsiders(PAGE.__world,party);}
+  function leaderFollowInfo(party){return roundValue('leaderFollowInfo',()=>readNativeLeaderLocation(PAGE.__world,party,{document,getWorld:()=>PAGE.__world}));}
+  function outsiders(party){return readNativeOutsiders(PAGE.__world,party,{document,getWorld:()=>PAGE.__world});}
   function pauseFight(phase,message,keepFollow=false){
     cancelMovePair();run.lowHealthFollowId='';
     if(!keepFollow)releaseNativeFollow();
@@ -5996,7 +6011,7 @@ function 建立隊員移動({now=Date.now}={}){
     if(!pending||pending.leader!==leader.name||pending.desired!==desired){pending={leader:leader.name,desired,since:now,attempts:0,lastClick:0};run.nativeFollowPending=pending}
     if(now-pending.since>15000){stop('錯誤：無法確認隊長距離跟隨的啟停狀態');return true}
     if(pending.attempts<3&&(!pending.lastClick||now-pending.lastClick>=5000)){
-      if(desired&&pending.attempts===0&&typeof w.startFollow==='function'){host.assert(integratedContext);cancelMovePair();const fresh=readNativeLeaderLocation(w,readNativePartyRoster(w));if(PAGE.__world!==w||fresh.state!=='same'||fresh.id!==info.id)return true;integratedFollowWorld=w;pending.attempts++;pending.lastClick=now;run.nativeFollowOwned=leader.name;run.nativeFollowOwnedId=info.id;w.startFollow(info.id);invalidateDom();run.message='已啟用原生跟隨隊長，靠近'+near+'內將關閉';}
+      if(desired&&pending.attempts===0&&typeof w.startFollow==='function'){host.assert(integratedContext);cancelMovePair();const fresh=readNativeLeaderLocation(w,readNativePartyRoster(w),{document,getWorld:()=>PAGE.__world});if(PAGE.__world!==w||fresh.state!=='same'||fresh.id!==info.id)return true;integratedFollowWorld=w;pending.attempts++;pending.lastClick=now;run.nativeFollowOwned=leader.name;run.nativeFollowOwnedId=info.id;w.startFollow(info.id);invalidateDom();run.message='已啟用原生跟隨隊長，靠近'+near+'內將關閉';}
       else if(!desired&&stopNativeFollow(leader,info.id)){pending.attempts++;pending.lastClick=now;run.message='已關閉跟隨隊長，恢復自主戰鬥與撿取';}
     }
     queueTick(350);return true;
@@ -6018,7 +6033,7 @@ function 建立隊員移動({now=Date.now}={}){
   function combatAllowed(hud=readHud()){
     if(arrivalAuto.getState().stage||restoring||reloading||worldDisconnected()||PAGE.__world?.dead||hud.hp?.now<=0)return false;
     if(currentMode())return !!run?.running&&run.phase==='fight'&&!run.resting&&hud.hp?.now>0&&autoAreaState()==='field'&&!syncPending()&&!mapOpen()&&run.currentLocation===locationKey(hud);
-    if(!run?.running||run.phase!=='fight'||run.resting||!trainingMap(hud)||syncPending()||mapOpen()||!readNativeWorldFacts(PAGE.__world).position||run.battleLocation!==locationKey(hud))return false;
+    if(!run?.running||run.phase!=='fight'||run.resting||!trainingMap(hud)||syncPending()||mapOpen()||!readNativeWorldFacts(PAGE.__world,{document,getWorld:()=>PAGE.__world}).position||run.battleLocation!==locationKey(hud))return false;
     return run.role==='member'?(settings.memberMode==='care'||leaderTogether(partyState())):leaderTarget(hud);
   }
   function crowdReturn(){pauseFight('navigate','目標地圖人滿為患，返回王都');run.returnReason='目標地圖人滿為患，請換個地方';run.target={world:'王都聖輝城',name:'王都聖輝城'};resetNavigation();queueTick()}
@@ -6051,7 +6066,7 @@ function 建立隊員移動({now=Date.now}={}){
     }
     return false;
   }
-  function nativeRoomLocation(){const world=PAGE.__world;if(world?.charId!==integratedContext?.characterId)return null;try{return readNativeRoomSnapshot(world);}catch{return null;}}
+  function nativeRoomLocation(){const world=PAGE.__world;if(world?.charId!==integratedContext?.characterId)return null;try{return readNativeRoomSnapshot(world,{document,getWorld:()=>PAGE.__world});}catch{return null;}}
   function avoidTick(hud){return nativeAvoidStep(hud);}
   async function nativeAvoid(hud){
     const context=integratedContext,activeRun=run,a=run?.avoid;if(!a)return;
@@ -6227,8 +6242,8 @@ function 建立隊員移動({now=Date.now}={}){
     }
   }
   function stopNativeFailure(reason){try{stop(reason);}finally{host.cancelAll();}}
-  function nativeCurrentCharacterName(){const facts=readNativeWorldFacts(PAGE.__world);return facts.characterId===host.characterId?facts.characterName:null;}
-  function nativeNavigationReady(){try{return readNativeChannelSnapshot(PAGE.__world).ready;}catch{return false;}}
+  function nativeCurrentCharacterName(){const facts=readNativeWorldFacts(PAGE.__world,{document,getWorld:()=>PAGE.__world});return facts.characterId===host.characterId?facts.characterName:null;}
+  function nativeNavigationReady(){try{return readNativeChannelSnapshot(PAGE.__world,{document,getWorld:()=>PAGE.__world}).ready;}catch{return false;}}
   function navigateTick(hud){return nativeNavigationStep(hud);}
   async function nativeNavigation(hud){
     const context=integratedContext,activeRun=run;
@@ -6733,7 +6748,7 @@ function 建立隊員移動({now=Date.now}={}){
     queueTick();return true;
   }
   let integratedReturnLocation=null;
-  function confirmedFarmReturn(){const point=integratedReturnLocation;integratedReturnLocation=null;if(!point||run?.role==='member'||currentMode()||run.worldRecovery||run.recoveryHome||run.returnReason||run.noExpRecovery||run.autoRest)return false;return nativeReturnLocationMatches(PAGE.__world,point)&&nativeChannels.destinationConfirmed(routeDestination()==='normal'?run.target.name:run.target.world+'・裂痕 '+routeBranch());}
+  function confirmedFarmReturn(){const point=integratedReturnLocation;integratedReturnLocation=null;if(!point||run?.role==='member'||currentMode()||run.worldRecovery||run.recoveryHome||run.returnReason||run.noExpRecovery||run.autoRest)return false;return nativeReturnLocationMatches(PAGE.__world,point,{document,getWorld:()=>PAGE.__world})&&nativeChannels.destinationConfirmed(routeDestination()==='normal'?run.target.name:run.target.world+'・裂痕 '+routeBranch());}
   function restoreRecovery(){
     let saved;try{saved=JSON.parse(sessionStorage.getItem(RECOVERY_KEY)||'null')}catch{sessionStorage.removeItem(RECOVERY_KEY);return}
     if(!saved||saved.version!==1||!saved.character||!saved.data||!saved.settings)return;
@@ -6804,7 +6819,7 @@ function 建立隊員移動({now=Date.now}={}){
     if(PAGE.__world?.autoBattle===true){run.message='原生AUTO仍執行，等待核對後再交接';return false;}
     return true;
   }
-  const nativeChannels=createSourceNativeChannelAdapter({host,kind:'battle',key:PREFIX+'-native-channel-v1',reconcileExternal:(record,options)=>record.kind==='native-respawn'?reconcileNativeRespawn(record,options):nativePartyGoToProof(record,options.world),getContext:()=>integratedContext,getWorld:()=>PAGE.__world,isRunning:()=>Boolean(run?.running),document,page:PAGE,requestMap:()=>key('KeyM','m'),now:()=>Date.now()});
+  const nativeChannels=createSourceNativeChannelAdapter({host,kind:'battle',key:PREFIX+'-native-channel-v1',reconcileExternal:(record,options)=>record.kind==='native-respawn'?reconcileNativeRespawn(record,options):nativePartyGoToProof(record,options.world,{document,getWorld:()=>PAGE.__world}),getContext:()=>integratedContext,getWorld:()=>PAGE.__world,isRunning:()=>Boolean(run?.running),document,page:PAGE,requestMap:()=>key('KeyM','m'),now:()=>Date.now()});
   return {
     kind:'battle',sourceVersion:'2.6.4',selfDriven:true,observe:observeIntegrated,validate,
     consumables:nativeConsumables,settings:openSettings,records:openRecords,getSettings:()=>structuredClone(readPermanentBattleSettings()),
@@ -7479,19 +7494,19 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
     updatePanel();
   }
 
-  function readPlayerCoordinate(){const point=readNativeWorldFacts(PAGE_WINDOW.__world).position;coordinate=point?{...point,seenAt:now(),source:'world'}:{x:null,y:null,seenAt:0,source:'world'};return coordinate;}
+  function readPlayerCoordinate(){const point=readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world}).position;coordinate=point?{...point,seenAt:now(),source:'world'}:{x:null,y:null,seenAt:0,source:'world'};return coordinate;}
 
-  function readMinimapContext(){const data=readNativeWorldFacts(PAGE_WINDOW.__world);locationContext={location:data.location,regionId:data.regionId,channel:data.channel,channelId:data.channelId,seenAt:data.regionId?now():0};return locationContext;}
+  function readMinimapContext(){const data=readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world});locationContext={location:data.location,regionId:data.regionId,channel:data.channel,channelId:data.channelId,seenAt:data.regionId?now():0};return locationContext;}
 
   function atLocation(name) {
     return now() - locationContext.seenAt < 5000 && normalize(locationContext.location).includes(normalize(name));
   }
 
-  function readTopRightVitality(){return readNativeWorldFacts(PAGE_WINDOW.__world).vitality;}
+  function readTopRightVitality(){return readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world}).vitality;}
 
-  function readVitality(){return readNativeWorldFacts(PAGE_WINDOW.__world).vitality;}
+  function readVitality(){return readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world}).vitality;}
 
-  function autoState(){return readNativeWorldFacts(PAGE_WINDOW.__world).auto;}
+  function autoState(){return readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world}).auto;}
 
   function mapTabsRow() {
     return [...document.querySelectorAll('div, section, nav, header')]
@@ -9601,8 +9616,8 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
     setStoredValue(COUNT_KEY, huntCount);
   }
 
-  function readMinimapContext(){const data=readNativeWorldFacts(PAGE_WINDOW.__world);return {location:data.location,regionId:data.regionId,channel:data.channel,channelId:data.channelId};}
-  function readPlayerCoordinate(){return readNativeWorldFacts(PAGE_WINDOW.__world).position??{x:null,y:null};}
+  function readMinimapContext(){const data=readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world});return {location:data.location,regionId:data.regionId,channel:data.channel,channelId:data.channelId};}
+  function readPlayerCoordinate(){return readNativeWorldFacts(PAGE_WINDOW.__world,{document,getWorld:()=>PAGE_WINDOW.__world}).position??{x:null,y:null};}
 
   function refreshMinimapDiagnostic() {
     const result = readMinimapContext();
@@ -10029,7 +10044,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
 
   function bossBarVisible(){return nativeEncounter.read().alive;}
   function isDeathScreen(){return readNativeDeath(PAGE_WINDOW.__world);}
-  function autoState(){const world=PAGE_WINDOW.__world;return world.autoBattlePendingAction?'unknown':readNativeWorldFacts(world).auto;}
+  function autoState(){const world=PAGE_WINDOW.__world;return world.autoBattlePendingAction?'unknown':readNativeWorldFacts(world,{document,getWorld:()=>PAGE_WINDOW.__world}).auto;}
   function clickRevive(){
     if(!nativeRespawn.available())return false;
     nativeChannels.markExternal({kind:'native-respawn',role:PAGE_WINDOW.__world.player.name});
@@ -11564,7 +11579,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
   function pauseStep(){host.assert(integratedContext,{allowPending:true});if(nativeChannels.busy()||nativeChannels.hasPending())return false;if(phase.startsWith('loot-wait'))return false;releaseMove();const w=PAGE_WINDOW.__world;if(w?.autoBattle===true||w?.autoBattlePendingAction==='start'){if(integratedAutoOwned&&integratedAutoWorld===w)ensureAutoOff('');statusText='等待原生AUTO關閉後交接';return false;}if(w?.autoBattle!==false||w.autoBattlePendingAction||w.castingState||w.pendingSkill)return false;integratedAutoOwned=false;return true;}
   function observeIntegrated(){return {state:integratedPausing?'pausing':enabled?'running':integratedCompleted?'completed':lastReport?'stopped':'idle',phase,message:statusText,count:huntCount,selectedBossLevel:selectedBossLevel||null,channel:currentChannel||null,deathCount,timerTargetLevel:timerTargetLevel||null,dueAt:timerTargetReadyAt||null,respawnSchedule:structuredClone(respawnSchedule),pending:nativeChannels.observePending()};}
   let nativeItemNames=new Map(),nativeCatalogApi=null,nativeCatalogJob=null,nativeFightBaseline=0,nativeFightTracking=false,nativeLostBossAt=0;
-  const nativeEncounter=createNativeEncounterMonitor({getWorld:()=>PAGE_WINDOW.__world,characterId:host.characterId,verify:()=>host.assert(integratedContext,{allowPending:true}),canObserve:()=>enabled&&host.canOperate(integratedContext),itemName:id=>nativeItemNames.get(id)??id,onDrop:drop=>addDrop(drop.level,drop.name,drop.quantity)});
+  const nativeEncounter=createNativeEncounterMonitor({getWorld:()=>PAGE_WINDOW.__world,document,document,characterId:host.characterId,verify:()=>host.assert(integratedContext,{allowPending:true}),canObserve:()=>enabled&&host.canOperate(integratedContext),itemName:id=>nativeItemNames.get(id)??id,onDrop:drop=>addDrop(drop.level,drop.name,drop.quantity)});
   const nativeRespawn=createNativeRespawnView({document,getWorld:()=>PAGE_WINDOW.__world,verify:()=>host.assert(integratedContext,{allowPending:true})});
   function loadNativeItemNames(){
     if(nativeItemNames.size||nativeCatalogJob||typeof PAGE_WINDOW.fetch!=='function')return;
@@ -11574,7 +11589,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
   }
   const nativeNpcDialog=createNativeNpcDialogView({document,getWorld:()=>PAGE_WINDOW.__world,verify:()=>host.assert(integratedContext,{allowPending:true})});
   const nativeBossDirectory=createNativeBossDirectoryView({document,getWorld:()=>PAGE_WINDOW.__world,characterId:host.characterId,verify:()=>host.assert(integratedContext,{allowPending:true})});
-  const nativeChannels=createSourceNativeChannelAdapter({host,kind:'boss',key:PREFIX+'-native-channel-v1',getContext:()=>integratedContext,getWorld:()=>PAGE_WINDOW.__world,isRunning:()=>enabled&&!integratedCleanup,document,requestMap:()=>pressMap(),page:PAGE_WINDOW,now:()=>Date.now(),travelRetry:destination=>destination==='holy_city',travelInterval:CAPITAL_SETTLE_TIMEOUT_MS,createTravelView:map=>nativeBossDirectory.navigation(map),travelReconcileReady:world=>world.mode==='open'&&world.serverAuthoritativeResources===true&&(readNativeDeath(world)||readNativeChannelSnapshot(world).ready),reconcileExternal:reconcileNativeRespawn});
+  const nativeChannels=createSourceNativeChannelAdapter({host,kind:'boss',key:PREFIX+'-native-channel-v1',getContext:()=>integratedContext,getWorld:()=>PAGE_WINDOW.__world,isRunning:()=>enabled&&!integratedCleanup,document,requestMap:()=>pressMap(),page:PAGE_WINDOW,now:()=>Date.now(),travelRetry:destination=>destination==='holy_city',travelInterval:CAPITAL_SETTLE_TIMEOUT_MS,createTravelView:map=>nativeBossDirectory.navigation(map),travelReconcileReady:world=>world.mode==='open'&&world.serverAuthoritativeResources===true&&(readNativeDeath(world)||readNativeChannelSnapshot(world,{document,getWorld:()=>PAGE_WINDOW.__world}).ready),reconcileExternal:reconcileNativeRespawn});
   async function handleNativeChannelMap(){
     if(!requestedChannel)requestedChannel=nextChannel(currentChannel);
     if(phase==='switch-channel'){
@@ -11614,7 +11629,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
   function nativeBossTravelStep(regionId){const context=integratedContext;return nativeBossTravel(regionId).catch(error=>{if(context===integratedContext&&enabled)stopNativeBossFailure('原生首領入口：'+error.message);});}
   function nativeBossEntryStep(){
     if(['return-city','capital-settling'].includes(phase))return nativeCapitalStep();
-    const world=PAGE_WINDOW.__world;let snapshot;try{snapshot=readNativeChannelSnapshot(world);}catch{statusText='等待原生地圖與分線';return updatePanel();}
+    const world=PAGE_WINDOW.__world;let snapshot;try{snapshot=readNativeChannelSnapshot(world,{document,getWorld:()=>PAGE_WINDOW.__world});}catch{statusText='等待原生地圖與分線';return updatePanel();}
     if(!snapshot.ready){statusText='等待原生世界就緒';return updatePanel();}
     if(world.regionId!=='holy_city'){cityKnown=false;setPhase('return-city','搜尋首領前返回王都');return nativeCapitalStep();}
     currentChannel=snapshot.channel;cityKnown=true;
@@ -12586,7 +12601,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
   const DEATH_FLOW_TIMEOUT_MS = 15000;
   const SUCCESS_FLOW_TIMEOUT_MS = 30000;
   const GENERAL_FLOW_TIMEOUT_MS = 300000;
-  const ENTRY_WAIT_TIMEOUT_MS = 600000;
+  const ENTRY_WAIT_TIMEOUT_MS = 180000;
   const COMBAT_CHECK_INTERVAL_MS = 200;
 
   const PAGE_WINDOW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -12621,6 +12636,31 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
   let verificationSince = null, verificationPausedMs = 0;
   let flowStage = 'initial';
   let flowStageSince = flowNow();
+  let memberEntryFailures=0,memberEntryElapsed=0,memberEntrySince=null,memberEntryStarted=false;
+  function resetMemberEntryWait(){memberEntryFailures=0;memberEntryElapsed=0;memberEntrySince=null;memberEntryStarted=false;}
+  function memberEntryWaitSnapshot(){return {version:1,failures:memberEntryFailures,elapsedMs:memberEntryElapsed+(memberEntrySince===null?0:Math.max(0,flowNow()-memberEntrySince)),started:memberEntryStarted};}
+  function suspendMemberEntryWait(){const saved=memberEntryWaitSnapshot();memberEntryElapsed=saved.elapsedMs;memberEntrySince=null;return saved;}
+  function restoreMemberEntryWait(saved){
+    resetMemberEntryWait();if(saved===undefined)return;
+    if(!saved||saved.version!==1||!Number.isSafeInteger(saved.failures)||saved.failures<0||saved.failures>3||!Number.isFinite(saved.elapsedMs)||saved.elapsedMs<0||typeof saved.started!=='boolean'||!saved.started&&(saved.failures!==0||saved.elapsedMs!==0))throw new Error('隊員進場等待快照無效');
+    memberEntryFailures=saved.failures;memberEntryElapsed=saved.elapsedMs;memberEntryStarted=saved.started;memberEntrySince=saved.started?flowNow():null;
+  }
+  function suspendBlockedMemberEntryWait(){
+    if(!host.canOperate(integratedContext)){suspendMemberEntryWait();return;}
+    const world=PAGE_WINDOW.__world;
+    if(inDungeon()&&world.charId===integratedContext?.characterId&&typeof world.instanceId==='string'&&world.instanceId&&world.serverAuthoritativeResources===true){resetMemberEntryWait();return;}
+    if(!enabled||integratedPausing||inventoryReader||host.currentPending()||nativeRespawn.busy()||nativeRespawn.hasPending()||nativeResults.busy()||nativeResults.hasPending()||inDungeon()||world?.dead||world?.player?.hp<=0)suspendMemberEntryWait();
+  }
+  function memberEntryWaitTick(){
+    markFlowStage('waiting');
+    if(host.currentPending()){suspendMemberEntryWait();panelMessage='等待原生未明操作核對｜已返回 '+returnCount+' 次';updatePanel('等待原生未明操作核對');return false;}
+    const t=flowNow();if(!memberEntryStarted)memberEntryStarted=true;if(memberEntrySince===null)memberEntrySince=t;
+    let elapsed=memberEntryElapsed+Math.max(0,t-memberEntrySince);
+    while(elapsed>=ENTRY_WAIT_TIMEOUT_MS&&memberEntryFailures<3){memberEntryFailures++;elapsed-=ENTRY_WAIT_TIMEOUT_MS;}
+    memberEntryElapsed=elapsed;memberEntrySince=t;
+    if(memberEntryFailures>=3){stopScript('等待進場：連續三次各180秒均未進場');return false;}
+    const text='第 '+(memberEntryFailures+1)+'/3 次等待進場・'+Math.ceil((ENTRY_WAIT_TIMEOUT_MS-elapsed)/1000)+' 秒';panelMessage=text+'｜已返回 '+returnCount+' 次';updatePanel(text);return true;
+  }
   let lastDodgeAt = 0;
   let lastDodgeScanAt = 0;
 
@@ -12770,7 +12810,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
     }
   }
 
-  function monitorCombatMovement() {if(memberLimitTick())return;
+  function monitorCombatMovement() {suspendBlockedMemberEntryWait();if(memberLimitTick())return;
     if(integratedCleanup){try{host.assertCleanup(integratedContext);}catch{inventoryReader?.cancel('角色已切換，不讀取新角色背包');return;}}
     else if(!host.canOperate(integratedContext))return;
     nativeResults.observe();
@@ -12931,6 +12971,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
       return;
     }
     if (!inDungeon()) return;
+    if(world.charId===integratedContext?.characterId&&typeof world.instanceId==='string'&&world.instanceId&&world.serverAuthoritativeResources===true)resetMemberEntryWait();else suspendMemberEntryWait();
     const key = `${world.regionId}|${world.instanceId ?? ''}`;
     if (battleKey !== key || battleEnded) {
       battleKey = key;
@@ -13027,7 +13068,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
     }, delay);
   }
 
-  function scan() {if(memberLimitTick())return;
+  function scan() {suspendBlockedMemberEntryWait();if(memberLimitTick())return;
     if(!host.canOperate(integratedContext))return;
     if(nativeRespawn.busy()||nativeRespawn.hasPending())return;
     if(['owned-auto-start','owned-auto-stop'].includes(host.currentPending()?.kind)&&!ownedAuto.reconcile(host.currentPending()).confirmed){if(pauseForVerification())return;if(ownedAuto.expired())stopScript('原生AUTO結果逾時，保留紀錄，不重送');return;}
@@ -13042,7 +13083,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
 
 
     observeBattle();
-    const nativeResult=nativeResults.read(),successVisible=nativeResult?.success===true;
+    const nativeResult=nativeResults.read(),successVisible=nativeResult?.success===true;if(successVisible)suspendMemberEntryWait();
     const reviveState = findReviveState();
     const world = PAGE_WINDOW.__world;
     if (!successVisible && (reviveState || world?.dead || world?.player?.hp <= 0)) {
@@ -13068,8 +13109,8 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
         return;
       }
       const combat = inDungeon();
-      if (!flowWithinLimit(combat ? 'combat' : 'waiting', combat ? GENERAL_FLOW_TIMEOUT_MS : ENTRY_WAIT_TIMEOUT_MS,
-          combat ? '戰鬥' : '等待進場')) return;
+      if(!combat){memberEntryWaitTick();return;}
+      if(!flowWithinLimit('combat',GENERAL_FLOW_TIMEOUT_MS,'戰鬥'))return;
       updatePanel('執行中');
       return;
     }
@@ -13107,6 +13148,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
       returnCount = 0;
 
       deathHandled = false;
+      resetMemberEntryWait();
       flowStage = 'initial';
       flowStageSince = flowNow();
       lastDodgeAt = 0;
@@ -13177,7 +13219,7 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
     const limit=document.createElement('input');limit.type='number';limit.min='0';limit.max='999';limit.step='1';limit.value=String(memberLimit);limit.setAttribute('aria-label','隊員執行場次');limit.style.width='80px';field('執行場次（0為不限）',limit);
     const note = document.createElement('p');
     note.style.whiteSpace = 'pre-line';
-    note.textContent = '勾選自動戰鬥後監控下方 AUTO，副本中未開啟時自動開啟\nBOSS閃避至技能邊緣外30～50，保留安全路徑檢查\n每場最多復活三次，用完繼續等待隊友\n等待進場上限10分鐘；驗證出現時等待關閉後接續';
+    note.textContent = '勾選自動戰鬥後監控下方 AUTO，副本中未開啟時自動開啟\nBOSS閃避至技能邊緣外30～50，保留安全路徑檢查\n每場最多復活三次，用完繼續等待隊友\n等待進場每次180秒，連續三次未進場停止；不重送邀請或接受，驗證與未明操作核對期間等待';
     const save = document.createElement('button'); save.textContent = '儲存';
     save.addEventListener('click', () => {
       if(!/^(0|[1-9][0-9]{0,2})$/.test(limit.value)){note.textContent='請輸入0至999的整數場數';return;}memberLimit=Number(limit.value);setStoredValue(MEMBER_LIMIT_KEY,String(memberLimit));
@@ -13260,16 +13302,16 @@ function assertSource(){if(integratedCleanup)host.assertCleanup(integratedContex
   function releaseMove(){if(ownedMoveWorld===PAGE_WINDOW.__world&&ownedMoveWorld?.charId===integratedContext?.characterId&&ownedMove&&ownedMoveWorld.moveTarget===ownedMove)ownedMoveWorld._clearMoveTarget?.('integrated-member-release');ownedMove=null;ownedMoveWorld=null;}
   function reconcile(pending){if(pending?.kind==='dungeon-result-journal'||nativeResults.hasPending())return nativeResults.reconcile().then(result=>{returnCount=nativeResults.countForRun(integratedContext?.runId);setStoredValue(COUNT_KEY,String(returnCount));return result;});if(pending?.kind==='dungeon-respawn-journal'||nativeRespawn.hasPending())return nativeRespawn.reconcile();if(!pending)return {confirmed:true};if(['owned-auto-start','owned-auto-stop'].includes(pending.kind))return ownedAuto.reconcile(pending);if(pending.kind!=='dungeon-return'||pending.sourceRole!=='member'||PAGE_WINDOW.__world?.charId!==pending.characterId)return {confirmed:false};const confirmed=nativeResults.absent()&&PAGE_WINDOW.__world?.mode==='open'&&!PAGE_WINDOW.__world.instanceId&&['holy_city','village'].includes(PAGE_WINDOW.__world.regionId)&&PAGE_WINDOW.__world.serverAuthoritativeResources===true&&PAGE_WINDOW.__world.isWorldInteractionLocked?.()===false;if(confirmed)host.pending(null);return {confirmed,evidence:confirmed?'隊員結算後已返回副本外':null};}
   function memberLimitTick(){if(!host.canOperate(integratedContext)||!enabled||memberLimit===0)return false;returnCount=nativeResults.countForRun(integratedContext?.runId);if(returnCount<memberLimit)return false;const w=PAGE_WINDOW.__world;if(nativeResults.busy()||nativeResults.hasPending()||inventoryReader||host.currentPending()||!nativeResults.absent()||w?.mode!=='open'||w.instanceId||!['holy_city','village'].includes(w.regionId)||w.serverAuthoritativeResources!==true||w.isWorldInteractionLocked?.()!==false)return true;if(!ownedAuto.safe())return true;memberGoalReached=true;stopScript('已完成設定隊員副本場數');return true;}
-  function drive(){if(memberLimitTick())return;if(['owned-auto-start','owned-auto-stop'].includes(host.currentPending()?.kind))ownedAuto.reconcile(host.currentPending());if(host.currentPending()?.kind==='dungeon-return')reconcile(host.currentPending());monitorCombatMovement();}
+  function drive(){suspendBlockedMemberEntryWait();if(memberLimitTick())return;if(['owned-auto-start','owned-auto-stop'].includes(host.currentPending()?.kind))ownedAuto.reconcile(host.currentPending());if(host.currentPending()?.kind==='dungeon-return')reconcile(host.currentPending());monitorCombatMovement();}
   function beginDriver(){nativeResults.watch();host.cancel(driverTimer);driverTimer=host.interval(drive,COMBAT_CHECK_INTERVAL_MS);}
-  function observeIntegrated(){return {state:integratedPausing?'pausing':enabled?'running':lastReport?'stopped':'idle',phase:inventoryReader?'inventory-'+inventoryPurpose:flowStage,message:panelMessage,role:'member',count:returnCount,revivesUsed,cleanupRunning:Boolean(inventoryReader&&!enabled),report:lastReport,pending:host.currentPending()};}
+  function observeIntegrated(){return {state:integratedPausing?'pausing':enabled?'running':lastReport?'stopped':'idle',phase:inventoryReader?'inventory-'+inventoryPurpose:flowStage,message:panelMessage,role:'member',count:returnCount,revivesUsed,cleanupRunning:Boolean(inventoryReader&&!enabled),report:lastReport,entryWait:memberEntryWaitSnapshot(),pending:host.currentPending()};}
   return {kind:'dungeon',sourceRole:'member',sourceVersion:'1.7.0',selfDriven:true,validate,getSettings:readPermanentMemberSettings,observe:observeIntegrated,settings:openSettings,records:openRecords,
     start(context){integratedContext=context;integratedPausing=false;assertSource();if(PAGE_WINDOW.__world?.party?.leaderId===PAGE_WINDOW.__world?.charId)throw new Error('目前是原生隊長，請選擇副本隊長模式');const settings={...readPermanentMemberSettings(),...(context.settings.member??context.settings)};validate(settings);memberLimit=settings.limit??0;memberGoalReached=false;if(settings.auto!==undefined)wantAuto=settings.auto;if(settings.dodge!==undefined)wantDodge=settings.dodge;setEnabled(true);if(!enabled)throw new Error(panelMessage||'副本隊員未啟動');beginDriver();},
     tick:drive,
-    pause(context){assertSource();if(!nativeResults.absent())return {safe:false};if(nativeResults.busy()||nativeResults.hasPending())return {safe:false};if(nativeRespawn.busy()||nativeRespawn.hasPending())return {safe:false};integratedPausing=true;if(['owned-auto-start','owned-auto-stop'].includes(host.currentPending()?.kind))ownedAuto.reconcile(host.currentPending());if(host.currentPending()?.kind==='dungeon-return')reconcile(host.currentPending());if(inventoryReader||PAGE_WINDOW.__world?.mode==='dungeon'||nativeResults.read()||host.currentPending())return {safe:false};if(!ownedAuto.safe())return {safe:false};releaseMove();cancelReviveSchedule();host.cancelAll();enabled=false;return {safe:true,checkpointId:context.runId+'-member-'+Date.now(),sourceVersion:'1.7.0',sourceRole:'member',sourceCheckpoint:{settings:{auto:wantAuto,dodge:wantDodge,limit:memberLimit},returnCount,revivesUsed,battleKey,battleEnded,deathHandled,resultHandled,flowStage,flowStageSince,report:structuredClone(reportFlow.state())}};},
+    pause(context){assertSource();if(!nativeResults.absent())return {safe:false};if(nativeResults.busy()||nativeResults.hasPending())return {safe:false};if(nativeRespawn.busy()||nativeRespawn.hasPending())return {safe:false};integratedPausing=true;if(['owned-auto-start','owned-auto-stop'].includes(host.currentPending()?.kind))ownedAuto.reconcile(host.currentPending());if(host.currentPending()?.kind==='dungeon-return')reconcile(host.currentPending());if(inventoryReader||PAGE_WINDOW.__world?.mode==='dungeon'||nativeResults.read()||host.currentPending())return {safe:false};if(!ownedAuto.safe())return {safe:false};releaseMove();cancelReviveSchedule();host.cancelAll();enabled=false;return {safe:true,checkpointId:context.runId+'-member-'+Date.now(),sourceVersion:'1.7.0',sourceRole:'member',sourceCheckpoint:{settings:{auto:wantAuto,dodge:wantDodge,limit:memberLimit},returnCount,revivesUsed,battleKey,battleEnded,deathHandled,resultHandled,flowStage,flowStageSince,entryWait:suspendMemberEntryWait(),report:structuredClone(reportFlow.state())}};},
     settle(context){host.assertCleanup(context);if(context!==integratedContext)throw new Error('隊員收尾執行不符');host.cancelAll();nativeResults.cancel();nativeRespawn.cancel();releaseMove();cancelReviveSchedule();integratedPausing=true;integratedCleanup=true;try{if(host.currentPending()?.kind==='dungeon-return')reconcile(host.currentPending());if(!ownedAuto.release())return {safe:false};if(inventoryReader){inventoryReader.tick();return {safe:false};}if(verificationVisible())return {safe:false};const reward=nativeResults.read();if(reward){if(reward.success&&reward.ready&&!resultHandled&&!host.currentPending()&&!nativeResults.busy()){resultHandled=true;nativeResults.requestReturn({cleanup:true}).then(result=>{if(result.confirmed){returnCount=nativeResults.countForRun(integratedContext?.runId);setStoredValue(COUNT_KEY,String(returnCount));}}).catch(error=>{updatePanel('原生必要返回未確認：'+error.message);});}return {safe:false};}if(PAGE_WINDOW.__world?.mode==='dungeon'){updatePanel('核心操作權到期，等待本場原生結算；不復活、不開下一場');return {safe:false};}return this.pause(context);}finally{integratedCleanup=false;}},
     async stop(context,reason){host.cancelAll();integratedCleanup=true;try{releaseMove();ownedAuto.release();stopScript(reason);const deadline=Date.now()+45000;while(inventoryReader&&Date.now()<deadline){monitorCombatMovement();if(inventoryReader)await host.sleep(200,context,{cleanup:true});}if(inventoryReader)inventoryReader.cancel('結束背包未確認');}catch{inventoryReader?.cancel('角色或結束背包讀取未確認');}finally{integratedCleanup=false;host.cancelAll();}},
-    resume(context,checkpoint){if(checkpoint.sourceVersion!=='1.7.0'||!checkpoint.sourceCheckpoint)throw new Error('隊員接續來源或快照無效');integratedContext=context;integratedPausing=false;assertSource();const s=checkpoint.sourceCheckpoint;wantAuto=s.settings.auto;wantDodge=s.settings.dodge;memberLimit=s.settings.limit??0;memberGoalReached=false;nativeResults.restoreRunCount(context.runId,s.returnCount);returnCount=nativeResults.countForRun(context.runId);revivesUsed=s.revivesUsed;battleKey=s.battleKey;battleEnded=s.battleEnded;deathHandled=s.deathHandled;resultHandled=s.resultHandled;flowStage=s.flowStage;flowStageSince=flowNow();reportFlow.begin({characterId:context.characterId,character:PAGE_WINDOW.__world.player?.name||''});if(s.report?.characterId!==context.characterId)throw new Error('隊員報告角色不符');reportFlow.restore(s.report);enabled=true;beginDriver();scheduleNextScan();},
+    resume(context,checkpoint){if(checkpoint.sourceVersion!=='1.7.0'||!checkpoint.sourceCheckpoint)throw new Error('隊員接續來源或快照無效');integratedContext=context;integratedPausing=false;assertSource();const s=checkpoint.sourceCheckpoint;wantAuto=s.settings.auto;wantDodge=s.settings.dodge;memberLimit=s.settings.limit??0;memberGoalReached=false;nativeResults.restoreRunCount(context.runId,s.returnCount);returnCount=nativeResults.countForRun(context.runId);revivesUsed=s.revivesUsed;battleKey=s.battleKey;battleEnded=s.battleEnded;deathHandled=s.deathHandled;resultHandled=s.resultHandled;flowStage=s.flowStage;flowStageSince=flowNow();restoreMemberEntryWait(s.entryWait);reportFlow.begin({characterId:context.characterId,character:PAGE_WINDOW.__world.player?.name||''});if(s.report?.characterId!==context.characterId)throw new Error('隊員報告角色不符');reportFlow.restore(s.report);enabled=true;beginDriver();scheduleNextScan();},
     reconcile,result:()=>({confirmed:memberGoalReached&&memberLimit>0&&returnCount>=memberLimit&&!inventoryReader&&!host.currentPending(),count:returnCount,limit:memberLimit,report:lastReport??structuredClone(reportFlow.state())})};
 }
 
@@ -13302,8 +13344,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.95.4';
-const RUNTIME_VERSION='0.95.4';
+const SCRIPT_VERSION='0.95.5';
+const RUNTIME_VERSION='0.95.5';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
@@ -13416,7 +13458,7 @@ function initializeRole() {
   drafts=new SettingsDrafts({characterId:ownerId,controller:()=>ownerController,read:()=>store.read(ownerId,'settings',{})?.settingsDrafts??null,write:(value,checkpoint)=>{const next=checkpoint&&routine?.controller()===ownerController?routine.settingsCheckpointState(checkpoint):null;store.write(ownerId,'settings',{...store.read(ownerId,'settings',{}),settingsDrafts:value,...(next?{routineState:routine.exportState(next)}:{})});if(next)routine.state=next;}});
   routine=new LocalRoutine({controller:()=>ownerController,acquire:acquireRoleLock,settings:localSettings,
     captureFarmReturn:()=>{if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId)return null;try{return partyAdapter.captureLocation();}catch{return null;}},
-    returnFarmLocation:async(location,checkpoint)=>{if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId||checkpoint.context.characterId!==ownerId)throw new ControlError('identity_changed','返場角色或執行已更換');const target={action:'rendezvous',groupId:'farm-return',location:structuredClone(location),timeoutMs:300000};partyAdapter.validate(target);if(nativeReturnLocationMatches(PAGE.__world,location))return {confirmed:true};if(ownerController.active||ownerController.pending||ownerController.cleanup||ownerController.manualPause)throw new ControlError('task_busy','返場前仍有任務或未明操作');await acquireRoleLock(ownerId,ownerController);if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId||ownerController.active||ownerController.pending||ownerController.cleanup||ownerController.manualPause)throw new ControlError('task_busy','等待返場控制權期間已停止或角色改變');if(nativeReturnLocationMatches(PAGE.__world,location))return {confirmed:true};const runId=crypto.randomUUID();await ownerController.start('party',{runId,settings:target});return {started:true,runId,kind:'party'};},
+    returnFarmLocation:async(location,checkpoint)=>{if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId||checkpoint.context.characterId!==ownerId)throw new ControlError('identity_changed','返場角色或執行已更換');const target={action:'rendezvous',groupId:'farm-return',location:structuredClone(location),timeoutMs:300000};partyAdapter.validate(target);if(nativeReturnLocationMatches(PAGE.__world,location,{document,getWorld:()=>PAGE.__world}))return {confirmed:true};if(ownerController.active||ownerController.pending||ownerController.cleanup||ownerController.manualPause)throw new ControlError('task_busy','返場前仍有任務或未明操作');await acquireRoleLock(ownerId,ownerController);if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId||ownerController.active||ownerController.pending||ownerController.cleanup||ownerController.manualPause)throw new ControlError('task_busy','等待返場控制權期間已停止或角色改變');if(nativeReturnLocationMatches(PAGE.__world,location,{document,getWorld:()=>PAGE.__world}))return {confirmed:true};const runId=crypto.randomUUID();await ownerController.start('party',{runId,settings:target});return {started:true,runId,kind:'party'};},
     save:value=>store.write(ownerId,'settings',{...store.read(ownerId,'settings',{}),routineState:value}),restored:store.read(ownerId,'settings',{})?.routineState??null});
   const pending=farmAdapter.observe().pending;
   if(pending&&!controller.pending){controller.pending={...pending,characterId:roleId};controller.state='reconciling';controller.persist();}
@@ -13431,7 +13473,7 @@ function initializeRole() {
     if(command.type==='task.stop'){if(command.payload.manualAuto===true&&!controller.active?.context.settings.manualAuto&&!controller.cleanup?.context.settings.manualAuto)throw new ControlError('stale_run','AUTO停止指令不屬於目前執行');safePause?.cancel('核心停止取消暫停等待');coreReload?.cancel('核心停止取消重整');return await controller.stop(command.payload.reason||'核心停止',{manual:command.payload.reason==='manual'});}
     if(command.type==='task.pause'){if(coreReload?.job)throw new ControlError('reload_busy','重整已等待安全點');return safePause.requestCore(command);}
     if(command.type==='task.reconcile')return await controller.reconcile();
-    if(command.type==='task.resume'){assertSourcesReadable();await acquireRoleLock(ownerId,ownerController);try{if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId)throw new ControlError('identity_changed','接續控制權等待期間角色已更換');if(command.payload.returnLocation){const checkpoint=ownerController.checkpoint;if(!checkpoint||checkpoint.context.runId!==command.runId||checkpoint.context.characterId!==ownerId||!nativeReturnLocationMatches(PAGE.__world,command.payload.returnLocation))throw new ControlError('return_location_unconfirmed','原執行返場位置未由原生場景確認');checkpoint.returnLocationConfirmed=structuredClone(command.payload.returnLocation);ownerController.persist();}await ownerController.resume({manual:true});return {resumed:true};}catch(error){if(!ownerController.active&&!ownerController.cleanup)release();throw error;}}
+    if(command.type==='task.resume'){assertSourcesReadable();await acquireRoleLock(ownerId,ownerController);try{if(roleId!==ownerId||controller!==ownerController||identity().characterId!==ownerId)throw new ControlError('identity_changed','接續控制權等待期間角色已更換');if(command.payload.returnLocation){const checkpoint=ownerController.checkpoint;if(!checkpoint||checkpoint.context.runId!==command.runId||checkpoint.context.characterId!==ownerId||!nativeReturnLocationMatches(PAGE.__world,command.payload.returnLocation,{document,getWorld:()=>PAGE.__world}))throw new ControlError('return_location_unconfirmed','原執行返場位置未由原生場景確認');checkpoint.returnLocationConfirmed=structuredClone(command.payload.returnLocation);ownerController.persist();}await ownerController.resume({manual:true});return {resumed:true};}catch(error){if(!ownerController.active&&!ownerController.cleanup)release();throw error;}}
     if(command.type==='task.start' || command.type==='farm.service') {
       const kind=command.type==='farm.service'?'farm':command.payload.taskKind;
       if(!['farm','battle','daily','boss','dungeon','party'].includes(kind))throw new ControlError('unsupported_task','此任務尚未接入');
@@ -13466,7 +13508,7 @@ function snapshot() {
   const ownGarden=isNativeOwnHome(world,'player_home_garden');
   const daily=dailyAdapter?.observe();
   const connection=readNativeConnectionState({document,getWorld:()=>world});
-  const party=partyAdapter?.observe();return observeSnapshot(world,{controller,connection:connection.connected===true?'connected':connection.disconnected===true?'disconnected':'unknown',ownGarden,partyWait:controller?.active?.kind==='party'?{groupId:party.groupId}:null,daily:daily?{taskDay:daily.taskDay,status:daily.state,completedAt:daily.completedAt,evidenceSummary:Object.fromEntries(Object.entries(daily.tasks).map(([id,value])=>[id,{status:value.status,completedAt:value.completedAt??null}]))}:null,verification:readNativeSecurityVerification({document,getWorld:()=>world}),farmEnabled:controller?.active?.kind==='farm'});
+  const party=partyAdapter?.observe();return observeSnapshot(world,{controller,document,getWorld:()=>PAGE.__world,connection:connection.connected===true?'connected':connection.disconnected===true?'disconnected':'unknown',ownGarden,partyWait:controller?.active?.kind==='party'?{groupId:party.groupId}:null,daily:daily?{taskDay:daily.taskDay,status:daily.state,completedAt:daily.completedAt,evidenceSummary:Object.fromEntries(Object.entries(daily.tasks).map(([id,value])=>[id,{status:value.status,completedAt:value.completedAt??null}]))}:null,verification:readNativeSecurityVerification({document,getWorld:()=>world}),farmEnabled:controller?.active?.kind==='farm'});
 }
 function render() {
   if(roleId&&dungeonAdapter)syncDungeonRole();
@@ -13478,7 +13520,7 @@ function render() {
   if(autoIntent){const receipt=controller?.receipts.get(autoIntent.commandId);if(receipt&&['rejected','failed','uncertain'].includes(receipt.state)){notice='AUTO啟停失敗：'+(receipt.message||'執行尚未確認');autoIntent=null;}else if(autoIntent.roleId!==roleId||autoIntent.action==='start'&&manual||autoIntent.action==='stop'&&!manual&&!manualCleanup)autoIntent=null;else if(Date.now()-autoIntent.at>20000){notice='AUTO啟停尚未確認，請核對核心狀態';autoIntent=null;}}
   const autoReason=!controller?'等待角色載入':modeInitializing?'正在確認控制模式':controller.cleanup?'等待原執行收尾':controller.pending&&!manual?'等待未明操作核對':controller.active&&!manual?'其他任務執行中':coreTask&&!['stopped','completed','failed'].includes(coreTask.state)&&!manual?'核心流程執行或暫停中':safePause?.job||coreReload?.job?'等待安全交接':controller.mode==='managed'&&!core?.available?'核心不可用：'+(core?.message||core?.reason||'連線未就緒'):controller.mode==='managed'&&(!core?.registered||core.state!=='connected')?'等待核心連線':conflicts()?'偵測到舊助手操作衝突':'';
   status.textContent='角色：'+(s.identity.characterName||'等待載入')+'｜'+(controller?.mode==='managed'?'核心模式':'獨立模式')+'｜'+(manual?'AUTO中':controller?.active?({battle:'戰鬥中',daily:'每日中',farm:'種植中',boss:'野王中',dungeon:'副本中',party:routine?.state.phase==='farm-return'?'返場中':'隊伍處理中'}[controller.active.kind]):controller?.cleanup?(controller.manualPause?'人工停止・收尾中':'收尾中'):controller?.pending?(controller.manualPause?'人工停止・待核對':'待核對'):controller?.manualPause?'人工停止':'待命');
-  metrics.textContent=formatCompactAssistantMetrics({world:PAGE.__world,snapshot:s});
+  metrics.textContent=formatCompactAssistantMetrics({world:PAGE.__world,snapshot:s,document});
   const compactState=controller?.pending?'等待未明操作核對':coreTask?.state==='background-idle'?'等待下一次背景任務':source?.message??({idle:'待命',stopped:'已停止',paused:'已暫停',reconciling:'等待核對'}[controller?.state]??controller?.state??'待命');
   compactPanel.update({active:Boolean(controller?.active||controller?.cleanup||routine?.state.enabled||coreTaskActive||autoIntent),characterName:s.identity.characterName,plan:manual||manualCleanup?'AUTO':/^plan-[0-2]$/.test(coreTask?.planId??'')?'方案'+(Number(coreTask.planId.slice(5))+1):routine?.state.enabled&&routine.state.planLabel?routine.state.planLabel:PLAN_TASK_LABELS[controller?.active?.kind]??'單項任務',state:autoIntent?(autoIntent.action==='start'?'AUTO啟動中':'AUTO停止中'):compactState,autoLabel:autoIntent?(autoIntent.action==='start'?'啟動中':'停止中'):autoReason?'AUTO 不可用':manual?'AUTO ON':'AUTO OFF',autoDisabled:Boolean(autoReason||autoActionBusy||autoIntent),autoTitle:autoReason||(manual?'點擊停止目前AUTO':'點擊啟動目前地圖的助手技能攻擊')});
   message.textContent=[source?.message,source?.warning,notice,controller?.mode==='managed'&&!core?.available?'核心不可用：'+(core?.message||core?.reason||'連線未就緒'):'',conflicts()?'偵測到舊助手，阻止開始新任務':''].filter(Boolean).join('；');
@@ -13586,7 +13628,11 @@ async function runManualAuto(action,auto=null){
     if(c.mode==='managed'){
       const current=session,requestId=crypto.randomUUID();
       autoIntent={action,roleId:owner,at:Date.now(),requestId};render();
-      const response=await current.manualAuto(action,auto,{requestId});
+      const controlledTask=current.status().manualTask,runId=c.active?.context.runId;
+      // 安全暫停後由人工任務接續的AUTO，沿同一run的控制權停止。
+      const response=action==='stop'&&controlledTask?.taskKind==='battle'&&controlledTask.runId===runId
+        ?await current.manualTask({action:'stop',runId,requestId})
+        :await current.manualAuto(action,auto,{requestId});
       if(controller!==c||session!==current||roleId!==owner)return;
       if(autoIntent?.requestId===requestId)autoIntent.commandId=response.commandId;
       notice=action==='start'?'已請核心啟動目前地圖AUTO，等待原生確認':'已請核心停止AUTO，等待收尾確認';
