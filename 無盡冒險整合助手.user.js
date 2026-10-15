@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.96.5
+// @version      0.96.9
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -1116,8 +1116,8 @@ function createNativeFriendsFlow({api,context,day,verify,readFriends,readRecord,
   }
   async function resolve(name,refresh=false){
     verify();const friends=readFriends();
-    if(friends!==null&&!Array.isArray(friends))throw new Error('原生好友清單結構未確認');
-    const friend=friends&&match(friends,name,'friends');if(friend)return friend;
+    if(!Array.isArray(friends))throw new Error('原生好友清單尚未確認，未查人氣榜');
+    const friend=match(friends,name,'friends');if(friend)return friend;
     if(refresh||popularity===null){popularity=await api.readPopularity(context.characterId);verify();}
     if(!Array.isArray(popularity))throw new Error('原生人氣榜資料未確認');
     return match(popularity,name,'popularity');
@@ -2973,7 +2973,7 @@ function createDailyNativeActionsAdapter({host,page,document,getContext,getWorld
   const runGuildHunt=(id,reporting=false)=>withOperation('native-daily:',args=>tradeFlow(args).runHunt(id,reporting),{synchronizeWorld:synchronizeGuildWorld});
   const runGuildFacility=id=>withOperation('native-daily:',args=>tradeFlow(args).runFacility(id),{synchronizeWorld:synchronizeGuildWorld});
   const runGuildTravel=callbacks=>withOperation('native-daily:',args=>tradeFlow(args).runGuildTravel(callbacks),{allowRegionChange:true,synchronizeWorld:synchronizeGuildWorld});
-  const runKingdomOrders=config=>withOperation('native-daily:',args=>tradeFlow(args).runOrders(config));
+  const runKingdomOrders=config=>withOperation('native-daily:',args=>tradeFlow(args).runOrders(config),{synchronizeWorld:synchronizeGuildWorld});
   const homeFlow=({transport,journal,day,awaitNative})=>createNativeHomeFlow({...journal,day,getWorld,api:createNativeHomeTransport({transport}),view:createNativeHomeView({document:page.document??document,getWorld,characterId:journal.context.characterId,verify:journal.verify}),readPlotIds:readHomePlotIds,wait,awaitNative,beforeAction:beforeHomeAction,mutationId:()=>page.crypto.randomUUID()});
   const runHome=(action,options)=>withOperation('native-home:',args=>{const flow=homeFlow(args);return action==='enter'?flow.enterGarden(options):action==='leave'?flow.leaveHome(options?.phase):action==='supply'?flow.supply():flow.perform(action,options);},{allowRegionChange:true,allowInteractionLocked:true,synchronizeWorld:false});
   const channelFlow=journal=>createNativeChannelFlow({...journal,day:getDay(),getWorld,document:page.document??document,view:createNativeChannelView({document:page.document??document,verify:journal.verify,requestMap})});
@@ -7167,7 +7167,7 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
   function currentFriendTargets() {
     const actual=readCurrentRole();
     if(!actual||actual!==role)throw new RunCancelled();
-    return FRIEND_TARGETS.includes(actual)?FRIEND_TARGETS.filter(name=>name!==actual):[];
+    return FRIEND_TARGETS.filter(name=>name!==actual);
   }
   function syncCurrentRole() {
     if(runtime.running||cleanupPromise)return;
@@ -7772,10 +7772,107 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
     return clickAt(rect.left + rect.width * 0.25, rect.top + rect.height * 0.19, '世界分頁（地圖視窗座標備援）');
   }
 
+  const TRAVEL_DESTINATIONS=['王都聖輝城','幽冥之城','安珀蕾花蜜王庭','薇拉希絲樹冠王城','卡德雷斯王城'];
+  // 狩獵設定與傳送身份核對共用同一地圖清單；在建置模組初始化完成後才取值。
+  function travelDestinations(){return [...new Set([...TRAVEL_DESTINATIONS,...HUNTING_MAPS.map(map=>map.name)])];}
   function exactTravelArrival(destination){
-    const world=PAGE_WINDOW.__world;
-    return world?.charId===integratedContext?.characterId&&world?.player?.name===role&&nativeDestinationMatches(world,destination);
+    const banner=document.querySelector('.mm-banner-name');
+    const w=PAGE_WINDOW.__world,known={'王都聖輝城':'holy_city','安珀蕾花蜜王庭':'kingdom_freya','薇拉希絲樹冠王城':'kingdom_silvana','卡德雷斯王城':'kingdom_ogron'};
+    return Boolean(w?.player?.name===role&&w.mode!=='dungeon'&&typeof w.regionId==='string'&&(!known[destination]||w.regionId===known[destination])&&banner&&isVisible(banner)&&normalize(controlText(banner))===normalize(destination));
   }
+  function travelFee(button){
+    const label=labelOf(button);if(label==='免費前往')return {currency:'免費',amount:0};
+    if(label==='前往'){
+      // 舊版已支援的原生銀幣入口；費用可能在目的地詳情而非按鈕內。
+      for(let card=button.parentElement,depth=0;card&&depth<4;card=card.parentElement,depth++){
+        const text=controlText(card);if(/鑽石|鑽幣|付款|儲值/.test(text))return null;
+        const fee=text.match(/(?:費用|消耗|花費|傳送費)[：:\s]*([\d,]+)\s*銀幣|銀幣[：:\s]*([\d,]+)\s*(?:前往|傳送)/);
+        if(fee)return {currency:'銀幣',amount:Number((fee[1]||fee[2]).replaceAll(',',''))};
+        if(travelDestinations().some(name=>text.includes(name)))return {currency:'銀幣',amount:null,native:true};
+      }
+      return null;
+    }
+    const match=label.match(/^前往\s*[（(]\s*([\d,]+)\s*銀幣\s*[）)]$/);if(!match)return null;
+    const amount=Number(match[1].replaceAll(',',''));return Number.isSafeInteger(amount)&&amount>=0?{currency:'銀幣',amount}:null;
+  }
+  function availableTravelSilver(){
+    const values=[...document.querySelectorAll('span,strong,p,div')].filter(isVisible).flatMap(el=>[labelOf(el),el.getAttribute('title'),el.getAttribute('aria-label')]).map(text=>String(text||'').match(/^銀幣\s*[:：]?\s*([\d,]+)$/)).filter(Boolean).map(m=>Number(m[1].replaceAll(',','')));
+    const unique=[...new Set(values)].filter(Number.isSafeInteger);return unique.length===1?unique[0]:null;
+  }
+  function destinationTravelButton(destination) {
+    if(!travelDestinations().includes(destination))return null;
+    const matches=[];
+    for(const button of usableElements().filter(el=>travelFee(el)&&enabled(el))){
+      for(let card=button.parentElement,depth=0;card&&depth<8;depth++,card=card.parentElement){
+        // 目的地與費用的唯一性才是身份證據；大型地圖詳情區仍可合法傳送。
+        const labels=[card,...card.querySelectorAll('*')].map(el=>normalize(el.getAttribute('title')||labelOf(el)));
+        const destinations=travelDestinations().filter(name=>labels.includes(normalize(name)));
+        const buttons=[...card.querySelectorAll('button,[role="button"],a')].filter(el=>travelFee(el)&&enabled(el));
+        if(destinations.length===1&&destinations[0]===destination&&buttons.length===1&&buttons[0]===button){matches.push(button);break;}
+      }
+    }
+    return matches.length===1?matches[0]:null;
+  }
+  function permittedTravel(button){
+    const w=PAGE_WINDOW.__world,fee=travelFee(button);
+    if(!enabled(button)||!fee||!w?.player||w.player.name!==role||w.dead||!Number.isFinite(w.player.hp)||w.player.hp<=0||w.mode==='dungeon'||typeof w.isWorldInteractionLocked!=='function'||w.isWorldInteractionLocked())return false;
+    if(fee.currency==='免費')return true;
+    // 傳送可使用原生銀幣費用；免費偏好不再阻擋使用者允許的付費傳送。
+    if(fee.native&&fee.amount===null)return true; // 沿用原生銀幣前往，由遊戲核對實際費用。
+    const silver=availableTravelSilver();return silver!==null&&silver>=fee.amount;
+  }
+  function settleTravelPending(){
+    const pending=dayState.travelPending;if(!pending||pending.kind==='native-map-travel')return;
+    if(exactTravelArrival(pending.destination)){
+      dayState.travelHistory ||= [];dayState.travelHistory.push({...pending,state:'arrived',confirmedAt:now()});delete dayState.travelPending;persist();
+    }
+  }
+  function travelFailure(destination,detail){
+    if(dayState.travelPending)dayState.travelPending.error=detail;
+    if(currentTask())saveStep('傳送：'+destination,'warn',detail+'；本次等待已逾時，依賴此傳送的工作跳過，下次執行仍可重試');persist();
+  }
+
+  function clickDestinationMarker(destination,mapWindow){
+    if(!mapWindow)return false;
+    const pins=[...mapWindow.querySelectorAll('.illustrated-world-map__pin[title]')].filter(el=>normalize(el.getAttribute('title'))===normalize(destination)&&enabled(el));
+    return pins.length===1&&dispatchSingleClick(pins[0],destination+'地圖標記');
+  }
+
+  function ensureTravel(destination) {
+    requireRunOwner();
+    if(dayState.travelPending?.kind==='native-map-travel'){runtime.message='舊整合傳送未確認，保留紀錄待唯讀核對，不使用原入口重送';return false;}
+    settleTravelPending();
+    const pending=dayState.travelPending;
+    if(pending){
+      const w=PAGE_WINDOW.__world,s=huntWorldState();
+      const retryReady=pending.role===role&&Number.isFinite(pending.sentAt)&&now()-pending.sentAt>=10000&&w?.player?.name===role&&!w.dead&&Number(w.player.hp)>0&&w.mode!=='dungeon'&&s.locked===false&&!s.syncing&&!s.toast&&!s.resourceBlocked&&(s.authoritative===true||s.localWorld);
+      if(!retryReady){runtime.message=`等待傳送至${pending.destination}的回應；世界就緒且十秒未抵達後重試`;return false;}
+      // 使用者允許低額傳送重試：保存前次紀錄，重新核對當前目的地與費用。
+      dayState.travelHistory ||= [];dayState.travelHistory.push({...pending,state:'retry-approved',retryDestination:destination,confirmedAt:now(),detail:'十秒未確認抵達，依使用者授權允許重新傳送'});
+      if(dayState.travelHistory.length>30)dayState.travelHistory.splice(0,dayState.travelHistory.length-30);
+      delete dayState.travelPending;persist();
+    }
+    if(exactTravelArrival(destination)){
+      if(currentMapWindow()){pressEscape();return false;}return true;
+    }
+    const text=pageText(),mapWindow=currentMapWindow();
+    if(!mapWindow){pressMap();return false;}
+    if(!isWorldMap(text)){clickWorldTab();return false;}
+    const button=destinationTravelButton(destination);
+    if(button){
+      if(now()<runtime.nextActionAt||now()-lastActionAt<actionDelay('前往'))return false;
+      // Target, price and resource conditions are re-read at the actual dispatch boundary.
+      const fresh=destinationTravelButton(destination);if(fresh!==button||!permittedTravel(fresh)){runtime.message='傳送目的地／費用／資源條件不足，未送出';return false;}
+      requireRunOwner();const fee=travelFee(fresh);
+      dayState.travelPending={state:'pending',destination,fee,role,fromRegionId:PAGE_WINDOW.__world.regionId,sentAt:now()};
+      if(!persist())throw new Error('傳送pending無法保存，未送出');
+      if(!dispatchSingleClick(fresh,`${destination}－前往`)){delete dayState.travelPending;persist();}
+      return false;
+    }
+    if(clickDestinationMarker(destination,mapWindow))runtime.message=`已選擇${destination}，等待唯一目的地與費用確認`;
+    return false;
+  }
+
   function saveNativeTravel(record,history,verify){
     verify();const previous=dayState.travelPending,oldHistory=dayState.travelHistory;
     if(record)dayState.travelPending=record;else delete dayState.travelPending;
@@ -7783,14 +7880,6 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
     try{if(record)syncIntegratedPending();if(!persist(verify))throw new Error('原生傳送紀錄未保存，未送出');}
     catch(error){if(record)dayState.travelPending=record;else if(previous)dayState.travelPending=previous;else delete dayState.travelPending;if(oldHistory)dayState.travelHistory=oldHistory;else delete dayState.travelHistory;throw error;}
     finally{syncIntegratedPending();}
-  }
-  async function settleTravelPending(){if(dayState.travelPending)await nativeActions.reconcileTravel();}
-  function travelFailure(destination,detail){
-    if(dayState.travelPending)dayState.travelPending.error=detail;
-    if(currentTask())saveStep('傳送：'+destination,'warn',detail+'；等待原生傳送核對');persist();
-  }
-  async function ensureTravel(destination){
-    requireRunOwner();const result=await nativeActions.runTravel(destination);runtime.message=result.message;return result.state==='arrived';
   }
 
   function startTaskIfNeeded() {
@@ -7815,14 +7904,152 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
   }
 
   async function handleFriends(){
-    const targets=currentFriendTargets();if(!targets.length){finishTask('略過','目前角色不在固定互讚白名單');return;}
+    const targets=currentFriendTargets();
     if(nativeActions.readFriends()===null){
-      if(!runtime.counters.nativeFriendsOpenAt){runtime.counters.nativeFriendsOpenAt=now();if(!nativeFriendsMenu.open())nativeFriendsMenu.prepare();runtime.message='等待原生好友清單；找不到角色時改查人氣榜';updatePanel();return;}
-      if(now()-runtime.counters.nativeFriendsOpenAt<2500)return;
+      if(!runtime.counters.nativeFriendsOpenAt){runtime.counters.nativeFriendsOpenAt=now();if(!nativeFriendsMenu.open())nativeFriendsMenu.prepare();runtime.message='先等待好友清單讀取，再查找固定目標';updatePanel();return;}
+      if(now()-runtime.counters.nativeFriendsOpenAt<8000){runtime.message='等待好友清單讀取，尚未查人氣榜';updatePanel();return;}
+      finishTask('警示','好友清單尚未完成讀取，未查人氣榜或送出讚賞');return;
     }
     const describe=result=>'新讚 '+result.praised+'、今日已讚 '+result.alreadyPraised+'、人氣榜找到 '+result.fromPopularity+(result.missing.length?'、未找到 '+result.missing.join('、'):'');
     const result=await nativeOperationStep('白名單互讚',()=>nativeActions.runFriends(targets),describe);
     if(runtime.running)finishTask(result?.confirmed?'完成':'警示',result?describe(result):runtime.warning);
+  }
+
+  function currentGuildWindow() {
+    const nav=visible('nav[aria-label="公會功能"]')[0];
+    return nav?.closest('.window-guild, .window, [role="dialog"]') || null;
+  }
+
+  function guildInterfaceVisible(text) {
+    if (currentGuildWindow()) return true;
+    if (!/公會\s*GUILD/i.test(text)) return false;
+    if (smallestTextElement((label) => /^公會\s*GUILD(?:\s|$)/i.test(label))) return true;
+    const visibleTabs = usableElements().filter((element) =>
+      ['總部', '任務', '王國', '金庫', '研習', '兌換', '建設', '名冊', '戰報'].includes(labelOf(element))).length;
+    return visibleTabs >= 3;
+  }
+
+  function clickGuildExact(...labels) {
+    const guild = currentGuildWindow();
+    if (!guild) return false;
+    const wanted = new Set(labels.map(normalize));
+    return dispatchClick(findClickable((label) => wanted.has(label), guild), labels[0]);
+  }
+
+  function guildEnterButton() {
+    const guild=currentGuildWindow();
+    return scopedButton(guild,/^進入公會領地$/) || textCard(guild,/公會領地/,el=>Boolean(scopedButton(el,'進入')))?.querySelector('button');
+  }
+
+  function clickGuildEnter() {
+    return dispatchClick(guildEnterButton(),'進入公會領地');
+  }
+
+  function guildManagementTabs() {
+    const guild = currentGuildWindow();
+    if (!guild) return null;
+    const task = smallestTextElement((label) => label === '任務', guild);
+    for (let element = task, depth = 0; element && depth < 7 && guild.contains(element); depth += 1, element = element.parentElement) {
+      const label = labelOf(element);
+      const rect = element.getBoundingClientRect();
+      if (label.includes('總部') && label.includes('任務') && label.includes('王國') && label.includes('金庫') &&
+          rect.width > innerWidth * 0.45 && rect.height < 130) return element;
+    }
+    return null;
+  }
+
+  function clickGuildTab(label) {
+    const tabs = guildManagementTabs();
+    if (!tabs) return false;
+    return dispatchClick(findClickable((text) => text === label, tabs), `公會頁簽「${label}」`);
+  }
+
+  function readGuildName() {
+    const guild = currentGuildWindow();
+    if (!guild) return runtime.counters.guildName || '';
+    const banner = smallestTextElement((label) => /^\[[^\]]+\]\s*[^\s]+/.test(label), guild);
+    const match = labelOf(banner).match(/^\[([^\]]+)\]\s*([^\s]+)/);
+    const selectedGuild = match?.[1] || '';
+    if (selectedGuild) {
+      runtime.counters.guildName = selectedGuild;
+      runtime.counters.guildMapPrefix = `[${selectedGuild}]`;
+    }
+    return runtime.counters.guildName || '';
+  }
+
+  function minimapShowsGuildPrefix(prefix) {
+    if (!prefix) return false;
+    return [...document.querySelectorAll('span, div, p, strong, b')].some((element) => {
+      if (!isVisible(element) || !labelOf(element).startsWith(prefix)) return false;
+      const rect = element.getBoundingClientRect();
+      return rect.left >= innerWidth * 0.58 && rect.top <= innerHeight * 0.3 &&
+        rect.width >= 70 && rect.width <= 460 && rect.height <= 100;
+    });
+  }
+
+  function guildTaskCard(taskName) {
+    const root=currentGuildWindow();if(!root)return null;
+    const names=['邊境狩獵 I','邊境狩獵 II','邊境狩獵 III'];
+    const matchName=text=>names.find(name=>new RegExp('^'+name.replace(/ /g,'\\s*')+'(?:\\s|巡邏|長線|大清剿|$)').test(text));
+    const leaves=[...root.querySelectorAll('h2,h3,h4,strong,span,div,p')].filter(el=>rendered(el) && matchName(controlText(el))===taskName).sort((a,b)=>controlText(a).length-controlText(b).length);
+    for(const leaf of leaves){
+      for(let card=leaf;card && card!==root;card=card.parentElement){
+        const actions=[...card.querySelectorAll('button')].filter(el=>/^(?:接取(?:任務)?|已接取|進行中|回報|已回報|已領取)$/.test(labelOf(el)));
+        const titles=new Set([...card.querySelectorAll('h2,h3,h4,strong,span,div,p')].map(el=>matchName(controlText(el))).filter(Boolean));
+        if(actions.length>1 || titles.size>1)break;
+        if(actions.length===1)return card;
+      }
+    }
+    return null;
+  }
+
+  function currentDonationDialog() {
+    return textCard(document,'金庫捐獻',el=>Boolean(scopedButton(el,'關閉',true)) &&
+      Boolean(el.querySelector('input[type="number"]') || scopedButton(el,/^已達上限$/,true)));
+  }
+
+  function donationRow(resourceName) {
+    return textCard(currentDonationDialog(),resourceName,el=>
+      el.querySelectorAll('input[type="number"]').length === 1 && /持有/.test(controlText(el)));
+  }
+
+  function scrollDonationToBottom() {
+    const dialog = currentDonationDialog();
+    if (!dialog) return false;
+    const scrollers = [dialog, ...dialog.querySelectorAll('*')]
+      .filter((element) => element.scrollHeight > element.clientHeight + 40);
+    for (const element of scrollers) {
+      element.scrollTop = element.scrollHeight;
+      element.dispatchEvent(new PAGE_WINDOW.Event('scroll', { bubbles: true }));
+    }
+    return true;
+  }
+
+  function scrollDonationToTop() {
+    const dialog = currentDonationDialog();
+    if (!dialog) return false;
+    for (const element of [dialog, ...dialog.querySelectorAll('*')].filter((item) => item.scrollHeight > item.clientHeight + 40)) {
+      element.scrollTop = 0;
+      element.dispatchEvent(new PAGE_WINDOW.Event('scroll', { bubbles: true }));
+    }
+    return true;
+  }
+
+  function donationCompleted(resourceName) {
+    const row=donationRow(resourceName);
+    const text=controlText(row);
+    const m=text.replace(/,/g,'').match(/今日\s*(\d+)\s*\/\s*(\d+)/);
+    // 完成列會排序到清單底部；只核對同品項進度，不把缺料／送出中的禁用當完成。
+    return Boolean(m && Number(m[2])>0 && Number(m[1])===Number(m[2]));
+  }
+
+  function inGuildTerritory(text) {
+    const guildName = runtime.counters.guildName || '';
+    const guildMapPrefix = runtime.counters.guildMapPrefix || (guildName ? `[${guildName}]` : '');
+    if (minimapShowsGuildPrefix(guildMapPrefix)) return true;
+    if (atLocation('公會領地')) return true;
+    const markers = ['資源管理米拉', '名冊員莉雅', '公會公告', '裝飾工坊'];
+    return markers.filter((marker) => text.includes(marker)).length >= 2;
   }
 
   function currentQuestDialog() {
@@ -7832,6 +8059,29 @@ let integratedContext=null,integratedCleanup=false,integratedStarted=false,integ
       const label = labelOf(element);
       if (rect.width > 360 && rect.height > 130 && rect.width < innerWidth * 0.92 &&
           /(繼續|完成|跳過)/.test(label)) return element;
+    }
+    return null;
+  }
+
+  function currentVitalityDialog() {
+    const title = smallestTextElement((label) => label === '採集活力說明');
+    for (let element = title, depth = 0; element && depth < 8; depth += 1, element = element.parentElement) {
+      const label = labelOf(element);
+      const rect = element.getBoundingClientRect();
+      if (label.includes('補活力') && label.includes('關閉') && rect.width >= 280 && rect.width <= 650 && rect.height >= 220) return element;
+    }
+    return null;
+  }
+
+  function readAdventureActivity(text) {
+    const patterns = [
+      /今日累積活躍值\s*(\d+)\s*\/\s*100/,
+      /活躍寶箱\s*(\d+)\s*\/\s*100/,
+      /(\d+)\s*\/\s*100\s*活躍/
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) return Number(match[1]);
     }
     return null;
   }
@@ -7921,6 +8171,10 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
 // 建立世界資源接續 使用統一共用實作。
 
   const inspectWorldResources=建立世界資源接續();
+  function huntWorldPromptVisible(el){
+    for(let node=el;node?.nodeType===1;node=node.parentElement)if(!rendered(node))return false;
+    return Boolean(el);
+  }
   function huntWorldState(){
     const t=now();
     // 與狩獵循環共用排程；避免每次選技都掃描提示。
@@ -7929,8 +8183,8 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     const w=PAGE_WINDOW.__world;
     let locked=null;try{if(typeof w?.isWorldInteractionLocked==='function')locked=Boolean(w.isWorldInteractionLocked());}catch{}
     const toast=gatherSkillConnectionError();
-    const connection=readNativeConnectionState({document,getWorld:()=>PAGE_WINDOW.__world});
-    const syncing=connection.sync===true,connected=connection.connected===true;
+    const syncing=[...document.querySelectorAll('div,span,p')].some(el=>!el.closest('[id^="'+PREFIX+'"]')&&normalize(el.textContent)==='世界同步'&&huntWorldPromptVisible(el));
+    const connected=[...document.querySelectorAll('.cpm-wifi.ok[aria-label="連線正常"]')].some(huntWorldPromptVisible);
     const resources=inspectWorldResources({world:w,now:t,role,active:runtime.running||worldRecoveryBooting,authorize:()=>{requireRunOwner();return true;},locked,syncing,disconnected:Boolean(toast),connected,timeOrigin:PAGE_WINDOW.performance?.timeOrigin,history:dayState.huntWorldObservations||[]});
     const {authoritative,rawAuthoritative,localGuildWorld,localEscortWorld,localWorld,resourceRepaired,resourceBlocked}=resources;
     const blocked=locked===true||syncing||resourceBlocked;
@@ -7974,9 +8228,9 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     if(t-huntLastDodge<500)return 250;
     const health={now:w.player.hp,max:w.player.maxHp};
     if(huntTactics.evade({world:w,health,mode:'efficient',allowMovement:true}))return 150;
-    const slots=createNativeQuickItemsView({document,getWorld:()=>PAGE_WINDOW.__world}).skills();
-    if(!slots)throw new Error('原生技能綁定未確認，停止狩獵');
-    return huntTactics.tick({world:w,health,mode:'efficient',slots,pickupEnabled:true,evadeChecked:true,allowMovement:true})?100:250;
+    const slots=[...document.querySelectorAll('.skill-slot[data-drop-row="skills"]')].sort((a,b)=>Number(a.dataset.dropIdx)-Number(b.dataset.dropIdx));
+    if(slots.length<12)throw new Error('技能格資料不完整，停止狩獵');
+    return huntTactics.tick({world:w,health,mode:'efficient',slots:slots.map(el=>el.dataset.bindId).filter(Boolean),pickupEnabled:true,evadeChecked:true,allowMovement:true})?100:250;
   }
 
   const roleCoordinator=建立角色執行協調({locks:PAGE_WINDOW.navigator?.locks,storage:localStorage,token:PAGE_WINDOW.crypto?.randomUUID?.(),onLost:()=>{runtime.running=false;runtime.warning='瀏覽器執行鎖已失效，停止送出，保留交易紀錄';updatePanel();}});
@@ -8011,9 +8265,14 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     localStorage.setItem(key,text);
     if(localStorage.getItem(key)!==text||!setValue(key,record))throw new Error('討伐憑證每週紀錄保存失敗，停止售出');
   }
-  const HUNTS = nativeGuildHuntDefinitions.map(definition=>definition.name);
+  const HUNTS = ['邊境狩獵 I', '邊境狩獵 II', '邊境狩獵 III'];
   // 金庫已確認品名；2026-09-30 依使用者指定擴充，只固定品名，不固定角色庫存。
-  const DUNGEON_DONATION_NAMES = nativeGuildDungeonNames;
+  const DUNGEON_DONATION_NAMES = Object.freeze([
+    '霜息精華','霜結甲片','血絲腺','霜炎結晶','月光琉璃','霜獸皮',
+    '灼焰露','焰刃晶','星辰珍珠','焰月結晶','月光寶玉','焰絲布',
+    '深淵異藻','深淵骨片','時序珍珠','深淵時序晶核','時序晶','海冥皮膜',
+    '曙光麥穗','虛空之眼','虛空精糧','龍息精華','龍紋虛空結晶','龍脊骨','古龍鱗'
+  ]);
   const FACILITIES = [
     { name: '旗幟工坊', facilityId: 'banner_workshop', regionId: 'guild_territory' },
     { name: '公會熔爐', facilityId: 'guild_forge', regionId: 'guild_territory' },
@@ -8021,6 +8280,14 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   ];
 
   const safeVitalityCount=value=>Number.isInteger(Number(value))?Math.max(0,Math.min(3,Number(value))):0;
+  const SAFE_TOPUPS=[{currency:'銀幣',price:20000,amount:20},{currency:'銀幣',price:50000,amount:50},{currency:'金幣',price:50,amount:80}];
+  function safeTopupButton(root,used){
+    const expected=SAFE_TOPUPS[used];if(!expected)return null;
+    const found=[...root.querySelectorAll('button')].filter(button=>{
+      const m=labelOf(button).replace(/,/g,'').match(/^花\s*(\d+)\s*(銀幣|金幣)\s*補\s*\+(\d+)$/);
+      return m && m[2]===expected.currency && Number(m[1])===expected.price && Number(m[3])===expected.amount && enabled(button);
+    });return found.length===1?found[0]:null;
+  }
   let cleanupPromise=null;
   function ownActivity(kind,pending=false){
     requireRunOwner();const w=PAGE_WINDOW.__world;if(w?.player?.name!==role)throw new Error('缺少作業角色身份，未接管');
@@ -8052,7 +8319,14 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
           else if(w.autoBattle===true && typeof w.toggleAutoBattle==='function'){
             requireRunOwner();w.toggleAutoBattle();done=await boundedCleanupCheck(()=>ownedWorld(record)?.autoBattle===false && ownedWorld(record)?.autoBattlePendingAction!=='start');
           }
-        }else if(kind==='gathering'){done=await nativeActions.stopGather(integratedCleanup);
+        }else if(kind==='gathering'){
+          if(record.kind==='native-gathering'){done=await nativeActions.stopGather(integratedCleanup);}else{
+          let hud=document.querySelector('.auto-gather-hud');
+          if(!hud && record.startPending){await boundedCleanupCheck(()=>document.querySelector('.auto-gather-hud'));hud=document.querySelector('.auto-gather-hud');}
+          if(!current())return false;
+          if(!hud && !record.startPending)done=true;
+          else if(hud){const button=scopedButton(hud,/^停止$/);if(button && enabled(button)){requireRunOwner();button.click();done=await boundedCleanupCheck(()=>!document.querySelector('.auto-gather-hud'));}}
+          }
         }else if(kind==='npcMove'){done=npcMoveOwner.release('daily-npc-cleanup');
         }else if(kind==='bossMove'){
           const target=w.moveTarget;
@@ -8084,7 +8358,9 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     saveStep('採集物品紀錄','done','背包淨變化（含其他入袋／消耗／倉庫操作；不是採集總量）：'+JSON.stringify(changes));
     ledger()['採集物品紀錄'].changes=changes;persist();
   }
-  function gatheringIdentityMatches(status,option,material){void material;return status?.active===true&&status.itemId===nativeGatherTarget(option).itemId;}
+  function gatheringIdentityMatches(hud,option,material){
+    const text=controlText(hud);return Boolean(hud && text.includes(option.gatheringType) && text.includes(material) && new RegExp('(?:T|階級\\s*)'+option.gatheringTier+'(?:\\D|$)').test(text));
+  }
   let runEpoch = 0;
   const delay = ms => host.sleep(ms,integratedContext,{cleanup:integratedCleanup}).catch(()=>{throw new RunCancelled();});
   const controlText = root => normalize(root?.innerText || root?.textContent || '');
@@ -8275,9 +8551,22 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     await guard(epoch);
   }
 
+  async function closeDonation(epoch = runEpoch) {
+    await until(() => {
+      const dialog = currentDonationDialog();
+      if (!dialog) return true;
+      const close = scopedButton(dialog, '關閉');
+      close?.scrollIntoView?.({block:'nearest',inline:'nearest'});
+      return enabled(close) && dispatchClick(close, '關閉金庫捐獻');
+    }, '金庫捐獻關閉鈕尚不可用', 5000, epoch);
+    await until(() => !currentDonationDialog(), '等待金庫捐獻關閉', 5000, epoch);
+  }
+
   async function closeWindows(epoch = runEpoch) {
     for (let i = 0; i < 8; i++) {
       await guard(epoch);
+      const donation=currentDonationDialog();
+      if(donation){await closeDonation(epoch);continue;}
       const windows = visible('.window, [role="dialog"], .quest-dialog-modal-sheet, .game-confirm-overlay, .home-social-window-backdrop');
       if (!windows.length) return;
       // 活力視窗需使用關閉鈕；不點任何確認交易或未完成副本的放棄鈕。
@@ -8301,7 +8590,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       saveStep(key, 'done', result || '已確認');
       return true;
     } catch (error) {
-      if ((error instanceof RunCancelled||isNativeRateLimit(error)) || error instanceof NativeTradePrivilegeExpired) throw error;
+      if ((error instanceof RunCancelled||isNativeRateLimit(error)) || error instanceof NativeTradePrivilegeExpired || error instanceof RemotePrivilegeExpired) throw error;
       await cleanupOwnedActivities(key+'失敗');
       if(currentTask()?.id==='gathering')finishGatherNet();
       if(nativeActions.hasSecurityChallenge())blockScene('安全驗證未解除；保留現場，其餘操作項目阻擋');
@@ -8329,7 +8618,8 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   }
 
   async function travelTo(destination) {
-    try{await until(() => ensureTravel(destination), `無法抵達${destination}；已按十秒間隔重試，請核對傳送狀態`,90000);}catch(error){if(!((error instanceof RunCancelled||isNativeRateLimit(error))))travelFailure(destination,error.message);throw error;}
+    await closeWindows();
+    try{await until(() => ensureTravel(destination), `無法抵達${destination}；已按十秒間隔重試，請核對傳送狀態`,90000);}catch(error){if(!(error instanceof RunCancelled))travelFailure(destination,error.message);throw error;}
     if(ledger()['傳送：'+destination]?.state==='warn')saveStep('傳送：'+destination,'done','補跑已確認抵達'+destination+'；先前傳送警示已排除');
   }
 
@@ -8339,11 +8629,17 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     readRecord:()=>dayState.operations?.npcMove??null,
     writeRecord:record=>{requireRunOwner();dayState.operations||={};if(record)dayState.operations.npcMove={role,...record};else delete dayState.operations.npcMove;if(!Object.keys(dayState.operations).length)delete dayState.operations;if(!persist())throw new Error('NPC移動紀錄未保存');syncIntegratedPending();}
   });
+  let activeFacilityTransaction=null;
   const nativeNavigator = 建立原生物件尋路器({move:npcMoveOwner.move,
     verify:world=>{requireRunOwner();if(world!==PAGE_WINDOW.__world||world.charId!==integratedContext?.characterId)throw new RunCancelled();},
     getWorld: () => PAGE_WINDOW.__world,
-    getRenderer:()=>PAGE_WINDOW.__renderer,
-    interactForge: (forge,world)=>{const renderer=PAGE_WINDOW.__renderer;requireRunOwner();if(world!==PAGE_WINDOW.__world||world.region?.workshop?.forge!==forge||renderer?.world!==world||typeof renderer.onForgeClick!=='function')return false;renderer.onForgeClick(forge);requireRunOwner();return true;},
+    getRenderer:()=>{
+      const renderer=PAGE_WINDOW.__renderer;if(!activeFacilityTransaction||typeof renderer?.onGuildFacilityClick!=='function')return renderer;
+      return {onGuildFacilityClick:object=>{requireRunOwner();const transaction=activeFacilityTransaction;if(object.facilityId!==transaction.facilityId)throw new Error('領地設施identity改變，未互動');
+        if(transaction.reconcile){if(transaction.opened)return;transaction.opened=true;renderer.onGuildFacilityClick.call(renderer,object);return;}
+        if(ledger()[transaction.key]?.state==='pending')throw new Error('領地前次互動未明，不重送');saveStep(transaction.key,'pending',transaction.facilityId+'；已送出原生設施互動，等待結果');renderer.onGuildFacilityClick.call(renderer,object);}};
+    },
+    interactForge: (_forge, world) => Boolean(world.nearestInteract?.forgeId) && pressSpace(),
     readHud: () => readPlayerCoordinate(), radius: 200
   });
 
@@ -8358,22 +8654,308 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     return panel(expected);
   }
 
-  async function guildHunt(name,reporting=false){
-    const id=nativeGuildHuntId(name);
-    if(!id)throw new Error('未核准的原生狩獵任務');
-    const result=await nativeActions.runGuildHunt(id,reporting);
-    if(!result.confirmed)throw new Error('原生狩獵任務尚未達回報條件');
-    return result.quest.claimed?'今日已回報':'已接取';
+  async function guildPage(tab) {
+    if (currentDonationDialog()) {
+      await closeDonation();
+    }
+    let guild = currentGuildWindow();
+    if (!guild) {
+      await openPanel(/^公會$/, /^公會\s*GUILD/, {code:'KeyG',key:'g',label:'G'});
+      guild = await until(currentGuildWindow, '等待公會功能導覽列');
+    }
+    const nav = guild.querySelector('nav[aria-label="公會功能"]') || guild;
+    const button = scopedButton(nav, tab);
+    if (!button) throw new Error(`公會找不到${tab}頁籤`);
+    if (button.getAttribute('aria-current') !== 'page') await tap(button, `公會${tab}`);
+    await until(() => scopedButton(currentGuildWindow()?.querySelector('nav[aria-label="公會功能"]'), tab)?.getAttribute('aria-current') === 'page', `等待公會${tab}頁籤載入`);
+    return currentGuildWindow();
   }
-  async function handleGuild(){
-    const options=userOptions();
-    const config=()=>({includeDungeon:options.guildDungeonDonation,useWarehouse:options.legendary&&runtime.effectiveLegendary!==false&&PAGE_WINDOW.__world?.player?.legendaryActive===true});
-    const result=await nativeOperationStep('公會簽到',()=>nativeActions.runGuild({...config(),stage:'sign-in'}),result=>'簽到 '+result.signedIn+(result.warnings.length?'；'+result.warnings.join('；'):''));
-    if(result?.skipped){finishTask('略過',result.reason);return;}
-    for(const name of HUNTS)if(runtime.running)await nativeOperationStep('接取'+name,()=>nativeActions.runGuildHunt(nativeGuildHuntId(name)),result=>result.quest.claimed?'今日已回報':'已接取');
-    if(runtime.running)await nativeOperationStep('公會捐獻',()=>nativeActions.runGuild({...config(),stage:'donations'}),result=>'支援投入 '+result.supported+'、金庫投入 '+result.donated+(result.warnings.length?'；'+result.warnings.join('；'):''));
-    for(const facility of FACILITIES)if(runtime.running)await nativeOperationStep('領地'+facility.name,()=>interactTerritoryFacility(facility),result=>result.confirmed?'原生同設施今日互動已確認':'原生設施互動尚未確認');
-    if(runtime.running)finishRecipe();
+
+  async function guildHunt(name, reporting = false) {
+    await guildPage('任務');
+    const huntTab=scopedButton(currentGuildWindow(),'邊境狩獵');
+    if(huntTab)await tap(huntTab,'邊境狩獵');
+    const get = () => guildTaskCard(name);
+    await until(get, `找不到${name}`);
+    let text = controlText(get());
+    const sync=syncedHunt(name);
+    if(sync){const shown=text.replace(/,/g,'').match(/(\d+)\s*\/\s*(\d+)/);if(shown && Number(shown[2])!==sync.target)throw new Error('狩獵目標與同步資料不符');}
+    if (sync?.claimed || /已回報|已領取/.test(text)) {
+      if(ledger()[`狩獵接取:${name}`]?.state==='pending')saveStep(`狩獵接取:${name}`,'done','重開確認今日已回報，接取已對帳');
+      if(ledger()[`狩獵回報:${name}`]?.state==='pending')saveStep(`狩獵回報:${name}`,'done','重開確認今日已回報');
+      return '今日已回報';
+    }
+    const report = scopedButton(get(), /^回報$/);
+    if(report && ledger()[`狩獵接取:${name}`]?.state==='pending')saveStep(`狩獵接取:${name}`,'done','獨立卡片已可回報，接取已對帳');
+    if (report) {
+      const key=`狩獵回報:${name}`;
+      if(ledger()[key]?.state==='pending')throw new Error(`${name}前次回報未確認，不重送`);
+      const before=controlText(get());
+      saveStep(key,'pending',before);
+      await tapSingleClick(report, `回報${name}`);
+      await until(() => /已回報|已領取/.test(controlText(get())), `無法確認${name}回報`);
+      saveStep(key,'done',`已回報；任務與獎勵：${before}`);
+      return '已回報';
+    }
+    if (reporting) throw new Error(`${name}尚不可回報：${text}`);
+    if(/已接取|進行中/.test(text)){if(ledger()[`狩獵接取:${name}`]?.state==='pending')saveStep(`狩獵接取:${name}`,'done','重開獨立卡片確認已接取');return '已接取';}
+    const key=`狩獵接取:${name}`;
+    if(ledger()[key]?.state==='pending')throw new Error(`${name}接取結果未明；已重查卡片，不重送`);
+    saveStep(key,'pending','等待獨立狩獵卡片確認');
+    await tapSingleClick(() => scopedButton(get(), /^接取(?:任務)?$/), `接取${name}`);
+    await until(() => /已接取|進行中|回報/.test(controlText(get())), `無法確認${name}已接取`);
+    saveStep(key,'done','已接取進行中');
+    return '已接取';
+  }
+
+  function parseDonation(text, input) {
+    const raw = text.replace(/,/g,'');
+    const match = raw.match(/持有\s*(\d+)\s*[·・]?\s*今日\s*(\d+)\s*\/\s*(\d+)\s*[·・]?\s*每\s*(\d+)/);
+    if (!match || !input || input.max === '') return null;
+    const [held, used, limit, unit] = match.slice(1).map(Number);
+    const maximum = Number(input.max), quantity = Number(input.value);
+    if (![held, used, limit, unit, maximum, quantity].every(Number.isSafeInteger) || unit <= 0 || limit <= 0 || limit < used || maximum < 0) return null;
+    const planned = Math.floor(Math.min(held, (limit-used)*unit, maximum) / unit) * unit;
+    return { held, used, limit, unit, maximum, quantity, planned };
+  }
+
+  function dungeonDonationAllowed(data) {
+    return Boolean(data && data.planned > 0 && data.held > 10 * data.planned);
+  }
+
+  async function treasuryOpen() {
+    if (currentDonationDialog()) return currentDonationDialog();
+    await guildPage('金庫');
+    if (!currentDonationDialog()) await tap(() => scopedButton(currentGuildWindow(), '捐獻'), '金庫捐獻');
+    return until(currentDonationDialog, '等待金庫捐獻');
+  }
+
+  async function donateItem(name, dungeon) {
+    if (dungeon ? !DUNGEON_DONATION_NAMES.includes(name) : !['銀幣','金幣'].includes(name))
+      throw new Error(`金庫禁止投入未核准品項：${name}`);
+    await treasuryOpen();
+    const get = () => donationRow(name);
+    const key = `捐獻交易:${name}`;
+    if (donationCompleted(name)) {
+      if(ledger()[key]?.state==='pending')saveStep(key,'done','重開後確認今日已達上限');
+      return '今日已達上限';
+    }
+    const row = await until(get, `找不到${name}捐獻列`);
+    let data = parseDonation(controlText(row), row.querySelector('input[type="number"]'));
+    if (!data) throw new Error('持有／今日／每份／輸入上限資料不完整');
+    if (data.used === data.limit) return '今日已達上限';
+    if (data.planned <= 0) throw new Error('持有量不足，未投入');
+    if (dungeon && !dungeonDonationAllowed(data)) return `保留庫存：${data.held} ≤ ${10*data.planned}`;
+    const pending = ledger()[key];
+    if (pending?.state === 'pending') {
+      if (!Number.isSafeInteger(pending.used) || pending.used<0 || !Number.isSafeInteger(pending.quantity) || pending.quantity<=0 ||
+          pending.quantity%data.unit || (pending.role && pending.role!==role) ||
+          (pending.day && pending.day!==dayState.day) || (pending.charId && pending.charId!==PAGE_WINDOW.__world?.charId))
+        throw new Error('前次投入資料或角色不符，保留未明交易');
+      const expected=pending.used+pending.quantity/data.unit;
+      if(expected>data.limit)throw new Error('前次投入份數超出今日上限，保留未明交易');
+      if (data.used>=expected) {
+        saveStep(key,'done','重查同品項今日份數，前次投入已確認');
+      } else {
+        if (!(runtime.mode==='single'||runtime.rerunAll) || !Number.isFinite(pending.at) || now()-pending.at<30000)
+          throw new Error('前次投入仍待確認；請稍後按公會補跑重新核對');
+        // 明確補跑才重開整個公會，以新載入的獨立品項列核對，不沿用舊捐獻視窗。
+        await closeWindows();
+        await treasuryOpen();
+        if (donationCompleted(name)) { saveStep(key,'done','重開公會確認今日已達上限'); return '今日已達上限'; }
+        const reopened=await until(()=>{
+          const current=get();
+          return parseDonation(controlText(current),current?.querySelector('input[type="number"]'));
+        },`重開後無法讀取${name}今日投入`);
+        await delay(ACTION_DELAYS.afterClick);
+        await guard(runEpoch);
+        const checked=parseDonation(controlText(get()),get()?.querySelector('input[type="number"]'));
+        if (donationCompleted(name)) { saveStep(key,'done','重開公會確認今日已達上限'); return '今日已達上限'; }
+        if (checked && checked.used>=expected) {
+          saveStep(key,'done','重開公會確認前次投入份數');data=checked;
+        } else {
+          if (!checked || reopened.used!==pending.used || checked.used!==pending.used ||
+              reopened.limit!==data.limit || checked.limit!==data.limit || reopened.unit!==data.unit || checked.unit!==data.unit ||
+              checked.planned<=0 || !enabled(get()?.querySelector('input[type="number"]')) || !scopedButton(get(),'投入'))
+            throw new Error('重開後投入狀態仍不明或尚不可投入，保留交易，不重送');
+          saveStep(key,'retry-approved',`重開公會兩次讀取確認今日仍${checked.used}/${checked.limit}，允許本次補捐`);
+          data=checked;
+        }
+      }
+    }
+    await tap(() => scopedButton(get(), /^最大\s*[\d,]+$/), `${name}最大可投入量`);
+    const fresh = parseDonation(controlText(get()), get()?.querySelector('input[type="number"]'));
+    if (!fresh || fresh.quantity !== fresh.planned || fresh.quantity !== data.planned ||
+        fresh.used!==data.used || fresh.limit!==data.limit || fresh.unit!==data.unit ||
+        (dungeon && !dungeonDonationAllowed(fresh))) throw new Error('投入前數量或庫存改變，停止本筆');
+    ledger()[key] = { ...ledger()[key], state:'pending', detail:`待確認投入 ${fresh.quantity}`, used:fresh.used, quantity:fresh.quantity,
+      role,day:dayState.day,charId:PAGE_WINDOW.__world?.charId,at:now() }; persist();
+    await tapSingleClick(() => scopedButton(get(), '投入'), `投入${name} ${fresh.quantity}`);
+    await until(() => donationCompleted(name) || (() => {
+      const after = parseDonation(controlText(get()), get()?.querySelector('input[type="number"]'));
+      return after && after.used >= fresh.used + fresh.quantity/fresh.unit;
+    })(), `無法確認${name}今日投入增加；不重送`);
+    saveStep(key, 'done', `已投入${fresh.quantity}`);
+    return `已投入${fresh.quantity}`;
+  }
+
+  function materialSnapshot(card) {
+    const text=controlText(card),number=v=>v==null?null:Number(v.replace(/,/g,''));
+    const progress=text.match(/繳交進度\s*([\d,]+)\s*\/\s*([\d,]+)/);
+    const held=text.match(/(?:持有|擁有|庫存)\s*[:：]?\s*([\d,]+)(?:\s*\/\s*([\d,]+))?/);
+    const pieces=[...card.querySelectorAll('h4,strong,span,div,p')].map(controlText).filter(t=>/[×x]\s*[\d,]+/.test(t)).sort((a,b)=>a.length-b.length);
+    const item=pieces.map(t=>t.match(/([^×x]+?)\s*[×x]\s*([\d,]+)/)).find(Boolean);
+    const name=item?.[1]?.trim() || controlText(card.querySelector('h4')) || '';
+    const pair=!progress?text.match(/([\d,]+)\s*\/\s*([\d,]+)/):null;
+    const required=number(progress?.[2]||held?.[2]||item?.[2]);
+    return {name:name.replace(/^(?:需求|材料|繳交)\s*[:：]?\s*/,''),held:number(held?.[1]||pair?.[1]),required,
+      remaining:progress?Math.max(0,number(progress[2])-number(progress[1])):required};
+  }
+  function rememberSupport(root) {
+    ledger()['支援捐獻'] ||= {};
+    ledger()['支援捐獻'].materials=[...root.querySelectorAll('.guild-donation-card')].filter(c=>!/已完成/.test(controlText(c))).map(materialSnapshot);
+    persist();
+  }
+  async function supportDonations() {
+    await guildPage('任務');
+    await tap(() => scopedButton(currentGuildWindow(), /^支援捐獻/), '支援捐獻');
+    for (let i=0; i<30; i++) {
+      const root = currentGuildWindow();
+      rememberSupport(root);
+      for(const doneCard of root.querySelectorAll('.guild-donation-card')){
+        if(!/已完成/.test(controlText(doneCard)))continue;
+        const key=`支援交易:${supportIdentity(doneCard)}`;
+        if(ledger()[key]?.state==='pending')saveStep(key,'done','重開確認支援委託已完成');
+      }
+      if (/帳號每日四份\s*4\s*\/\s*4/.test(controlText(root))) return '今日支援已達上限';
+      const button = scopedButton(root, /^完成委託$/);
+      if (!button) {
+        const cards=[...root.querySelectorAll('.guild-donation-card')];
+        if(cards.length && cards.every(card=>/已完成/.test(controlText(card))))return '支援委託全部完成';
+        throw new Error('支援委託仍有未完成項目，但材料不足或尚不可繳交');
+      }
+      const card = button.closest('.guild-donation-card');
+      const title=controlText(card?.querySelector('h4'));
+      if(!card || !title)throw new Error('無法辨識支援捐獻品項');
+      const identity=supportIdentity(card);
+      const matches=()=>[...currentGuildWindow().querySelectorAll('.guild-donation-card')].filter(c=>supportIdentity(c)===identity);
+      if(matches().length!==1)throw new Error('支援委託識別重複，保留現場，不猜測同名卡片');
+      const getCard=()=>matches().length===1?matches()[0]:null;
+      const key=`支援交易:${identity}`;
+      if(ledger()[`支援交易:${title}`]?.state==='pending')throw new Error(`${title}舊版交易未確認，不重送`);
+      if(ledger()[key]?.state==='pending')throw new Error(`${title}前次結果未確認，不重送`);
+      saveStep(key,'pending','等待委託完成');
+      await tapSingleClick(()=>scopedButton(getCard(),/^完成委託$/), `支援捐獻：${title}`);
+      await until(() => /已完成/.test(controlText(getCard())), '支援捐獻送出後沒有完成狀態，不重送');
+      saveStep(key,'done','已完成');
+    }
+    throw new Error('支援捐獻更新次數異常');
+  }
+
+  // 只讀原生清單 key；無 key 時用不隨持有量／進度變化的需求及獎勵識別。
+  function nativeCardKey(card) {
+    const explicit=card?.getAttribute('data-task-id')||card?.getAttribute('data-order-id');
+    if(explicit)return explicit;
+    const prop=card && Object.keys(card).find(k=>k.startsWith('__reactFiber$'));
+    let fiber=prop?card[prop]:null;
+    for(let i=0;fiber && i<8;i++,fiber=fiber.return){
+      if(i && fiber.stateNode?.nodeType===1 && !card.contains(fiber.stateNode))break;
+      if(fiber.key!=null && !/^\d+$/.test(String(fiber.key)))return String(fiber.key);
+    }
+    return '';
+  }
+  function supportIdentity(card) {
+    const id=nativeCardKey(card);if(id)return `id:${id}`;
+    const text=controlText(card),title=controlText(card?.querySelector('h4'));
+    const qty=text.match(/繳交進度\s*[\d,]+\s*\/\s*([\d,]+)/)?.[1];
+    const reward=text.match(/活躍\s*\+\s*[\d,]+\s*公會經驗\s*\+\s*[\d,]+/)?.[0];
+    if(!title||!qty||!reward)throw new Error('支援委託缺少獨立編號或完整需求／獎勵');
+    return `${title}|${qty}|${reward}`;
+  }
+
+  async function handleGuild() {
+    if (userOptions().guildDungeonDonation) saveStep('副本品項分類', 'done', `使用內建${DUNGEON_DONATION_NAMES.length}項已確認品名，不開啟背包`);
+    await step('公會簽到', async () => {
+      await guildPage('任務');
+      if (/今日已簽到|今日公會簽到完成/.test(controlText(currentGuildWindow()))) return '已簽到';
+      await tapSingleClick(() => scopedButton(currentGuildWindow(), /^每日簽到/), '每日簽到');
+      await until(() => /今日已簽到|今日公會簽到完成/.test(controlText(currentGuildWindow())), '公會簽到未確認');
+    });
+    for (const hunt of HUNTS) await step(`接取${hunt}`, () => guildHunt(hunt));
+    await step('支援捐獻', supportDonations, {repeat:true});
+    for (const name of ['銀幣','金幣']) await step(`金庫${name}`, () => donateItem(name,false), {repeat:true});
+    if (userOptions().guildDungeonDonation) {
+      await step('副本材料捐獻', async () => {
+        await treasuryOpen();
+        const candidates = DUNGEON_DONATION_NAMES.filter(name => donationRow(name));
+        for (const name of candidates) await step(`副本捐獻${name}`, () => donateItem(name,true), {repeat:true});
+        return `已比對內建副本品名與可捐清單，交集${candidates.length}項`;
+      }, {repeat:true});
+    }
+    for(const facility of FACILITIES)await step('領地'+facility.name,()=>interactTerritoryFacility(facility));
+    await closeWindows(); finishRecipe();
+  }
+
+  function territoryEvidence(facility){
+    const dialog=document.querySelector('.quest-dialog-modal-sheet');if(!dialog)return '';
+    const nativeTitle=dialog.querySelector('.quest-dialog-title');
+    const identity=nativeTitle?rendered(nativeTitle)&&controlText(nativeTitle)===facility.name:[...dialog.querySelectorAll('h1,h2,h3,h4,strong,span')].some(el=>rendered(el)&&controlText(el)===facility.name);if(!identity)return '';
+    const result=[...dialog.querySelectorAll('span,p,strong,div')].filter(rendered).map(controlText).filter(text=>{
+      const scoped=text.startsWith(facility.name)?text.slice(facility.name.length).trim():text;
+      return /^(?:你|您)?(?:已)?(?:完成了今日互動|今天已經完成互動)(?:[。！!]|\s|$)/.test(scoped)&&!/將|可以|即可|需要|請|若|互動後/.test(scoped);
+    });return result.sort((a,b)=>a.length-b.length)[0]||'';
+  }
+  async function closeCompletedTerritoryDialog(facility){
+    const get=()=>document.querySelector('.quest-dialog-modal-sheet');
+    if(!get())return;
+    const title=get().querySelector('.quest-dialog-title');
+    if(!title)return; // 舊介面由既有關窗流程收尾。
+    if(controlText(title)!==facility.name||!territoryEvidence(facility))throw new Error('已完成對話的設施／結果改變，不推進');
+    const next=uniqueControl(get(),/^繼續\s*▸?$/);
+    if(next)await tapSingleClick(()=>{
+      if(controlText(get()?.querySelector('.quest-dialog-title'))!==facility.name||!territoryEvidence(facility))throw new Error('送出前已完成對話改變');
+      return uniqueControl(get(),/^繼續\s*▸?$/);
+    },'查看已完成領地互動說明');
+    await until(()=>get()&&controlText(get().querySelector('.quest-dialog-title'))===facility.name&&controlText(get().querySelector('.quest-dialog-text'))==='每日互動會在下一次公會日重置後再次開放。'&&uniqueControl(get(),/^完成$/),'等待同設施每日重置說明');
+    await tapSingleClick(()=>{
+      if(controlText(get()?.querySelector('.quest-dialog-title'))!==facility.name||controlText(get()?.querySelector('.quest-dialog-text'))!=='每日互動會在下一次公會日重置後再次開放。')throw new Error('送出前重置說明改變');
+      return uniqueControl(get(),/^完成$/);
+    },'關閉已完成領地互動對話');
+    await until(()=>!get(),'等待已完成領地對話關閉');
+  }
+  async function interactTerritoryFacility(facility){
+    const key='領地交易:'+facility.facilityId,proof=territoryEvidence(facility);
+    if(proof){saveStep(key,'done',facility.facilityId+'；'+proof);await closeCompletedTerritoryDialog(facility);return proof;}
+    if(ledger()[key]?.state==='done')return ledger()[key].detail;
+    const reconcile=ledger()[key]?.state==='pending';
+    if(PAGE_WINDOW.__world?.regionId!=='guild_territory'){await closeWindows();await guildPage('總部');await until(()=>clickGuildEnter(),'找不到進入公會領地按鈕');await until(()=>PAGE_WINDOW.__world?.regionId==='guild_territory','等待公會領地',30000);}
+    await closeWindows();activeFacilityTransaction={key,facilityId:facility.facilityId,reconcile,opened:false};
+    try{
+      await talkTo(facility,new RegExp(facility.name));let evidence='';
+      if(reconcile){
+        await until(()=>territoryEvidence(facility),'已重新進入領地查看同一設施，仍缺今日完成證據；保留未明交易，不推進領獎對話',6000);
+        evidence=territoryEvidence(facility);saveStep(key,'done',facility.facilityId+'；補跑現場確認：'+evidence);await closeCompletedTerritoryDialog(facility);return evidence;
+      }
+      await until(async()=>{
+        evidence=territoryEvidence(facility);if(evidence)return true;
+        const dialog=document.querySelector('.quest-dialog-modal-sheet'),text=controlText(dialog),next=uniqueControl(dialog,/^繼續\s*▸?$/);
+        // 正常互動的獎勵說明不是今日完成證據；完成對話後重開同一設施對帳。
+        const finish=uniqueControl(dialog,/^完成$/);
+        if(finish&&controlText(dialog?.querySelector('.quest-dialog-title'))===facility.name){
+          const record=ledger()[key];if(!record.finishSent&&dispatchSingleClick(finish,'完成'+facility.name+'對話')){record.finishSent=true;persist();}return false;
+        }
+        if(!dialog&&ledger()[key]?.finishSent&&!ledger()[key]?.reopened){
+          ledger()[key].reopened=true;persist();activeFacilityTransaction.reconcile=true;activeFacilityTransaction.opened=false;
+          await talkTo(facility,new RegExp(facility.name));return false;
+        }
+        if(next){const record=ledger()[key];if(!record||record.state!=='pending')throw new Error('缺少領地交易身份，未推進對話');record.dialogSent ||= [];if(!record.dialogSent.includes(text)){if(record.dialogSent.length>=8)throw new Error('領地對話超過八步，結果未明');record.dialogSent.push(text);persist();if(!dispatchSingleClick(next,'繼續'+facility.name+'對話')){record.dialogSent.pop();persist();}}}
+        return false;
+      },'等待同一設施明確今日互動完成；一般獲得／貢獻說明不足',20000);
+      saveStep(key,'done',facility.facilityId+'；'+evidence);
+      if(document.querySelector('.quest-dialog-modal-sheet .quest-dialog-title')&&territoryEvidence(facility)){await closeCompletedTerritoryDialog(facility);return evidence;}
+      if(document.querySelector('.quest-dialog-modal-sheet')){const done=uniqueControl(document.querySelector('.quest-dialog-modal-sheet'),/^完成$/);if(done)await tapSingleClick(done,'完成領地對話');}
+      await until(()=>!document.querySelector('.quest-dialog-modal-sheet'),'等待對話關閉');return evidence;
+    }finally{activeFacilityTransaction=null;}
   }
 
   async function approachDailyNativeObject(target){
@@ -8391,25 +8973,41 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       return result.state==='opened'&&npcMoveOwner.release('daily-native-object-arrived');
     },'等待原生物件與即時距離',90000);
   }
-  async function interactTerritoryFacility(facility){
-    const world=PAGE_WINDOW.__world;
-    const travelled=await nativeActions.runGuildTravel({travel:guild=>{
-      requireRunOwner();if(world!==PAGE_WINDOW.__world||typeof world.setGuildTerritoryContext!=='function'||typeof world.travel!=='function')throw new RunCancelled();
-      world.setGuildTerritoryContext({guildId:guild.id,guildName:guild.name,guildTag:guild.tag,level:guild.level,role:world.player.guildRole});
-      return world.travel('guild_territory',{source:'guild',guildId:guild.id});
-    },wait:()=>until(()=>world===PAGE_WINDOW.__world&&world.regionId==='guild_territory'&&world.isWorldInteractionLocked?.()===false,'等待原生公會領地同步',30000)});
-    if(!travelled.confirmed)throw new Error('原生公會領地未確認');
-    await approachDailyNativeObject(facility);
-    return nativeActions.runGuildFacility(facility.facilityId);
+
+  function syncedHunt(name) {
+    const ids={'邊境狩獵 I':'GBH100','邊境狩獵 II':'GBH500','邊境狩獵 III':'GBH900'};
+    const daily=PAGE_WINDOW.__world?.daily,id=ids[name];
+    if(!id || daily?.day!==taskDayKey() || !Object.hasOwn(daily.progress||{},id) || typeof daily.claimed?.[id]!=='boolean')return null;
+    const current=Number(daily.progress[id]),target=Number(id.slice(3));
+    if(!Number.isFinite(current)||current<0)return null;
+    return {name,current,target,claimed:daily.claimed[id],source:'原生已同步 daily'};
   }
 
-  function syncedHunt(name){
-    const id=nativeGuildHuntId(name),daily=PAGE_WINDOW.__world?.daily;
-    if(!id||daily?.day!==taskDayKey()||!Object.hasOwn(daily.progress||{},id)||!Number.isSafeInteger(daily.progress[id])||daily.progress[id]<0)return null;
-    const claimed=daily.claimed?.[id];if(claimed!==undefined&&claimed!==false&&claimed!==0&&claimed!==true&&!(Number.isSafeInteger(claimed)&&claimed>0))return null;
-    return {name,current:daily.progress[id],target:Number(id.slice(3)),claimed:claimed===true||Number.isSafeInteger(claimed)&&claimed>0,accepted:true,source:'原生 daily'};
+  function huntProgress() {
+    const hud=visible('.qt-list .qt-row').map(row => {
+      const name = controlText(row.querySelector('.qt-name'));
+      const match = controlText(row.querySelector('.qt-prog')).replace(/,/g,'').match(/(\d+)\s*\/\s*(\d+)/);
+      return name.includes('邊境狩獵') && match ? {name,current:Number(match[1]),target:Number(match[2])} : null;
+    }).filter(Boolean);
+    return HUNTS.map(name=>{
+      const sync=syncedHunt(name),row=hud.find(row=>new RegExp('^'+name+'(?:\\s|$)').test(row.name));
+      if(sync && (!row || row.target===sync.target))return sync;
+      return row || null;
+    }).filter(Boolean);
   }
-  const huntProgress=()=>HUNTS.map(syncedHunt).filter(Boolean);
+
+  async function openQuestHudTasks() {
+    const candidates=usableElements().filter(element=>labelOf(element)==='任務');
+    const taskTab=candidates.find(button=>{
+      for(let parent=button.parentElement,depth=0;parent&&depth<7;parent=parent.parentElement,depth++){
+        if(scopedButton(parent,/^隊伍(?:\s|$)/))return true;
+      }
+      return false;
+    });
+    if(!taskTab)throw new Error('找不到左側任務／隊伍頁籤，停止狩獵監控');
+    await tap(taskTab,'左側任務頁籤');
+    await until(()=>visible('.qt-list').length>0,'切換任務頁籤後仍讀不到任務清單',12000);
+  }
 
   async function setAuto(on,canStart=()=>true) {
     const wanted = on ? 'on' : 'off';
@@ -8423,8 +9021,15 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   }
 
   function huntAutoEligibility(){
-    const progress=syncedHunt('邊境狩獵 III');if(!progress)return {state:'unknown',reason:'原生狩獵任務尚未確認接取'};
-    if(progress.claimed||progress.current>=progress.target)return {state:'complete',reason:progress.claimed?'今日已回報':'擊殺已達標，不開AUTO'};
+    const name='邊境狩獵 III',sync=syncedHunt(name),card=guildTaskCard(name),text=controlText(card);
+    const hud=visible('.qt-list .qt-row').find(row=>controlText(row.querySelector('.qt-name'))===name);
+    const accepted=Boolean(hud||card&&/已接取|進行中|回報|已回報|已領取/.test(text)||dayState.huntPreflight?.day===taskDayKey()&&dayState.huntPreflight.tasks?.[name]==='已接取');
+    const progress=huntProgress().find(row=>row.name===name&&row.target===900);
+    const claimed=sync?sync.claimed:card?/已回報|已領取/.test(text):null;
+    const verified=dayState.huntPreflight?.day===taskDayKey()?dayState.huntPreflight.tasks?.[name]:null;
+    if(claimed||verified==='已回報'||verified==='今日已回報')return {state:'complete',reason:'今日已回報'};
+    if(progress?.current>=900)return {state:'complete',reason:'擊殺已達標，不開AUTO'};
+    if(!accepted||!progress||(claimed===null&&verified!=='已接取'))return {state:'unknown',reason:'缺少當前已接取／claimed／900目標證據'};
     return {state:'ready',progress};
   }
 
@@ -8449,6 +9054,11 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       if(huntAutoEligibility().state==='complete')return huntAutoEligibility().reason;
       huntWorldCheckAt=-Infinity;await waitHuntWorld();
       await travelTo(destination);
+      if (!huntProgress().some(row => row.target === 900)) {
+        await openQuestHudTasks();
+        const expand = scopedButton(document,/其他\s*[兩二2]\s*(?:條|項|個)?/);
+        if (expand) await tap(expand,'展開其他兩條任務');
+      }
       await until(() => huntProgress().find(row => row.target === 900), '找不到已接取的邊境狩獵 III 進度',8000);
       const eligible=huntAutoEligibility();if(eligible.state==='complete')return eligible.reason;if(eligible.state!=='ready')throw new Error(eligible.reason);
       if(autoState()==='on')throw new Error('請先關閉原生自動攻擊，再以效率模式進行狩獵');
@@ -8493,22 +9103,179 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     await closeWindows(); finishRecipe();
   }
 
-  async function kingdomOrders(country,remote){
-    if(!remote){await travelTo(country.name);await approachDailyNativeObject({...country,name:country.npc});}
-    return nativeActions.runKingdomOrders({kingdomId:remote?null:country.kingdomId,useWarehouse:remote});
-  }
-  async function handleKingdom(){
-    let fallback=false;
-    const describe=result=>'繳交 '+result.submitted+'、已完成 '+result.alreadySubmitted+'、重抽 '+result.rerolled+'、降階 '+result.downgraded+(result.warnings.length?'；'+result.warnings.join('；'):'');
-    if(userOptions().legendary){
-      try{await nativeOperationStep('遠端九筆委託',()=>kingdomOrders(null,true),describe);}
-      catch(error){if(!(error instanceof NativeTradePrivilegeExpired))throw error;fallback=true;runtime.effectiveLegendary=false;persist();saveStep('遠端權限改現場','done',error.message);}
-    }
-    if(!userOptions().legendary||fallback)for(const country of KINGDOMS)if(runtime.running)await nativeOperationStep(country.name+'委託',()=>kingdomOrders(country,false),describe);
-    if(runtime.running)finishRecipe();
+  class RemotePrivilegeExpired extends Error {}
+  function remotePrivilegeLost(){
+    const badge=document.querySelector('.legendary-pass-badge'),order=kingdomOrderWindow(),pass=panel(/傳奇冒險者/);
+    const roots=[badge,...[order,pass].filter(Boolean).flatMap(root=>[...root.querySelectorAll('[role="status"],[role="alert"],strong,span,p')])].filter(el=>el&&isVisible(el));
+    return roots.some(el=>/^(?:目前狀態[：:]?\s*)?(?:傳奇(?:冒險者|特權|權限)[：:]?\s*(?:已到期|已過期|未啟用|尚未啟用|未持有|尚未持有|無效|未開通)|遠端交付[：:]?\s*(?:權限不足|已到期|已過期))[。！!]?$/ .test(controlText(el)));
   }
 
+  function requireRemotePrivilege(remote) {
+    if(remote && remotePrivilegeLost())throw new RemotePrivilegeExpired('傳奇權限不存在或失效，改由各王國現場交付');
+  }
+  function reliableOrderId(card) {
+    const id=nativeCardKey(card);
+    return /^mko_[A-Za-z0-9_-]+$/.test(id)?id:'';
+  }
+
+  function kingdomOrderWindow() {
+    return visible('.window, [role="dialog"], .quest-dialog-modal-sheet').filter(root=>/個人每日委託|遠端交付商會/.test(controlText(root)) && orderCards(root).length>0).sort((a,b)=>controlText(a).length-controlText(b).length)[0] || null;
+  }
+
+  function legacyOrderProtection(){
+    const entries=Object.entries(ledger()).filter(([key,value])=>/^(?:重抽|降階):/.test(key)&&!/:id:mko_/.test(key)&&value?.state==='pending');
+    if(entries.length){dayState.legacyOrderProtection={state:'pending',keys:entries.map(([key])=>key),reason:'舊序號重抽／降階未明，不能绑定当前orderId'};persist();}
+    else if(dayState.legacyOrderProtection){delete dayState.legacyOrderProtection;persist();}
+    return entries.length>0;
+  }
+  async function kingdomOrders(country, remote) {
+    requireRemotePrivilege(remote);
+    if (remote) {
+      let legendary=panel(/傳奇冒險者/);
+      if(!legendary){
+        await closeWindows();
+        await until(()=>{
+          requireRemotePrivilege(true);
+          const badge=document.querySelector('.legendary-pass-badge[role="button"]');
+          if(badge)return dispatchSingleClick(badge,'傳奇冒險者特權');
+          return openNestedMenu(/^傳奇冒險者特權$/,'傳奇冒險者特權');
+        },'從徽章或既有選單查閱傳奇權限',12000);
+        legendary=await until(()=>panel(/傳奇冒險者/),'等待傳奇冒險者特權畫面');
+      }
+      await tapSingleClick(() => {requireRemotePrivilege(true);return scopedButton(legendary,/^遠端交付商會委託/);},'遠端交付商會委託');
+    } else {
+      await travelTo(country.name);
+      await talkTo({...country,name:country.npc}, new RegExp(country.npc.replace('委託官','委託官\\s*')));
+      await tap(() => scopedButton(panel(/個人每日委託/),'個人每日委託'),'個人每日委託');
+    }
+    await until(() => {requireRemotePrivilege(remote);return kingdomOrderWindow();}, '等待商會繳交畫面');
+    const getRoot = () => kingdomOrderWindow();
+    if(remote){
+      requireRemotePrivilege(remote);
+      const allTab=scopedButton(getRoot(),/^全部(?:\s*[\d,]+)?$/);
+      if(!allTab)throw new Error('遠端商會找不到「全部」委託頁籤，無法確認三王國訂單');
+      await tap(allTab,'切換全部王國委託');
+    }
+    // 用實際訂單卡片 + 物品需求作指紋，不採信遠端視窗的 9/3 彙總值。
+    const cards = () => orderCards(getRoot());
+    const expected = remote ? 9 : 3;
+    await until(() => {requireRemotePrivilege(remote);return cards().length === expected;}, `無法辨識${expected}筆獨立委託`);
+    const ids=cards().map(reliableOrderId);
+    if(ids.some(id=>!id) || new Set(ids).size!==expected)throw new Error('缺少唯一可靠 orderId，保留現場，不依清單序號交付');
+    for (const nativeId of ids) await step(`委託ID:${nativeId}`,async()=>{
+      requireRemotePrivilege(remote);
+      const get=()=>{requireRemotePrivilege(remote);const found=cards().filter(c=>reliableOrderId(c)===nativeId);return found.length===1?found[0]:null;};
+      let card=get(), text=controlText(card);
+      const countryKey=country?.key || (text.includes('卡德雷斯')?'ogron':text.includes('薇拉希絲')?'silvana':text.includes('安珀蕾')?'freya':null);
+      if(!countryKey)throw new Error('無法確認委託所屬王國');
+      const identity=`${countryKey}:id:${nativeId}`;
+      const submitKey=`繳交交易:${identity}`;
+      try {
+      const legacyPending=Object.entries(ledger()).some(([key,value])=>/^繳交交易:/.test(key) && !key.includes(':id:') && value.state==='pending');
+      if (!card)throw new Error('訂單已移除或識別改變，先重讀，不猜替代卡片');
+      if (/已繳交|已完成/.test(text)) {
+        if(ledger()[submitKey]?.state==='pending')saveStep(submitKey,'done','重開後確認已繳交');
+        return '已繳交';
+      }
+      if(ledger()[submitKey]?.state==='done')throw new Error('曾完成訂單目前狀態不一致，不重交');
+      if(ledger()[submitKey]?.state==='pending'||legacyPending)throw new Error('前次繳交結果未確認，不再次扣除材料');
+      if (!scopedButton(card,'繳交')) {
+        if(!scopedButton(card,/^缺材料$/,true))throw new Error('訂單不是缺材料狀態，未重抽或降階；繼續其餘訂單');
+        if(legacyOrderProtection())throw new Error('舊版序號重抽／降階交易未明，這張保留；繼續可直接繳交的其他訂單');
+        await changeOrderOnce(get,identity,'重抽',/^重抽(?:\s*\d+\s*\/\s*\d+)?$/,undefined);
+        if(!scopedButton(get(),'繳交'))await changeOrderOnce(get,identity,'降階',/^換低階\s*-15%$/);
+        card=get();text=controlText(card);
+        if(!scopedButton(card,'繳交'))throw new Error(`重抽及降階後仍不可繳交，跳過本張：${text}`);
+      }
+      if(ledger()[submitKey]?.state==='pending')throw new Error('前次繳交結果未確認，不再次扣除材料');
+      const before=controlText(get());
+      saveStep(submitKey,'pending',before);
+      await tapSingleClick(()=>scopedButton(get(),'繳交'),`繳交訂單 ${nativeId}`);
+      await until(()=>/已繳交|已完成/.test(controlText(get())), '繳交結果未確認，不重送',30000);
+      saveStep(submitKey,'done',`已確認繳交；交付前需求與獎勵：${before}；結果：${controlText(get())}`);
+      return controlText(get());
+      } finally {
+        const latest=cards().find(c=>reliableOrderId(c)===nativeId);
+        ledger()['委託ID:'+nativeId] ||= {};
+        ledger()['委託ID:'+nativeId].result={country:KINGDOMS.find(k=>k.key===countryKey)?.name||'王國委託',
+          material:latest?materialSnapshot(latest):null,complete:!!latest&&/已繳交|已完成/.test(controlText(latest)),
+          rerolled:ledger()['重抽:'+identity]?.state==='done',downgraded:ledger()['降階:'+identity]?.state==='done'};
+        persist();
+      }
+    },{repeat:true,closeOnError:false});
+    const finalCards=cards();
+    if(finalCards.length!==expected)throw new Error(`委託卡片數量由${expected}筆變為${finalCards.length}筆，無法確認全部交付`);
+    const incomplete=finalCards.filter(card=>!/(?:已繳交|已完成)/.test(controlText(card)));
+    if(incomplete.length)throw new Error(`尚有${incomplete.length}筆委託未確認完成；請查看材料與繳交按鈕狀態`);
+    await closeWindows();
+  }
+
+  async function changeOrderOnce(get,identity,action,pattern,legacyKey) {
+    const key=`${action}:${identity}`,before=orderFingerprint(get());
+    const previous=ledger()[key]||ledger()[legacyKey];
+    if(previous?.state==='pending'){
+      if(typeof previous.fingerprint!=='string'||!previous.fingerprint||previous.fingerprint===before)throw new Error(`上次${action}結果未明，不重送`);
+      saveStep(key,'done',`重新開啟確認${action}已變更：${controlText(get())}`);
+      return;
+    }
+    if(previous?.state==='done')return;
+    const button=scopedButton(get(),pattern);
+    if(!button)return;
+    ledger()[key]={state:'pending',detail:`${action}前：${controlText(get())}`,fingerprint:before,at:now()};persist();
+    await tapSingleClick(()=>scopedButton(get(),pattern),`${action}委託一次`);
+    await until(()=>get() && orderFingerprint(get())!==before,`${action}未出現新需求，不再次重送`);
+    saveStep(key,'done',`${action}後：${controlText(get())}`);
+  }
+
+  function orderFingerprint(card) {
+    return controlText(card).match(/.{1,45}[×x]\s*[\d,]+/)?.[0] || controlText(card);
+  }
+
+  function orderCards(root) {
+    if(!root)return [];
+    const result=[];
+    for(const button of root.querySelectorAll('button')) {
+      if(!/^(?:繳交|已繳交|已完成|缺材料|等待|已派單)$/.test(labelOf(button)))continue;
+      let card=button.parentElement;
+      while(card && card!==root){
+        const actions=[...card.querySelectorAll('button')].filter(el=>/^(?:繳交|已繳交|已完成|缺材料|等待|已派單)$/.test(labelOf(el)));
+        const body=controlText(card).replace(/(?:繳交|已繳交|已完成|缺材料|等待|已派單|重抽(?:\s*\d+\s*\/\s*\d+)?)/g,'').replace(/\s+/g,' ').trim();
+        // 本地王國頁的物品欄未必呈現「持有/需求」或「×數量」；以唯一狀態按鈕
+        // 加上卡片內仍有委託內容來辨識，避免因本地版面文字格式不同整列被漏搜。
+        if(actions.length===1 && /(?:[×x]\s*[\d,]+|[\d,]+\s*\/\s*[\d,]+)/.test(body))break;
+        card=card.parentElement;
+      }
+      if(card && card!==root && !result.includes(card))result.push(card);
+    }
+    return result;
+  }
+
+  async function handleKingdom() {
+    let fallback=false;
+    if(userOptions().legendary){
+      try{await step('遠端九筆委託',()=>kingdomOrders(null,true),{repeat:true,closeOnError:false});}
+      catch(error){if(!(error instanceof RemotePrivilegeExpired))throw error;fallback=true;runtime.effectiveLegendary=false;persist();saveStep('遠端權限改現場','done',error.message);}
+    }
+    if(!userOptions().legendary || fallback){
+      for(const country of KINGDOMS)await step(`${country.name}委託`,()=>kingdomOrders(country,false),{repeat:true,closeOnError:false});
+    }
+    const warnings=Object.entries(ledger()).filter(([,v])=>v.state==='warn'||v.state==='pending');
+    finishTask(warnings.length?'警示':'完成',`${warnings.length?'部分完成':'完成'}${fallback?'；傳奇權限失效，已改現場':''}${warnings.length?'；'+warnings.map(([k,v])=>k+'：'+v.detail).join('；'):''}`);
+  }
+
+  function highestEscort(options) {
+    return options.filter(x=>!x.disabled && Number.isFinite(x.level)).sort((a,b)=>b.level-a.level)[0] || null;
+  }
+  function escortPanel(result=false) {
+    return textCard(document,result?/護送成果/:/王國商隊護送/,
+      el=>Boolean(scopedButton(el,result?'回到一般冒險':'開始護送',true)) || (!result && escortDailyDone(el)));
+  }
+  const escortRetryButton=root=>scopedButton(root,'再接訂單');
+
   const ESCORT_REWARD_NAMES={freya:'安珀蕾花蜜',silvana:'薇拉希絲星塵',ogron:'卡德雷斯王印'};
+  function escortDailyDone(root) {
+    return /今日.*(?:已完成|已領取|已護送)/.test(controlText(root));
+  }
   function escortOutcome(escort) {
     if(escort?.result?.claimed===true)return 'claimed';
     if(escort?.result?.success===true)return 'success';
@@ -8556,11 +9323,10 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     };
   }
   async function monitorEscort() {
-    const world=PAGE_WINDOW.__world,escortRunId=world?.caravanEscort?.runId;
+    const world=PAGE_WINDOW.__world;
     const restore=installEscortFollow(world);
     try {
       await until(async()=>{
-        if(PAGE_WINDOW.__world!==world||world.caravanEscort?.runId!==escortRunId)throw new RunCancelled();
         const escort=world.caravanEscort;
         if(['complete','failed'].includes(escort?.phase))return true;
         if(escort?.phase!=='running')throw new Error('護送狀態遺失，保留現場');
@@ -8576,39 +9342,102 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       },'等待護送成果',TRANSPORT_TIMEOUT_MS);
     } finally {restore();}
   }
-
-  async function returnNativeEscort(country,label){
-    if(!await nativeActions.dismissEscort(country))throw new Error('原生護送返回入口未確認');
-    await until(()=>PAGE_WINDOW.__world?.regionId===country.regionId&&PAGE_WINDOW.__world?.caravanEscort==null,label,30000);
-  }
-  async function settleEscort(country,attempt){
-    const escort=nativeEscortSnapshot(PAGE_WINDOW.__world,country),outcome=escortOutcome(escort);
+  async function settleEscort(country,attempt) {
+    const getEscort=()=>PAGE_WINDOW.__world?.caravanEscort;
+    const result=await until(()=>escortPanel(true),'等待護送成果介面');
+    const outcome=escortOutcome(getEscort());
     if(outcome==='unknown')throw new Error('無法確認護送成功或失敗，保留結算');
-    saveEscortResult(escort,attempt);if(outcome==='failed')return false;
-    await nativeActions.runEscortClaim(country);
-    if(PAGE_WINDOW.__world?.caravanEscort!==escort||escort.result?.claimed!==true)throw new Error('原生護送領獎結果未確認');
-    const detail=escortRewardDetail(escort);saveEscortResult(escort,attempt);
-    await returnNativeEscort(country,'等待原生护送返回王國');return detail;
+    saveEscortResult(getEscort(),attempt);
+    if(outcome==='failed')return false;
+    if(!getEscort()?.runId)throw new Error('缺少護送場次識別，保留結算');
+    const claimKey=`護送領獎:${getEscort().runId}`;
+    if(outcome!=='claimed'){
+      if(ledger()[claimKey]?.state==='pending')throw new Error('前次護送領獎尚待確認，不重送');
+      await until(()=>enabled(scopedButton(escortPanel(true),'領取每日訂單獎勵')),'成功結算領獎鈕尚不可用；不重新護送');
+      await until(()=>{
+        const button=scopedButton(escortPanel(true),'領取每日訂單獎勵');
+        button?.scrollIntoView?.({block:'nearest',inline:'nearest'});
+        if(!enabled(button))return false;
+        saveStep(claimKey,'pending','已準備送出護送領獎，等待伺服器確認');
+        if(dispatchSingleClick(button,'領取每日訂單獎勵'))return true;
+        saveStep(claimKey,'retry-approved','尚未送出領獎');
+        return false;
+      },'等待護送領獎按鈕');
+      await until(()=>getEscort()?.result?.claimed===true,'護送獎勵未確認，保留結算且不重送',30000);
+    }
+    const detail=escortRewardDetail(getEscort());
+    saveStep(claimKey,'done',detail);
+    saveEscortResult(getEscort(),attempt);
+    await tapSingleClick(()=>scopedButton(escortPanel(true),'回到一般冒險'),'回到一般冒險');
+    await until(()=>atLocation(country.name),`返回${country.name}`,30000);
+    return detail;
   }
-  async function handleTransport(){
-    const country=KINGDOMS.find(x=>x.key===userOptions().escortKingdom);if(!country)return finishTask('略過','未指定護送王國');let skipReason='';
-    if(ledger()['護送嘗試']?.failures===2){const failed=nativeEscortSnapshot(PAGE_WINDOW.__world,country);if(failed?.phase==='failed')await returnNativeEscort(country,'第二次護送失敗後返回');return finishTask('略過','護送連續兩次失敗，本日跳過');}
+
+  async function handleTransport() {
+    const country=KINGDOMS.find(x=>x.key===userOptions().escortKingdom);
+    if(!country)return finishTask('略過','未指定護送王國');
+    let skipReason='';
     await step('指定王國護送',async()=>{
-      let saved=ledger()['護送嘗試']||{failures:0};
-      if(!Number.isSafeInteger(saved.failures??0)||saved.failures<0||saved.failures>2)throw new Error('護送嘗試紀錄未確認');
-      let existing=nativeEscortSnapshot(PAGE_WINDOW.__world,country);
-      if(existing?.phase==='failed'&&saved.lastFailedRunId===existing.runId){await returnNativeEscort(country,'原生護送失敗後返回再接');existing=null;}
-      for(let attempt=(saved.failures??0)+1;attempt<=2;attempt++){
-        if(!existing){await travelTo(country.name);const started=await nativeActions.runEscortStart(country,attempt);if(started.alreadyClaimed){skipReason='今日護送已完成，跳過';return skipReason;}}
-        existing=null;const current=nativeEscortSnapshot(PAGE_WINDOW.__world,country);if(!current)throw new Error('原生護送開始未確認');
-        if(current.phase==='running')await monitorEscort();
-        const settled=await settleEscort(country,attempt);if(settled)return settled;
-        const failed=nativeEscortSnapshot(PAGE_WINDOW.__world,country);if(failed?.phase!=='failed')throw new Error('護送失敗場次未確認');
-        if(saved.lastFailedRunId!==failed.runId){saved={...saved,failures:(saved.failures??0)+1,lastFailedRunId:failed.runId,state:'done',detail:'累積失敗'+((saved.failures??0)+1)+'次'};ledger()['護送嘗試']=saved;persist();}
-        await returnNativeEscort(country,saved.failures<2?'原生護送失敗後返回再接':'第二次護送失敗後返回');
-        if(saved.failures>=2){skipReason='護送連續兩次失敗，已返回王國，本日跳過';return skipReason;}
+      const saved=ledger()['護送嘗試']||{};
+      if(saved.failures>=2){
+        if(escortOutcome(PAGE_WINDOW.__world?.caravanEscort)==='failed' && escortPanel(true)){
+          await tapSingleClick(()=>scopedButton(escortPanel(true),'回到一般冒險'),'第二次護送失敗後返回');
+          await until(()=>atLocation(country.name),`返回${country.name}`,30000);
+        }
+        skipReason='護送連續兩次失敗，本日跳過';return skipReason;
       }
-    },{closeOnError:false});if(skipReason)return finishTask('略過',skipReason);finishRecipe();
+      // 中斷補跑先處理仍在進行或結算中的同一場，不傳送離開結算。
+      const existing=PAGE_WINDOW.__world?.caravanEscort;
+      if(existing && existing.kingdomKey!==country.key)throw new Error('目前護送王國與設定不同，保留現場');
+      let resume=Boolean(existing && ['running','complete','failed'].includes(existing.phase));
+      if(resume && existing.phase==='failed' && saved.lastFailedRunId===existing.runId){
+        await tapSingleClick(()=>escortRetryButton(escortPanel(true)),'護送失敗後再接訂單');
+        await until(()=>escortPanel(),'等待重接王國商隊護送');
+        resume=false;
+      }
+      if(!resume && !escortPanel()){
+      await travelTo(country.name);
+      await talkTo({...country,name:country.npc},new RegExp(country.npc.replace('委託官','委託官\\s*')));
+      await tap(()=>scopedButton(panel(/商隊運送訂單/),'商隊運送訂單'),'商隊運送訂單');
+      }
+      const get=()=>escortPanel();
+      for(let attempt=1;attempt<=2;attempt++){
+        if(attempt<=(saved.failures||0))continue;
+        if(!resume){
+        const current=await until(get,attempt===1?'等待王國商隊護送':'等待重接王國商隊護送');
+        if(escortDailyDone(current)){skipReason='今日護送已完成並限制再進入，跳過';return skipReason;}
+        const options=[...current.querySelectorAll('button')].map(el=>({el,disabled:!enabled(el),level:Number(labelOf(el).match(/Lv\.?\s*(\d+)/i)?.[1])}));
+        const best=highestEscort(options);
+        if(!best)throw new Error('沒有可選的護送等級');
+        await tap(best.el,`護送最高可用等級 Lv${best.level}`);
+        await until(()=>best.el.getAttribute('aria-pressed')==='true' || best.el.getAttribute('aria-selected')==='true' ||
+          /^(?:rgb\(255,\s*215,\s*102\)|#ffd766)$/i.test(getComputedStyle(best.el).borderTopColor), '最高等級選取標記未確認');
+        const preview=controlText(current);
+        await tapSingleClick(()=>scopedButton(current,'開始護送'),'開始護送');
+        await until(()=>PAGE_WINDOW.__world?.caravanEscort?.phase==='running'||escortDailyDone(get()), '護送開始未確認',30000);
+        if(escortDailyDone(get()) && PAGE_WINDOW.__world?.caravanEscort?.phase!=='running'){skipReason='今日護送已完成，跳過';return skipReason;}
+        }
+        resume=false;
+        if(PAGE_WINDOW.__world?.caravanEscort?.phase==='running')await monitorEscort();
+        const settled=await settleEscort(country,attempt);
+        if(settled)return settled;
+        const result=escortPanel(true);
+        const runId=PAGE_WINDOW.__world?.caravanEscort?.runId;
+        if(saved.lastFailedRunId!==runId){
+          saved.failures=(saved.failures||0)+1;saved.lastFailedRunId=runId;
+          ledger()['護送嘗試']={...saved,state:'done',detail:`累積失敗${saved.failures}次`};persist();
+        }
+        if(saved.failures<2){
+          await tapSingleClick(()=>escortRetryButton(escortPanel(true)),'護送失敗後再接訂單');
+          continue;
+        }
+        await tapSingleClick(()=>scopedButton(escortPanel(true),'回到一般冒險'),'第二次護送失敗後返回');
+        await until(()=>atLocation(country.name),`返回${country.name}`,30000);
+        skipReason='護送連續兩次失敗，已返回王國，本日跳過';return skipReason;
+      }
+    },{closeOnError:false});
+    if(skipReason)return finishTask('略過',skipReason);
+    finishRecipe();
   }
 
   function uniqueControl(root,pattern,disabled=false){
@@ -8636,6 +9465,9 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     const ready=gardenPlots().filter(plot=>plot.plotStage==='mature'),old=ledger()[farmingTransactionKey('庭院收成交易')];
     const pending=Object.values(ledger()).some(record=>record.state==='pending');
     if((runtime.mode==='single'||runtime.rerunAll)&&!pending&&(ready.length||emptyGardenPlots().length)&&(old?.state==='done'||ledger()[farmingTransactionKey('庭院指定作物交易')]?.state==='done')){
+      const scopeId=dayState.farmingPlan.phase+':'+(ledger()['庭院補跑輪次']?.cycle||0);
+      const priorPlots=[...(old?.plots||[]),...Object.entries(ledger()).filter(([key,record])=>key.startsWith('native-home:')&&record?.state==='done'&&record.action==='harvest_all'&&record.day===dayState.day&&record.characterId===integratedContext?.characterId&&record.scopeId===scopeId).flatMap(([,record])=>(record.before||[]).filter(plot=>record.targets?.includes(plot.plotId)))];
+      if(priorPlots.some(before=>ready.some(plot=>plot.plotId===before.plotId&&plot.readyAt===before.readyAt)))throw new Error('成熟菜圃與已收成紀錄矛盾，未重送收成');
       const cycle=(ledger()['庭院補跑輪次']?.cycle||0)+1;ledger()['庭院補跑輪次']={state:'done',cycle,detail:'原生庭院補跑第 '+cycle+' 輪',at:now()};persist();
     }
     const result=await nativeActions.runHome('harvest_all',{scopeId:dayState.farmingPlan.phase+':'+(ledger()['庭院補跑輪次']?.cycle||0)});saveStep(farmingTransactionKey('庭院收成交易'),'done','原生收成已確認 '+result.quantity+' 格');return '原生收成已確認 '+result.quantity+' 格';
@@ -8695,60 +9527,229 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     }
     dayState.farmingPlan.finished=['結尾一鍵收成','結尾六格種植','結尾澆水','家園特產'].every(key=>ledger()[key]?.state==='done');persist();finishRecipe();
   }
-  async function handleRecharge(){
-    const options=userOptions(),requests=[{material:options.supplyAdvancedMaterial,tier:2,allowed:ADVANCED_SUPPLIES},{material:options.supplyMaterial,tier:1,allowed:SUPPLIES}].filter(row=>row.allowed.includes(row.material));
-    if(!requests.length)return finishTask('略過','未選擇成品素材補給');
-    for(const {material,tier}of requests){if(!runtime.running)break;await nativeOperationStep(tier===2?'贊助每日進階補給':'成品素材補給',()=>nativeActions.runSupply(material,tier),result=>result.alreadyClaimed?'本日原生補給已領，未推定同階歷史素材':'已確認原生 '+material+' 補給');}
-    if(runtime.running)finishRecipe();
+  const SUPPLY_ITEM_IDS={'銅錠':'mat_copper_ingot','初級木板':'mat_softwood_board','一階布料強化液':'mat_cloth_potion_t1','一階催化劑':'mat_enhance_powder_t1'};
+  function supplyCard(root){
+    const native=[...(root?.querySelectorAll('.cm-patron-benefit-panel.is-daily')||[])].filter(rendered);
+    if(native.length===1&&/每日\s*08:00\s*更新/.test(controlText(native[0]))&&/成品素材補給/.test(controlText(native[0])))return native[0];
+    return uniqueNamedCard(root,/^每日(?:贊助者)?(?:成品素材)?補給$/,card=>Boolean(uniqueControl(card,/^(?:領取今日補給|今日已領取)$/,true)||scopedStatus(card,/^(?:今日已領取|今日已領初階成品|每日補給已領|今日贊助者補給已領取)[。！!]?$/)));
   }
-  async function handleVitality(){
-    const requested=safeVitalityCount(userOptions().vitalityPurchases);if(!requested)return finishTask('略過','未設定購買活力');
-    await nativeOperationStep('購買活力',()=>nativeActions.runVigor(requested),result=>'原生已補 '+result.used+'／5；本日目標 '+result.target+'，本次購買 '+result.bought+'（不使用鑽石）');
-    if(runtime.running)finishRecipe();
+  function supplyTierSelected(card,tier=1){
+    const label=tier===2?'進階':'初階',materials=tier===2?ADVANCED_SUPPLIES:SUPPLIES;
+    if(selectionConfirmed(uniqueControl(card,new RegExp('^'+label+'$'),true)))return true;
+    return card?.matches('.cm-patron-benefit-panel.is-daily')&&materials.every(name=>uniqueControl(card,new RegExp('^'+name+'$'),true));
   }
-
-  const gatheringToolPlan=(option,inventory=PAGE_WINDOW.__world?.player?.inv)=>nativeGatherToolPlan(option,inventory);
-  async function ensureGatheringTools(option){
-    const plan=gatheringToolPlan(option);
-    if(plan.usable.length&&!pendingEntries().some(record=>record.scope==='tool-process'||String(record.key).startsWith('補製採集工具 ')))return true;
-    if(!nativeActions.readToolWorkshop()){
-      if(PAGE_WINDOW.__world?.regionId!=='holy_city')await travelTo('王都聖輝城');
-      nativeNavigator.reset();const target={name:'王都工坊熔爐',forge:true,regionId:'holy_city'};
-      await until(()=>{requireRunOwner();const result=nativeNavigator.tick(target,()=>Boolean(nativeActions.readToolWorkshop()));if(result.state==='blocked')throw new Error(result.message);return result.state==='opened';},'等待原生工坊',90000);
+  function supplyIdentity(card,material,tier=1){
+    const materials=tier===2?ADVANCED_SUPPLIES:SUPPLIES,item=uniqueControl(card,new RegExp('^'+material+'$'),true);
+    return Boolean(materials.includes(material)&&supplyTierSelected(card,tier)&&selectionConfirmed(item));
+  }
+  function supplyClaimed(card){
+    if(card?.matches('.cm-patron-benefit-panel.is-daily')){
+      const dailyTab=card.parentElement?.querySelector('.cm-patron-benefit-tab.is-daily');
+      if(/今日已領取/.test(controlText(dailyTab)))return true;
+      if(/今日可領取/.test(controlText(dailyTab)))return false;
     }
-    const result=await nativeActions.runTools(option);requireRunOwner();
-    saveStep('補製採集工具 '+plan.name,result.available?'done':'skipped',result.available?plan.name+' ×2 已確認入袋':plan.name+'需製作2件，目前上限'+result.maximum+'；材料或加工費不足，略過自動採集');
-    await until(()=>nativeActions.closeToolWorkshop(),'關閉原生工坊',12000);return result.available;
+    if(scopedStatus(card,/^(?:今日已領取|今日已領初階成品|每日補給已領|今日贊助者補給已領取)[。！!]?$/))return true;
+    if(scopedStatus(card,/^(?:今日尚未領取|今日補給未領取|尚未領取今日補給|今日未領取)[。！!]?$/))return false;
+    return null;
   }
 
-  const gatheringWaiting=state=>state==='idle';
-  const gatheringStatus=status=>status?.state;
-  const gatheringVigor=()=>nativeGatherVigor(PAGE_WINDOW.__world);
-  const gatheringShouldSwitch=(state,vigor)=>Number.isFinite(vigor)&&vigor>0&&gatheringWaiting(state);
+  async function claimDailySupply(material,tier){
+    const label=tier===2?'進階':'初階',itemId=SUPPLY_ITEM_IDS[material];
+    await openPanel(/^儲值$/, /儲值中心/);const get=()=>panel(/儲值中心/);
+    await tap(()=>uniqueControl(get(),/^冒險者贊助/),'冒險者贊助');const expand=uniqueControl(get(),/^每日補給/);if(expand)await tap(expand,'每日補給');
+    const card=()=>supplyCard(get());await until(card,'等待唯一每日成品素材補給區塊');const key=tier===2?'成品補給交易:進階':'成品補給交易';
+    const initial=supplyClaimed(card());
+    if(initial===true){
+      // 今日整體已領不等於兩階各領到指定素材；未明交易僅對帳同階的明確領取文字。
+      const old=ledger()[key],proof=scopedStatus(card(),new RegExp('^今日已領'+label+'成品[：:]\\s*'+material+'$'));
+      if(old?.state==='pending'&&proof)saveStep(key,'done',label+' '+material+'；每日補給重開核對同階已領取');
+      if(ledger()[key]?.state==='pending')throw new Error(label+'補給前次交易未明，今日已領但缺同階材料證據，不重送');
+      return '每日補給今日已領取（不推定'+label+'歷史素材）';
+    }
+    if(initial!==false)throw new Error('補給claimed狀態資料不足，未領取');
+    if(ledger()[key]?.state==='pending')throw new Error(label+'成品補給前次領取未確認，不重送');
+    await tapSingleClick(()=>uniqueControl(card(),new RegExp('^'+label+'(?:\\s|$)'),true),label+'成品素材');
+    await until(()=>supplyTierSelected(card(),tier),label+'實際選中狀態未確認');
+    await tapSingleClick(()=>uniqueControl(card(),new RegExp('^'+material+'$'),true),material);
+    await until(()=>supplyIdentity(card(),material,tier),label+'／材料實際選中identity未確認');
+    await recordedTap(key,()=>{if(!supplyIdentity(card(),material,tier)||supplyClaimed(card())!==false)throw new Error('送出前補給identity／claimed改變，未領取');const control=uniqueControl(card(),/^領取今日補給$/,true);control?.scrollIntoView({block:'nearest',inline:'nearest'});return control;},'領取今日補給',label+' '+material,{...(itemId?{itemId}:{}),material,resourceTier:tier});
+    await until(()=>supplyIdentity(card(),material,tier)&&supplyClaimed(card())===true,'同一'+label+'／材料領取結果未確認');saveStep(key,'done',label+' '+material+'；已確認今日領取');return material+'；已確認'+label+'今日領取';
+  }
+  async function handleRecharge(){
+    const options=userOptions(),requests=[{material:options.supplyAdvancedMaterial,tier:2,allowed:ADVANCED_SUPPLIES},{material:options.supplyMaterial,tier:1,allowed:SUPPLIES}].filter(x=>x.allowed.includes(x.material));
+    if(!requests.length)return finishTask('略過','未選擇成品素材補給');
+    for(const {material,tier} of requests){await step(tier===2?'贊助每日進階補給':'成品素材補給',()=>claimDailySupply(material,tier),{repeat:true});await closeWindows();}
+    finishRecipe();
+  }
+  function refillTarget(start, additional, limit) {
+    if(![start,additional,limit].every(Number.isSafeInteger)||start<0||additional<0||limit<start)return null;
+    return Math.min(limit,start+additional);
+  }
+
+  async function handleVitality() {
+    const requested=safeVitalityCount(userOptions().vitalityPurchases);
+    if(!requested)return finishTask('略過','未設定購買活力');
+    await step('購買活力',async()=>{
+      await closeWindows();
+      await tap(()=>scopedButton(document.querySelector('.vigor-widget'),/^[?？]$/),'活力說明');
+      const get=currentVitalityDialog;
+      await until(get,'等待活力說明');
+      const read=()=>{
+        const m=controlText(get()).match(/(?:已補|購買次數)\s*(\d+)\s*\/\s*(\d+)/);
+        return m?{used:Number(m[1]),limit:Number(m[2])}:null;
+      };
+      const initial=await until(read,'讀不到活力補充次數');
+      const goal=dayState.vitalityGoal ||= { start:initial.used,requested };
+      if(!Number.isSafeInteger(goal.start)||goal.start<0)throw new Error('補充次數起始紀錄格式異常');
+      // 設定值是每日額外購買上限；即使舊紀錄目標較高，也重新以原起點封頂。
+      goal.requested=requested;
+      goal.target=Math.min(3,refillTarget(goal.start,requested,initial.limit)??0);
+      if(goal.target===null)throw new Error('補充次數格式異常');
+      persist();
+      while(true){
+        const current=read();if(!current)throw new Error('補充次數消失');
+        if(current.used>=goal.target)return `已補${current.used}/${current.limit}；本日目標${goal.target}`;
+        if(goal.pending!==undefined){
+          if(current.used>goal.pending){delete goal.pending;persist();continue;}
+          throw new Error('前次購買結果未確認；不重送');
+        }
+        const buy=safeTopupButton(get(),current.used);
+        if(!buy)throw new Error('禁鑽：當前幣別／價格／補量未符合已確認安全階級，未購買');
+        goal.pending=current.used;goal.price=labelOf(buy);persist();
+        await tapSingleClick(()=>{const fresh=read();if(!fresh||fresh.used!==current.used||fresh.used>=goal.target||fresh.used>=3)throw new Error('送出前次數已變，未購買');const candidate=safeTopupButton(get(),fresh.used);if(!candidate||labelOf(candidate)!==goal.price)throw new Error('送出前幣別／價格已變，未購買');return candidate;},`安全補充第${current.used+1}次`);
+        await until(()=>read()?.used===current.used+1,'購買後次數未增加，不重送');
+        delete goal.pending;persist();
+      }
+    },{repeat:true});
+    if(currentVitalityDialog())await tap(()=>scopedButton(currentVitalityDialog(),'關閉'),'關閉活力說明');
+    await closeWindows();finishRecipe();
+  }
+
+  const GATHER_TOOL_KINDS={採礦:'pickaxe',伐木:'axe',採藥:'sickle',釣魚:'rod'};
+  const GATHER_TOOL_SUFFIX={採礦:'鎬',伐木:'斧',採藥:'鐮',釣魚:'竿'};
+  function gatheringToolPlan(option, inventory=PAGE_WINDOW.__world?.player?.inv) {
+    const kind=GATHER_TOOL_KINDS[option.gatheringType],tier=Number(option.gatheringTier);
+    if(!kind || !Number.isInteger(tier) || tier<1 || tier>7 || !Array.isArray(inventory))throw new Error('工具庫存或指定階級尚未確認，不進行製作');
+    const usable=inventory.filter(item=>{
+      const match=String(item?.itemId||'').match(/^tool_([a-z]+)_t(\d+)(?:_worn)?$/);
+      // 遊戲工具未帶 durability 時以完整耐久呈現；磨損工具預設50，其餘200。
+      const durability=Number.isFinite(item?.durability)?item.durability:(/_worn$/.test(item?.itemId)?50:200);
+      return match && match[1]===kind && Number(match[2])>=tier && item.qty>0 && durability>0;
+    });
+    return {kind,tier,itemId:`tool_${kind}_t${tier}`,name:['銅','鐵','銀','黑鐵','深海','魔導','龍魂'][tier-1]+GATHER_TOOL_SUFFIX[option.gatheringType],usable};
+  }
+  const toolCraftWindow=()=>document.querySelector('.window-crafting');
+  function toolCraftDetail(plan) {
+    const root=toolCraftWindow()?.querySelector('.crafting-detail-pane');
+    const text=controlText(root);
+    if(!root || !text.startsWith(plan.name) || !text.includes(`${plan.tier} 階採集工具`))return null;
+    const quantity=root.querySelector('input[type="number"]');
+    const maximum=Number(quantity?.max);
+    const button=scopedButton(root,/^加工(?:\s.*)?$/,true);
+    return {root,quantity,maximum,button,text};
+  }
+  async function ensureGatheringTools(option) {
+    let plan=gatheringToolPlan(option);
+    const key=`補製採集工具 ${plan.name}`;
+    const previous=ledger()[key];
+    if(previous?.state==='pending'){
+      const count=(PAGE_WINDOW.__world?.player?.inv||[]).filter(i=>i.itemId===plan.itemId).reduce((n,i)=>n+Number(i.qty||0),0);
+      if(count>=(previous.beforeCount??Infinity)+2)saveStep(key,'done',`${plan.name} ×2 已由背包確認`);
+      else throw new Error(`${plan.name}前次製作結果未確認，不重送；請核對本日紀錄`);
+    }
+    if(plan.usable.length)return true;
+    await closeWindows();
+    await travelTo('王都聖輝城');
+    await talkTo({name:'王都工坊熔爐',forge:true,regionId:'holy_city'},/^工坊/);
+    await tapSingleClick(()=>scopedButton(toolCraftWindow(),'基礎製作'),'基礎製作');
+    await tapSingleClick(()=>scopedButton(toolCraftWindow(),new RegExp(`^${option.gatheringType}\\s*7$`)),`${option.gatheringType}工具`);
+    await tapSingleClick(()=>scopedButton(toolCraftWindow()?.querySelector('.crafting-list-pane'),new RegExp(`^${plan.name}\\s*無技能限制`)),plan.name);
+    let detail=await until(()=>toolCraftDetail(plan),'等待指定工具配方');
+    if(!detail.quantity || !Number.isFinite(detail.maximum))throw new Error('無法確認製作上限');
+    if(detail.maximum<2 || !detail.button || isDisabledControl(detail.button)){
+      saveStep(key,'skipped',`${plan.name}需製作2件，目前上限${detail.maximum}；材料或加工費不足，略過自動採集`);
+      await closeWindows();return false;
+    }
+    // 使用原生數量加減鈕，避免直接改值未觸發React狀態。
+    for(let n=0;n<55 && Number(detail.quantity.value)!==2;n++){
+      const value=Number(detail.quantity.value);
+      if(!Number.isInteger(value)||value<1)throw new Error('製作數量格式異常');
+      await tapSingleClick(()=>scopedButton(toolCraftDetail(plan)?.root,value<2?'＋':'−'),'設定工具製作數量2');
+      detail=await until(()=>toolCraftDetail(plan),'等待工具數量更新');
+    }
+    detail=toolCraftDetail(plan);
+    if(Number(detail?.quantity?.value)!==2 || detail.maximum<2 || !enabled(detail.button))throw new Error('製作兩件工具的條件已變動');
+    const beforeCount=(PAGE_WINDOW.__world.player.inv||[]).filter(i=>i.itemId===plan.itemId).reduce((n,i)=>n+Number(i.qty||0),0);
+    // 先保存送出紀錄；逾時、重載或停止都不能盲目再製作。
+    ledger()[key]={state:'pending',beforeCount,itemId:plan.itemId,quantity:2,detail:`${plan.name} ×2 等待加工結果`,at:now()};persist();
+    await tapSingleClick(()=>{
+      const current=toolCraftDetail(plan);
+      return Number(current?.quantity?.value)===2 && current.maximum>=2 ? current.button:null;
+    },`加工${plan.name} ×2`);
+    await until(()=>{
+      const count=(PAGE_WINDOW.__world?.player?.inv||[]).filter(i=>i.itemId===plan.itemId).reduce((n,i)=>n+Number(i.qty||0),0);
+      return count>=beforeCount+2 && gatheringToolPlan(option).usable.length>0;
+    },'加工後未確認兩件工具入袋，不重送',45000);
+    saveStep(key,'done',`${plan.name} ×2 已確認入袋；${detail.text}`);
+    await closeWindows();return true;
+  }
+  const gatheringWaiting=state=>/等待|等候|重生|刷新|(?:資源|節點).{0,8}(?:耗盡|不足|暫無|尚無)|(?:暫無|尚無).{0,8}(?:資源|節點)/.test(state);
+  function gatheringStatus(hud) {
+    const label=[...(hud?.querySelectorAll('span')||[])].find(el=>controlText(el)==='狀態');
+    return label?.nextElementSibling ? controlText(label.nextElementSibling) : controlText(hud);
+  }
+  function gatheringVigor() {
+    const native=PAGE_WINDOW.__world?.player?.lifeVigor;
+    return Number.isFinite(native)&&native>=0 ? native : readVitality()?.current;
+  }
+  function gatheringShouldSwitch(status,vigor,unchangedMs,waitingMs) {
+    return Number.isFinite(vigor) && vigor>0 && gatheringWaiting(status);
+  }
   async function retryGatheringOnce(option,material) {
     if(dayState.gatheringRestartUsed)return false;
     dayState.gatheringRestartUsed=true;persist();
-    saveStep('採集中斷重啟','retry-approved','活力未耗盡，僅嘗試重新啟動一次；實際操作另存原生紀錄');
+    saveStep('採集中斷重啟','pending','活力未耗盡，僅嘗試重新啟動一次');
     try{
       const started=await startGatheringWithTools(option,material);
       saveStep('採集中斷重啟',started?'done':'skipped',started?'已重新啟動，繼續監測活力':'無法補足工具，略過');
       return started;
     }catch(error){
-      if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;
+      if(error instanceof RunCancelled)throw error;
       saveStep('採集中斷重啟','skipped',error.message);return false;
     }
   }
 
-  async function switchGatheringChannel({target=null,final=false}={}){
-    const current=await until(()=>readMinimapContext().channel,'等待原生採集分線',12000),next=target??(current>=10?1:current+1);
+  async function switchGatheringChannel({target=null,final=false}={}) {
+    const current=await until(()=>readMinimapContext().channel,'無法辨識目前採集分線',12000);
+    const next=target??(current>=10?1:current+1);
     if(!Number.isInteger(next)||next<1||next>10)throw new Error('目標分線無效');
-    await until(async()=>{const result=await nativeActions.runChannel(next);return result.state==='confirmed';},'等待原生 CH.'+next+' 切換完成',30000,runEpoch,true);
-    await until(()=>nativeActions.closeChannelMap(),'等待原生地圖關閉',12000);
-    if(!final)saveStep('採集換線','done','CH.'+current+' → CH.'+next+'；原生分線已確認');return 'CH.'+current+' → CH.'+next+'；原生分線已確認';
+    if(current===next)return `已確認 CH.${next}`;
+    await until(()=>currentMapWindow() || (pressMap(),false),'採集停滯，按 M 開啟地圖',12000);
+    const click=final?tapSingleClick:tap;
+    await click(()=>findClickable(label=>label===`CH.${next}`,currentMapWindow()),`切換分線 CH.${next}`);
+    await until(()=>{
+      readMinimapContext();
+      return locationContext.channel===next;
+    },`換線後無法確認 CH.${next}`,30000);
+    if(currentMapWindow())await until(()=>!currentMapWindow() || (pressEscape(),false),'關閉換線地圖',12000);
+    if(!final)saveStep('採集換線','done',`CH.${current} → CH.${next}；已確認分線，交由採集監控確認恢復`);
+    return `CH.${current} → CH.${next}；已確認分線`; 
   }
 
   const GATHER_GUILD_SKILLS=[{name:'採集號子',id:'guild_gather_chant'},{name:'安全歸途',id:'guild_safe_return'}];
-  function gatherSkillConnectionError(){const world=PAGE_WINDOW.__world,connection=readNativeConnectionState({document,getWorld:()=>world});return connection.disconnected===true||world?.serverAuthoritativeResources===false&&world.isServerOwnedRegion?.()===true?'原生世界連線中斷，無法施放公會技能':'';}
+  function gatheringGuildBuffActive(name){
+    return [...document.querySelectorAll('[aria-label="player-buffs"] .cpm-buff')].some(buff=>{
+      const label=buff.getAttribute('aria-label')||'',seconds=Number(buff.querySelector('.cpm-buff-time')?.textContent);
+      return label.startsWith(name+' Lv.')&&/狀態效果作用中/.test(label)&&Number.isFinite(seconds)&&seconds>0;
+    });
+  }
+  function gatheringGuildSkillSlot(skill){
+    const slots=[...document.querySelectorAll('.skill-slot.guild-slot')].filter(el=>rendered(el)&&new RegExp('^'+skill.name+' Lv\\.\\d+$').test(el.getAttribute('title')||'')&&(!skill.id||el.getAttribute('data-bind-id')===skill.id));
+    return slots.length===1?slots[0]:null;
+  }
+  function gatherSkillConnectionError(){
+    return [...document.querySelectorAll('.toast.warn .toast-text')].filter(huntWorldPromptVisible).map(controlText).find(text=>/^世界連線中斷[，,]\s*(?:無法施放公會技能|戰鬥已暫停)$/.test(text))||'';
+  }
   function clearGatherSkillReloadTicket(){try{sessionStorage.removeItem(roleStoreKey('gather-skill-reload'));}catch{}}
   function pauseGatherSkillPreparation(reason){
     saveStep('公會採集技能準備','warn',reason);runtime.running=false;runtime.paused=false;runtime.resumeAvailable=true;runtime.phase='start';runtime.message='採集準備已暫停；'+reason;runtime.warning=reason;runEpoch++;persist();updatePanel();roleCoordinator.release();throw new RunCancelled();
@@ -8785,7 +9786,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     let acquired=false;
     const stop=reason=>{
       clearTicket();runtime.running=false;runtime.paused=false;runtime.resumeAvailable=false;runtime.message=reason+'；腳本已停止';runtime.warning=reason;
-      if(acquired&&roleCoordinator.owns(role)){try{stopWorldRecovery(reason);}catch(error){if(!((error instanceof RunCancelled||isNativeRateLimit(error))))throw error;}}
+      if(acquired&&roleCoordinator.owns(role)){try{stopWorldRecovery(reason);}catch(error){if(!(error instanceof RunCancelled))throw error;}}
       updatePanel();
     };
     try{
@@ -8795,7 +9796,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
         if(runEpoch!==epoch||!valid()||sessionStorage.getItem(key)!==JSON.stringify(ticket)){clearTicket();return;}
         const w=PAGE_WINDOW.__world;
         if(w?.player?.name&&w.player.name!==ticket.role){stop('重整後角色已切換，未接續');return;}
-        if(w?.player?.name===ticket.role&&typeof w.charId==='string'&&Boolean(w.charId)&&Array.isArray(w.buffs)){
+        if(w?.player?.name===ticket.role&&document.querySelector('[aria-label="player-buffs"]')){
           if(ticket.charId&&w.charId!==ticket.charId){stop('重整後角色識別不符，未接續');return;}
           if(!acquired){
             if(!await roleCoordinator.acquire(role)){stop('重整後無法取得角色執行鎖，未接續');return;}
@@ -8827,69 +9828,165 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       stop('重整後六十秒內世界狀態未就緒');
     }finally{worldRecoveryBooting=false;if(acquired&&!runtime.running)roleCoordinator.release();}
   }
+  class GatherSkillUnavailable extends Error {}
   async function ensureGatheringGuildSkills(){
+    const epoch=runEpoch;
+    // 公會技能屬採集前的加成；冷卻、缺MP、缺技能與未確認效果均不阻擋採集。
     for(const skill of GATHER_GUILD_SKILLS){
-      await guard(runEpoch);const result=await nativeActions.runGatherGuildSkill(skill.id);requireRunOwner();
-      if(result.disconnected)return recoverGatherSkillConnection('原生世界資源未同步，公會技能未確認');
-      saveStep('採集公會技能:'+skill.name,result.confirmed?'done':'skipped',result.confirmed?(result.alreadyActive?'原生公會效果作用中，不重複施放':'原生同技能效果已確認'):result.reason==='unconfirmed'?'本次效果未確認，不重送；採集照常進行':'原生冷卻／缺MP／不可用；採集照常進行');
+      await guard(epoch);const key='採集公會技能:'+skill.name;
+      if(gatheringGuildBuffActive(skill.name)){saveStep(key,'done','角色狀態效果作用中，不重複施放');continue;}
+      if(!gatheringGuildSkillSlot(skill)){
+        const expand=findClickable(label=>/展開公會技能列/.test(label));if(expand)await tapSingleClick(expand,'展開公會技能列',epoch);
+      }
+      const slot=gatheringGuildSkillSlot(skill);
+      if(!slot){saveStep(key,'skipped','找不到唯一可用技能格；採集照常進行');continue;}
+      const cooldown=controlText(slot.querySelector('.cd-cover'));
+      if(!enabled(slot)||cooldown){saveStep(key,'skipped',cooldown?'技能冷卻'+cooldown+'，不等待；採集照常進行':'技能目前不可施放，採集照常進行');continue;}
+      const existingError=gatherSkillConnectionError();if(existingError)return recoverGatherSkillConnection(existingError);
+      let connectionError='';const observer=typeof MutationObserver==='function'?new MutationObserver(()=>{connectionError ||= gatherSkillConnectionError();}):null;
+      observer?.observe(document.body,{childList:true,subtree:true,characterData:true});
+      try{
+        try{await tapSingleClick(()=>{const current=gatheringGuildSkillSlot(skill);if(!current||!enabled(current)||controlText(current.querySelector('.cd-cover')))throw new GatherSkillUnavailable();return current;},'施放公會技能'+skill.name,epoch,()=>saveStep(key,'pending','已點擊技能格，核對作用中效果與世界連線回應'));}
+        catch(error){if(error instanceof GatherSkillUnavailable){saveStep(key,'skipped','送出前技能變成冷卻或不可用，採集照常進行');continue;}throw error;}
+        try{await until(()=>gatheringGuildBuffActive(skill.name)||(connectionError ||= gatherSkillConnectionError()),'確認'+skill.name+'施放回應',2500,epoch);}catch(error){if(error instanceof RunCancelled)throw error;saveStep(key,'skipped','本次效果尚未確認，不等冷卻；採集照常進行，下次仍依實際技能格可用狀態判斷');continue;}
+        if(!gatheringGuildBuffActive(skill.name)){
+          saveStep(key,'retry-approved',connectionError+'；遊戲拒絕施放，重整後重新核對');return recoverGatherSkillConnection(connectionError);
+        }
+        saveStep(key,'done','角色狀態效果作用中，剩餘秒數大於0');
+      }finally{observer?.disconnect();}
     }
-    saveStep('公會採集技能準備','done','已核對兩項原生公會技能；冷卻或未確認效果不阻擋採集');
+    saveStep('公會採集技能準備','done','已檢查兩項公會技能；作用中略過、可施放則送出、冷卻或不可用不阻擋採集');
   }
 
-  function nativeGatherStatus(){const state=nativeActions.readGatherStatus();if(!state)throw new Error('原生採集狀態未知，保留現場');return state;}
-  async function startGatheringWithTools(option,material){
-    const target=nativeGatherTarget(option),world=PAGE_WINDOW.__world,levels=Object.values(nativeGatherKinds).map(info=>world.player?.lifeSkills?.[info.skill]?.level);
-    if(levels.every(level=>level===1)&&!dayState.gatheringReloaded){dayState.gatheringReloaded=true;persist();runtime.message='四項原生技能均為1等，僅重新整理一次；重載後按繼續';requestIntegratedReload();throw new RunCancelled();}
-    const level=world.player?.lifeSkills?.[target.skill]?.level;if(!Number.isSafeInteger(level)||level<target.requiredLevel)throw new Error('原生技能等級未知或不足，指定T'+target.tier+'需要Lv'+target.requiredLevel);
-    if(!await ensureGatheringTools(option))return false;
-    await ensureGatheringGuildSkills();beginGatherNet();const result=await nativeActions.runGatherStart(option);if(!result.confirmed)throw new Error('原生採集開始未確認');
-    if(dayState.gatherSkillRecovery)dayState.gatherSkillRecovery.restartContinuation=false;return true;
+  async function startGatheringWithTools(option,material) {
+      await openPanel(/^自動採集$/, /自動採集設定/,{code:'KeyJ',key:'j',label:'Ctrl+J',options:{ctrlKey:true}});
+      const get=()=>panel(/自動採集設定/);
+      const skills=[...get().querySelectorAll('button')].filter(el=>/^(?:伐木|採礦|採藥|釣魚)\s*Lv\.?\s*\d+$/.test(labelOf(el)));
+      if(skills.length===4 && skills.every(el=>/Lv\.?\s*1$/.test(labelOf(el))) && !dayState.gatheringReloaded){
+        dayState.gatheringReloaded=true;persist();
+        runtime.message='四技能均為1等，僅重新整理一次；重載後按繼續';persist();
+        requestIntegratedReload();throw new RunCancelled();
+      }
+      const skill=skills.find(el=>labelOf(el).startsWith(option.gatheringType));
+      const level=Number(labelOf(skill).match(/Lv\.?\s*(\d+)/)?.[1]);
+      const required=1+5*(option.gatheringTier-1);
+      if(!Number.isFinite(level)||level<required)throw new Error(`技能${level||'未知'}等，指定T${option.gatheringTier}需要Lv${required}`);
+      if(!await ensureGatheringTools(option))return false;
+      if(!get())await openPanel(/^自動採集$/, /自動採集設定/,{code:'KeyJ',key:'j',label:'Ctrl+J',options:{ctrlKey:true}});
+      const typeButton=()=>scopedButton(get(),new RegExp('^'+option.gatheringType+'\\s*Lv'));
+      await tapSingleClick(typeButton,option.gatheringType);
+      const materialButton=()=>scopedButton(get(),new RegExp(`^${material}\\s*Lv\\.?\\s*${required}(?:\\D|$)`));
+       await tapSingleClick(materialButton,`${material} T${option.gatheringTier}`);
+       await until(()=>selectionConfirmed(typeButton())&&selectionConfirmed(materialButton()),'無法確認採集技能／材料／階級選中狀態，未啟動',8000);
+       await ensureGatheringGuildSkills();
+       beginGatherNet();
+      await tapSingleClick(()=>scopedButton(get(),/^▶?\s*開始自動採集/),'開始自動採集',runEpoch,()=>ownActivity('gathering',true));
+      await until(()=>document.querySelector('.auto-gather-hud'),'未確認自動採集開始',30000);
+      if(dayState.gatherSkillRecovery)dayState.gatherSkillRecovery.restartContinuation=false;
+      if(dayState.operations?.gathering){dayState.operations.gathering.startPending=false;persist();}
+      return true;
   }
-  async function handleGathering(){
-    await guard(runEpoch);const initialVigor=gatheringVigor(),initial=nativeGatherStatus();
-    if(!initial.active&&dayState.operations?.gathering?.startPending)throw new Error('先前採集啟動尚未確認，保留現場');
-    if(!initial.active&&initialVigor===0){saveStep('採集中斷重啟','skipped','已確認活力耗盡，無需重啟');saveStep('採集略過','skipped','已確認活力耗盡，無需補跑');saveStep('指定材料採集','done','已重新確認原生活力耗盡，無需補跑');return finishTask('完成','已確認活力耗盡，無需補跑');}
-    const option=userOptions(),material=MATERIALS[option.gatheringType]?.[option.gatheringTier-1];if(!material)return finishTask('略過','未指定採集技能與材料階級');
-    if(initial.active&&!gatheringIdentityMatches(initial,option,material)){blockScene('原生採集目標與設定不符，未接管使用者作業');throw new Error('原生採集目標不符，未接管／未停止');}
-    dayState.gatheringRestartUsed=false;saveStep('採集中斷重啟','skipped',initial.active?'已確認原生採集，重新監測活力':'目前無採集作業，依剩餘活力啟動');saveStep('採集略過','skipped','本次重新核對原生活力');let skipReason='';
+
+  async function handleGathering() {
+    await guard(runEpoch);
+    const initialVigor=gatheringVigor();
+    if(!Number.isFinite(initialVigor))throw new Error('無法確認剩餘活力，未啟動採集');
+    const initialHud=document.querySelector('.auto-gather-hud');
+    if(!initialHud && dayState.operations?.gathering?.startPending)throw new Error('先前採集啟動尚未確認，保留現場');
+    if(!initialHud && initialVigor===0){
+      saveStep('採集中斷重啟','skipped','已確認活力耗盡，無需重啟');
+      saveStep('採集略過','skipped','已確認活力耗盡，無需補跑');
+      saveStep('指定材料採集','done','已重新確認活力耗盡，無需補跑');
+      return finishTask('完成','已確認活力耗盡，無需補跑');
+    }
+    const option=userOptions(), material=MATERIALS[option.gatheringType]?.[option.gatheringTier-1];
+    if(!material)return finishTask('略過','未指定採集技能與材料階級');
+    if(initialHud && !gatheringIdentityMatches(initialHud,option,material)){
+      blockScene('既有採集身份不足或與設定不符；未接管，保留使用者採集，其餘操作項目阻擋');
+      throw new Error('既有採集目標身份不足或與設定不符，未接管／未停止使用者採集');
+    }
+    // 每次進入採集階段依原生活力重查；中斷自救次數只限制本次執行。
+    dayState.gatheringRestartUsed=false;
+    saveStep('採集中斷重啟','skipped',initialHud?'已確認目前採集，重新監測活力':'目前無採集作業，依剩餘活力重新啟動');
+    saveStep('採集略過','skipped','本次重新核對剩餘活力');
+    let skipReason='';
     await step('指定材料採集',async()=>{
-      const existing=nativeGatherStatus();if(existing.active){if(!gatheringIdentityMatches(existing,option,material))throw new Error('原生採集目標已變，未接管');beginGatherNet();await nativeActions.runGatherStart(option);}else if(!await startGatheringWithTools(option,material)){skipReason='工具不足且無法製作兩件';return skipReason;}
+      const existingHud=document.querySelector('.auto-gather-hud');
+      if(existingHud){if(!gatheringIdentityMatches(existingHud,option,material)){blockScene('既有採集身份不足或與設定不符；未接管，保留使用者採集，其餘操作項目阻擋');throw new Error('既有採集目標身份不足或與設定不符，未接管／未停止使用者採集');}beginGatherNet();ownActivity('gathering');}
+      if(!existingHud){
+        if(!await startGatheringWithTools(option,material)){skipReason='工具不足且無法製作兩件';return skipReason;}
+      }
       let lastVigor=gatheringVigor(),lastChanged=workNow(),waitingSince=0,lastSwitch=0;
       await until(async()=>{
-        const vigor=gatheringVigor(),state=nativeGatherStatus();if(vigor!==lastVigor){lastVigor=vigor;lastChanged=workNow();waitingSince=0;}
-        if(vigor===0)return !state.active||workNow()-lastChanged>=15000;
-        if(state.active&&!gatheringIdentityMatches(state,option,material))throw new Error('原生採集目標被替換，未停止其他作業');
-        if(!state.active){if(!await retryGatheringOnce(option,material)){skipReason='重新啟動後仍無法完成活力消耗，略過採集';return true;}lastVigor=gatheringVigor();lastChanged=workNow();waitingSince=0;return false;}
-        if(gatheringWaiting(state.state)){if(!waitingSince)waitingSince=workNow();}else waitingSince=0;
+        const vigor=gatheringVigor();
+        if(!Number.isFinite(vigor))throw new Error('無法確認剩餘活力，保留現場');
+        if(vigor!==lastVigor){lastVigor=vigor;lastChanged=workNow();waitingSince=0;}
+        const hud=document.querySelector('.auto-gather-hud');
+        if(vigor===0)return !hud || workNow()-lastChanged>=15000;
+        if(!hud){
+          if(!await retryGatheringOnce(option,material)){skipReason='重新啟動後仍無法完成活力消耗，略過採集';return true;}
+          lastVigor=gatheringVigor();lastChanged=workNow();waitingSince=0;return false;
+        }
+        const status=gatheringStatus(hud);
+        if(/(?:工具|鎬|斧|鐮|釣竿).{0,8}(?:不足|耗盡|損壞)|沒有合用工具/.test(status)){
+          await tapSingleClick(()=>scopedButton(document.querySelector('.auto-gather-hud'),/^停止$/),'工具不足，停止目前採集');
+          await until(()=>!document.querySelector('.auto-gather-hud'),'等待工具不足採集停止');
+          return false;
+        }
+        if(gatheringWaiting(status)){if(!waitingSince)waitingSince=workNow();}else waitingSince=0;
         if(workNow()-lastChanged>=5*60*1000){skipReason='活力五分鐘未消耗，略過剩餘採集';return true;}
-        if(gatheringShouldSwitch(state.state,vigor)&&(!lastSwitch||workNow()-lastSwitch>=1000)){try{await switchGatheringChannel();}catch(error){if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;skipReason='換線未確認：'+error.message;return true;}lastSwitch=workNow();waitingSince=0;return false;}
-        runtime.message=option.gatheringType+' T'+option.gatheringTier+' '+material+'；活力'+vigor+'；'+state.state;return false;
-      },'等待指定材料採集結束',90*60*1000);return skipReason||material+'採集至活力耗盡';
-    },{repeat:true});finishGatherNet();
-    if(dayState.operations?.gathering){const stopped=await step('停止採集',async()=>{if(!await nativeActions.stopGather(false))throw new Error('原生採集停止未確認');},{repeat:true});if(!stopped)return finishRecipe();}
-    if(skipReason){saveStep('指定材料採集','warn',skipReason+'；活力尚未耗盡，可補跑');saveStep('採集略過','skipped',skipReason);await nativeActions.closeGatherWindow();return finishTask('警示',skipReason+'；活力尚未耗盡，可補跑');}finishRecipe();
+        if(gatheringShouldSwitch(status,vigor,workNow()-lastChanged,waitingSince?workNow()-waitingSince:0) && (!lastSwitch||workNow()-lastSwitch>=1000)){
+          try{await switchGatheringChannel();}catch(error){if(error instanceof RunCancelled)throw error;skipReason='換線未確認：'+error.message;return true;}
+          lastSwitch=workNow();waitingSince=0;return false;
+        }
+        runtime.message=`${option.gatheringType} T${option.gatheringTier} ${material}；活力${vigor}；${status}`;
+        return false;
+      },'等待指定材料採集結束',90*60*1000);
+      return skipReason || `${material}採集至活力耗盡`;
+    },{repeat:true});
+    finishGatherNet();
+    if(dayState.operations?.gathering && document.querySelector('.auto-gather-hud')){
+      const stopped=await step('停止採集',async()=>{
+        await tapSingleClick(()=>scopedButton(document.querySelector('.auto-gather-hud'),/^停止$/),'停止自動採集');
+        await until(()=>!document.querySelector('.auto-gather-hud'),'採集未停止');
+      },{repeat:true});
+      if(!stopped)return finishRecipe();
+    }
+    if(dayState.operations?.gathering){delete dayState.operations.gathering;if(!Object.keys(dayState.operations).length)delete dayState.operations;persist();}
+    if(skipReason){saveStep('指定材料採集','warn',skipReason+'；活力尚未耗盡，可補跑');saveStep('採集略過','skipped',skipReason);await closeWindows();return finishTask('警示',skipReason+'；活力尚未耗盡，可補跑');}
+    finishRecipe();
   }
 
-
-  async function trialOpen(){
-    if(nativeActions.readDungeonSelect())return;
-    await travelTo('王都聖輝城');const target={id:'dungeon_master',name:'副本守門員索倫',regionId:'holy_city'};
-    nativeNavigator.reset();await until(()=>{requireRunOwner();const result=nativeNavigator.tick(target,()=>Boolean(nativeActions.readDungeonNpc(target)));if(result.state==='blocked')throw new Error(result.message);runtime.message=result.message||'等待原生試煉守門員';return result.state==='opened';},'等待原生試煉守門員對話',90000);
-    await until(()=>nativeActions.openDungeonNpc(target),'開啟原生試煉清單',12000);await until(()=>nativeActions.readDungeonSelect(),'等待原生試煉副本資料',12000);
+  async function trialOpen() {
+    if(panel(/試煉之門\s*DUNGEON/))return;
+    await travelTo('王都聖輝城');
+    await talkTo({name:'副本守門員索倫',id:'dungeon_master',regionId:'holy_city'},/進入試煉之門/);
+    await tap(()=>scopedButton(panel(/進入試煉之門/),'進入試煉之門'),'進入試煉之門');
+    await until(()=>panel(/試煉之門\s*DUNGEON/),'等待試煉之門');
   }
 
   // 沿用副本重新進入助手的完成畫面流程：成功文字與控制項同時出現、等待後重新確認，最後才原生點擊。
   const DUNGEON_RETURN_MIN_DELAY_MS = 1000;
   const DUNGEON_RETURN_MAX_DELAY_MS = 4000;
-
+  const dungeonResultPanel=()=>document.querySelector('.dungeon-reward-panel') || document.querySelector('.dungeon-reward-overlay');
+  const dungeonReturnButton=()=>document.querySelector('button.dungeon-reward-action-return:not(:disabled)') ||
+    scopedButton(dungeonResultPanel(),'返回村莊');
   const DAILY_DUNGEON_NAME='石閣地下城';
-  const dungeonResultPanel=()=>nativeActions.readDungeonResult();
-  function dailyDungeonResult(){const result=nativeActions.readDungeonResult();return result?{success:result.success,ready:result.ready,rewards:result.rewards,disposition:result.disposition}:null;}
+  function dailyDungeonResult() {
+    const root=dungeonResultPanel(),text=controlText(root);
+    if(!root)return null;
+    if(!text.includes(DAILY_DUNGEON_NAME))throw new Error('結算不是指定石閣地下城，保留現場');
+    if(text.includes('挑戰成功'))return {success:true,text};
+    if(/挑戰失敗|副本失敗/.test(text))return {success:false,text};
+    return null;
+  }
+  const dungeonBossBarVisible=text=>text.includes('BOSSENCOUNTER') ||
+    (text.includes('首領戰鬥中') && text.includes('AGGRO'));
 
   let dungeonAutoRequestedAt=0;
   let dungeonAutoOffSince=0;
 
-  function verifiedDailyDungeon(){return nativeDungeonSessionMatches(dayState.dailyDungeonSession,PAGE_WINDOW.__world);}
+  function verifiedDailyDungeon(){const w=PAGE_WINDOW.__world,session=dayState.dailyDungeonSession;return Boolean(session?.confirmed && session.role===role && w?.player?.name===role && w.mode==='dungeon' && w.regionId===session.regionId && (!session.charId||w.charId===session.charId));}
   function bossApproachTick(){
     const w=PAGE_WINDOW.__world;if(!verifiedDailyDungeon()||w.dead||w.player?.hp<=0||w.castingState||w.pendingSkill||w.isWorldInteractionLocked?.())return '未符合靠近條件';
     if(!Array.isArray(w.mobs)||typeof w._mobAuthPos!=='function'||typeof w.moveOnly!=='function')return '缺少已確認怪物／原生位置／移動入口';
@@ -8906,32 +10003,169 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     ownActivity('bossMove');Object.assign(dayState.operations.bossMove,{x,y});persist();w.moveOnly(x,y);state.moves++;state.lastMove=workNow();
     return '朝唯一Boss原生位置有限靠近，第'+state.moves+'次；距離'+Math.round(distance);
   }
-
   async function exitVerifiedDailyDungeon(reason){
-    if(!await cleanupOwnedActivities(reason))return false;if(!verifiedDailyDungeon()){blockScene(reason+'；原生副本場次不足，保留現場');return false;}
-    try{const result=await nativeActions.runDungeonResult('exit');if(!result.confirmed)throw new Error('原生退出未確認');delete dayState.dailyDungeonSession;persist();return true;}catch(error){if((error instanceof RunCancelled||isNativeRateLimit(error)))throw error;blockScene(reason+'；'+error.message);return false;}
-  }
-  function scanDungeonCombat(){
-    const world=PAGE_WINDOW.__world,inside=verifiedDailyDungeon(),bossVisible=inside&&Array.isArray(world.mobs)&&world.mobs.some(mob=>mob.boss===true&&!mob.dead&&Number.isFinite(mob.hp)&&mob.hp>0);
-    if(!inside)return {inside:false,bossVisible:false,auto:'unknown'};const auto=typeof world.autoBattle==='boolean'?(world.autoBattle?'on':'off'):'unknown';
-    if(auto==='on'){dungeonAutoRequestedAt=0;dungeonAutoOffSince=0;}else if(auto==='off'){if(!dungeonAutoOffSince)dungeonAutoOffSince=workNow();if(!dungeonAutoRequestedAt&&workNow()-dungeonAutoOffSince>=1800&&world.autoBattlePendingAction!=='start'&&typeof world.toggleAutoBattle==='function'){ownActivity('auto');world.toggleAutoBattle();dungeonAutoRequestedAt=workNow();}}else dungeonAutoOffSince=0;return {inside,bossVisible,auto};
-  }
-  async function returnAfterDungeonSuccess(){
-    dungeonAutoRequestedAt=0;dungeonAutoOffSince=0;let bossSeen=false,autoOnAt=null;const started=workNow();
-    const outcome=await until(()=>{if(nativeActions.hasSecurityChallenge())throw new Error('出現原生安全驗證，保留現場等待手動處理');const result=dailyDungeonResult();if(result?.ready)return result.success?true:'failed';const state=scanDungeonCombat();runtime.message=bossApproachTick();if(state.auto==='on'&&autoOnAt===null)autoOnAt=workNow();if(state.bossVisible&&!bossSeen){bossSeen=true;saveStep('最低等副本首領戰鬥','done','原生本場有存活Boss');}if(autoOnAt!==null&&workNow()-autoOnAt>=120000)return 'stuck';if(autoOnAt===null&&workNow()-started>=120000)return 'auto-unconfirmed';return false;},'監測原生石閣地下城 AUTO 與結算',250000);
-    if(outcome!==true&&outcome!=='failed'){const reason=outcome==='stuck'?'AUTO ON 後兩分鐘未確認結算':'兩分鐘內未確認 AUTO ON';saveStep('副本卡住診斷','done',JSON.stringify({reason,player:{x:PAGE_WINDOW.__world?.player?.x,y:PAGE_WINDOW.__world?.player?.y},auto:PAGE_WINDOW.__world?.autoBattle,bossApproach:runtime.counters.bossApproach||null}));const exited=await exitVerifiedDailyDungeon(reason);throw new Error(reason+'；'+(exited?'已核對原生退出':'退出未確認，保留現場'));}
-    await delay(randomBetween(DUNGEON_RETURN_MIN_DELAY_MS,DUNGEON_RETURN_MAX_DELAY_MS));await guard(runEpoch);const current=dailyDungeonResult();if(!current?.ready)throw new Error('等待後原生結算／返回入口已變');saveStep('最低等副本結算','done',JSON.stringify(current));const returned=await nativeActions.runDungeonResult('return');if(!returned.confirmed)throw new Error('原生副本返回未確認');if(!current.success)throw new Error('石閣地下城挑戰失敗，已返回王都，本日任務未完成');await cleanupOwnedActivities('副本結束');delete dayState.dailyDungeonSession;dayState.dungeonEntered=true;persist();
+    if(!await cleanupOwnedActivities(reason))return false;
+    if(!verifiedDailyDungeon()){blockScene(reason+'；副本身份不足，未盲目退出');return false;}
+    const button=document.querySelector('button[title="離開副本"]');
+    if(!button||!enabled(button)){blockScene(reason+'；缺少可用退出入口，需人工退出');return false;}
+    await tapSingleClick(button,'卡住後單次離開已確認副本');
+    const exited=await boundedCleanupCheck(()=>PAGE_WINDOW.__world?.mode!=='dungeon' && !document.querySelector('button[title="離開副本"]'));
+    if(!exited){blockScene(reason+'；退出未確認或需要未驗證確認視窗，需人工處理');return false;}
+    delete dayState.dailyDungeonSession;persist();return true;
   }
 
-  function soloDungeonParty(){return nativePartySolo(PAGE_WINDOW.__world,host.characterId);}
-  async function leaveDailyParty(options={}){void options;const result=await nativeActions.runParty('leave');if(!result.confirmed)throw new Error('原生離隊尚未確認');return '已確認離隊，保持單人';}
-  async function clearPartyBeforeDungeon(){const existing=soloDungeonParty(),result=await nativeActions.runParty('ensure-solo');if(!result.confirmed)throw new Error('原生單人隊伍尚未確認');return existing?'保留自己的單人隊伍，隊伍設定不變':'已建立自己的單人隊伍，隊伍設定不變';}
+  function scanDungeonCombat() {
+    const text=pageText();
+    const bossVisible=dungeonBossBarVisible(text);
+    const world=PAGE_WINDOW.__world;
+    const inside=world?.mode==='dungeon' || Boolean(document.querySelector('button[title="離開副本"]')) || bossVisible;
+    if (!inside) return {inside:false,bossVisible,auto:'unknown'};
+    const auto=typeof world?.autoBattle==='boolean' ? (world.autoBattle?'on':'off') : autoState();
+    if (auto==='on') { dungeonAutoRequestedAt=0; dungeonAutoOffSince=0; }
+    else if (auto==='off') {
+      if (!dungeonAutoOffSince) dungeonAutoOffSince=workNow();
+      // 入場先讓遊戲自行啟用；明確持續 OFF 才送一次，等待 ON 確認，禁止盲目重送。
+      if (verifiedDailyDungeon() && !dungeonAutoRequestedAt && workNow()-dungeonAutoOffSince>=1800 && (world?.autoBattle===false || autoState()==='off')) {
+        if(world?.autoBattlePendingAction==='start')return {inside:true,bossVisible,auto};
+        if(typeof world?.toggleAutoBattle==='function'){
+          ownActivity('auto');world.toggleAutoBattle();dungeonAutoRequestedAt=workNow();
+        }else if (verifiedDailyDungeon() && (ownActivity('auto'),pressAuto())) dungeonAutoRequestedAt=workNow();
+      }
+    } else dungeonAutoOffSince=0;
+    return {inside:true,bossVisible,auto};
+  }
 
+  async function returnAfterDungeonSuccess() {
+    dungeonAutoRequestedAt=0;
+    dungeonAutoOffSince=0;
+    let bossBarSeen=false;
+    let autoOnAt=null;
+    const monitorStartedAt=workNow();
+    const outcome=await until(()=>{
+      if(document.querySelector('[role="dialog"][aria-label="安全驗證"]'))throw new Error('出現安全驗證，保留現場等待手動處理');
+      const result=dailyDungeonResult();
+      if(result && dungeonReturnButton())return result.success ? true : 'failed';
+      const state=scanDungeonCombat();
+      runtime.message=bossApproachTick();
+      if(state.auto==='on' && autoOnAt===null)autoOnAt=workNow();
+      if(state.bossVisible && !bossBarSeen){
+        bossBarSeen=true;
+        saveStep('最低等副本首領戰鬥','done','已辨識首領血條與戰鬥文字');
+      }
+      if(autoOnAt!==null && workNow()-autoOnAt>=120000)return 'stuck';
+      if(autoOnAt===null && workNow()-monitorStartedAt>=120000)return 'auto-unconfirmed';
+      return false;
+    },'監控石閣地下城 AUTO ON 與返回村莊按鈕',250000);
+    if(outcome!==true && outcome!=='failed'){
+      const reason=outcome==='stuck'?'AUTO ON 後兩分鐘未出現完成畫面':'兩分鐘內未確認 AUTO ON';
+      const diagnostic={reason,player:{x:PAGE_WINDOW.__world?.player?.x,y:PAGE_WINDOW.__world?.player?.y},auto:PAGE_WINDOW.__world?.autoBattle,bossApproach:runtime.counters.bossApproach||null};
+      saveStep('副本卡住診斷','done',JSON.stringify(diagnostic));
+      const exited=await exitVerifiedDailyDungeon(reason);
+      throw new Error(`${reason}，${exited?'已核對退出副本':'退出未確認，需人工處理'}；跳過本次副本`);
+    }
+    await delay(randomBetween(DUNGEON_RETURN_MIN_DELAY_MS,DUNGEON_RETURN_MAX_DELAY_MS));
+    await guard(runEpoch);
+    const returnButton=dungeonReturnButton();
+    const result=dailyDungeonResult();
+    if (!result || !returnButton) throw new Error('完成畫面等待結束後找不到返回村莊');
+    saveStep('最低等副本結算','done',result.text);
+    console.info('[每日任務] 完成畫面等待結束，點擊「返回村莊」');
+    await tapSingleClick(()=>dungeonReturnButton(),'返回村莊');
+    await until(()=>!dungeonResultPanel() && PAGE_WINDOW.__world?.mode!=='dungeon' && !document.querySelector('button[title="離開副本"]') && atLocation('王都聖輝城'),'確認已返回王都',30000);
+    if(!result.success)throw new Error('石閣地下城挑戰失敗，已返回王都，本日任務未完成');
+    await cleanupOwnedActivities('副本結束');
+    delete dayState.dailyDungeonSession;dayState.dungeonEntered=true;persist();
+  }
+
+  function soloDungeonParty() {
+    const w=PAGE_WINDOW.__world,p=w?.party;
+    return Boolean(w?.charId && p?.leaderId===w.charId && p.members?.length===1 && p.members[0].characterId===w.charId);
+  }
+  async function openDungeonPartyWindow() {
+    if(document.querySelector('.window-party'))return document.querySelector('.window-party');
+    await until(()=>pressKey('KeyP','p','P 開啟隊伍設定'),'等待送出 P 開啟隊伍設定');
+    return until(()=>document.querySelector('.window-party'),'等待隊伍設定');
+  }
+  async function leaveDailyParty({closeFirst=true}={}) {
+    const epoch=runEpoch;await guard(epoch);
+    const world=PAGE_WINDOW.__world;
+    if(!world?.charId)throw new Error('缺少角色識別，無法確認離隊');
+    if(!world.party)return '已確認沒有隊伍，保持單人';
+    if(closeFirst)await closeWindows();
+    const party=await openDungeonPartyWindow();
+    const same=()=>{if(PAGE_WINDOW.__world!==world)throw new RunCancelled();return world;};
+    await tapSingleClick(()=>{same();return scopedButton(party,/^(?:離隊|離開隊伍)(?:\s*[（(]自動轉讓[）)])?$/)||scopedButton(party,/^解散隊伍$/);},'離開目前隊伍',epoch);
+    await until(async()=>{
+      same();if(!world.party)return true;
+      const confirm=textCard(document,/(?:退出隊伍|離開隊伍|解散隊伍)/,el=>Boolean(scopedButton(el,/^(?:退出|確定|確認|解散)$/)),'.window-party');
+      if(confirm)await tapSingleClick(()=>scopedButton(confirm,/^(?:退出|確定|確認|解散)$/),'確認離隊',epoch);
+      same();return !world.party;
+    },'確認原生隊伍已清空',16000,epoch);
+    await closeWindows();return '已確認離隊，保持單人';
+  }
+  async function clearPartyBeforeDungeon() {
+    const world=PAGE_WINDOW.__world;
+    if(!world?.charId)throw new Error('缺少原生角色識別，無法確認單人隊伍');
+    if(soloDungeonParty())return '保留自己的單人隊伍，隊伍設定不變';
+    await closeWindows();
+    if(world.party)await leaveDailyParty({closeFirst:false});
+    await tapSingleClick(()=>scopedButton(document,/^隊伍(?:\s*\d+)?$/),'查看左側隊伍');
+    await tapSingleClick(()=>scopedButton(document,/^建立隊伍(?:\s|$)/),'建立自己的單人隊伍');
+    await until(soloDungeonParty,'確認自己為隊長且只有自己',16000);
+    return '已建立自己的單人隊伍，隊伍設定不變';
+  }
+
+  function sweepConfirmPanel() {
+    return visible('.game-confirm-box[role="dialog"]').find(el =>
+      /^一鍵掃蕩(?:\s|$)/.test(controlText(el)) && scopedButton(el,'確認掃蕩',true)) || null;
+  }
+  function sweepConfirmButton() {
+    const root=sweepConfirmPanel();
+    const button=root?.querySelector('button.game-confirm-ok') || scopedButton(root,'確認掃蕩',true);
+    return button && controlText(button)==='確認掃蕩' ? button : null;
+  }
+  function sweepConfirmVisible(button) {
+    if(!enabled(button))return false;
+    const r=button.getBoundingClientRect(),root=sweepConfirmPanel()?.getBoundingClientRect();
+    return Boolean(root && r.top>=Math.max(0,root.top) && r.bottom<=Math.min(innerHeight,root.bottom) &&
+      r.left>=Math.max(0,root.left) && r.right<=Math.min(innerWidth,root.right));
+  }
+
+  function sweepBusy() {
+    return /一鍵掃蕩中|正在批次領取每日獎勵/.test(pageText());
+  }
+
+  function sweepResultEvidence(root){
+    if(scopedStatus(root,/^(?:一鍵)?掃蕩(?:已完成|完成|成功)(?:[。！!]|\s*$)/))return true;
+    // 實測結果是「一鍵掃蕩 × N · 獎勵摘要」，並非「掃蕩已完成」。
+    const preview=ledger()['掃蕩交易']?.preview||ledger()['掃蕩預覽']?.detail||'';
+    const count=preview.match(/(?:本次掃蕩|一鍵掃蕩)\s*(?:×)?\s*(\d+)/)?.[1];
+    return [...(root?.querySelectorAll('span,p,strong,div')||[])].filter(rendered).some(el=>{
+      const text=controlText(el),result=text.match(/^一鍵掃蕩\s*×\s*(\d+)\s*[·・]\s*(.+)$/);
+      return Boolean(result&&(!count||Number(result[1])===Number(count))&&/EXP|經驗|銀幣|金幣|獲得/.test(result[2])&&!/預覽|確認掃蕩/.test(result[2]));
+    });
+  }
+  function sweepSelectionReady(root){
+    return Boolean(root&&[...root.querySelectorAll('button')].some(button=>/^進入(?:\s|$)/.test(labelOf(button)))&&!/載入中|正在載入/.test(controlText(root)));
+  }
   async function sweepOnce(){
-    await trialOpen();const result=await nativeActions.runSweep();
-    if(!result.confirmed)throw new Error('原生掃蕩結果未確認，不追加副本操作');
-    dayState.sweepCompleted=true;dayState.sweepConfirmSent=false;saveStep('掃蕩交易','done',result.empty?'原生預覽確認沒有可掃蕩副本':'原生副本每日額度已確認；'+result.count+'本');
-    return result.empty?'目前沒有可掃蕩副本':result.alreadyCompleted?'原生本日掃蕩已確認，不重送':'原生一鍵掃蕩已確認；'+result.count+'本';
+    await trialOpen();const get=()=>panel(/試煉之門\s*DUNGEON/),sweepButton=()=>uniqueControl(get(),/^一鍵掃蕩\s*×\s*[1-9]\d*$/,true);
+    const finished=()=>get()&&!sweepConfirmPanel()&&!sweepBusy()&&(sweepResultEvidence(get())||sweepSelectionReady(get())&&!sweepButton());
+    const settle=()=>{dayState.sweepCompleted=true;dayState.sweepConfirmSent=false;saveStep('掃蕩交易','done','同試煉面板明確掃蕩完成');};
+    if(sweepBusy()||dayState.sweepConfirmSent||ledger()['掃蕩交易']?.state==='pending'){await until(finished,'掃蕩結果未確認，不再次送出或進入副本',60000);settle();return '一鍵掃蕩已完成，明確結果已確認';}
+    if(!sweepConfirmPanel()){
+      const sweep=sweepButton();if(!sweep){if(finished()){settle();return '已核對掃蕩完成';}if(scopedStatus(get(),/^(?:目前沒有可掃蕩副本|今日副本已全部掃蕩)$/))return '目前沒有可掃蕩副本';throw new Error('掃蕩入口／結果資料不足，未按按鈕消失認定完成');}
+      if(sweepResultEvidence(get()))throw new Error('可掃蕩入口與完成狀態矛盾，未送出');
+      dayState.sweepSent=true;persist();await tapSingleClick(()=>sweepButton(),'開啟一鍵掃蕩預覽');
+    }
+    await until(sweepConfirmPanel,'等待一鍵掃蕩確認視窗');
+    await until(()=>{
+      const confirm=sweepConfirmButton();confirm?.scrollIntoView?.({block:'nearest',inline:'nearest'});if(!sweepConfirmVisible(confirm)||now()<runtime.nextActionAt||now()-lastActionAt<actionDelay('確認掃蕩'))return false;
+      const preview=controlText(sweepConfirmPanel());saveStep('掃蕩預覽','done',preview);dayState.sweepConfirmSent=true;dayState.sweepCompleted=false;
+      if(dispatchRecordedClick(confirm,'確認掃蕩',ledger(),'掃蕩交易','已送出一次掃蕩；等待明確結果',{preview}))return true;
+      dayState.sweepConfirmSent=false;persist();return false;
+    },'等待確認掃蕩按鈕可操作',16000);
+    await until(finished,'掃蕩結果未確認，不再次送出或進入副本',60000);settle();return '一鍵掃蕩已完成，明確結果已確認';
   }
 
   async function handleTrial() {
@@ -8939,46 +10173,328 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     if(!swept){finishRecipe();return;}
     await step('進入最低等副本',async()=>{
       if(!dungeonResultPanel() && PAGE_WINDOW.__world?.mode!=='dungeon'){
-        await clearPartyBeforeDungeon();await trialOpen();
-
-        const result=await nativeActions.runDungeonEntry('dg_geffen_dungeon','normal');
-        if(!result.confirmed||!result.session)throw new Error('原生石閣地下城場次未確認');
+        await clearPartyBeforeDungeon();await closeWindows();await trialOpen();
+        const get=()=>panel(/試煉之門\s*DUNGEON/);
+        await tap(()=>scopedButton(get(),/^(?:單刷|SOLO)(?:\s|\d|$)/),'最低等單刷副本分頁');
+        const card=()=>[...get().querySelectorAll('[role="group"]')].find(el=>controlText(el).includes('石閣地下城')&&/Lv\s*1\s*-\s*15/.test(controlText(el)));
+        await until(card,'等待最低等石閣地下城 Lv1-15');
+        await tapSingleClick(()=>scopedButton(card(),/^進入(?:\s|$)/),'石閣地下城進入',runEpoch,()=>{dayState.dailyDungeonEntryPending={role,name:DAILY_DUNGEON_NAME,at:now()};persist();});
+        await until(()=>PAGE_WINDOW.__world?.mode==='dungeon'||dungeonResultPanel(),'確認已進入石閣地下城',30000);
         const entered=PAGE_WINDOW.__world;delete dayState.dailyDungeonEntryPending;
-        dayState.dailyDungeonSession={...result.session,name:DAILY_DUNGEON_NAME};persist();
+        dayState.dailyDungeonSession={confirmed:entered?.mode==='dungeon',role,charId:entered?.charId,regionId:entered?.regionId,name:DAILY_DUNGEON_NAME,at:now()};persist();
         if(entered?.autoBattle===true)ownActivity('auto');
       }
-      if(PAGE_WINDOW.__world?.mode==='dungeon'&&!nativeDungeonSessionMatches(dayState.dailyDungeonSession,PAGE_WINDOW.__world)){const resumed=await nativeActions.runDungeonEntry('dg_geffen_dungeon','normal');if(!resumed.confirmed)throw new Error('目前原生副本場次未確認');dayState.dailyDungeonSession={...resumed.session,name:DAILY_DUNGEON_NAME};persist();}
       await returnAfterDungeonSuccess();return '最低等石閣地下城挑戰成功，已返回王都';
     },{closeOnError:false});finishRecipe();
   }
 
-  async function handleAdventure(){
-    await nativeRewardStep('每日任務獎勵',{scope:'daily',types:['daily_quests'],requiredEventTypes:['daily_quests'],clearedTypes:['daily_quests']});
-    if(runtime.running)await nativeRewardStep('三個活躍寶箱',{scope:'daily',types:['activity_chests'],requiredEventTypes:['activity_chests'],completeTypes:['activity_chests']});
-    if(runtime.running)await nativeRewardStep('戰令獎勵',{scope:'battle-pass',types:['pass_rewards'],requiredEventTypes:['pass_rewards'],clearedTypes:['pass_rewards']});
-    if(runtime.running)finishRecipe();
+  async function rewardTab(name) {
+    await openPanel(/^(?:戰令|開啟本季戰令)$/, /冒險大廳|冒險戰令/);
+    const root=()=>panel(/冒險大廳|冒險戰令/);
+    await tap(()=>scopedButton(root(),new RegExp(`^${name}(?:\\s|$)`)),name);
+    await until(()=>[...root().querySelectorAll('[role="tab"]')].some(el=>labelOf(el).startsWith(name)&&el.getAttribute('aria-selected')==='true'),`確認${name}頁籤已選取`);
+    return root;
   }
 
+  function rewardCards(root){
+    if(!root)return [];const cards=[];
+    if(batchCategory(root)?.startsWith('每日任務')){
+      for(const status of root.querySelectorAll('section span')){
+        const state=controlText(status);if(!/^(?:已領取|進行中|可領取|可領獎)$/.test(state))continue;
+        const header=status.parentElement,activity=[...header.querySelectorAll('div')].find(el=>/^\+\d+\s*活躍$/.test(controlText(el)));
+        const title=activity?controlText(activity.previousElementSibling):'';
+        if(!title)continue;let card=header;
+        while(card&&card!==root&&!card.querySelector('button'))card=card.parentElement;
+        if(!card||card===root||cards.some(item=>item.title===title))continue;
+        cards.push({card,title,id:nativeCardKey(card),claimed:state==='已領取',incomplete:state==='進行中',claim:scopedButton(card,/^領取$/)});
+      }
+      if(cards.length)return cards;
+    }
+    const actions=[...root.querySelectorAll('button,span,p')].filter(el=>rendered(el)&&/^(?:領取|已領取)$/.test(controlText(el)));
+    for(const action of actions){for(let card=action.parentElement;card&&card!==root;card=card.parentElement){
+      const headings=[...card.querySelectorAll('h3,h4')].filter(rendered),states=[...card.querySelectorAll('button,span,p')].filter(el=>rendered(el)&&/^(?:領取|已領取)$/.test(controlText(el)));
+      if(headings.length>1||states.length>1)break;if(headings.length===1&&states.length===1){const title=controlText(headings[0]);if(title&&!cards.some(item=>item.card===card))cards.push({card,title,id:nativeCardKey(card),claimed:controlText(states[0])==='已領取',claim:states[0].tagName==='BUTTON'&&controlText(states[0])==='領取'&&enabled(states[0])?states[0]:null});break;}
+    }}return cards;
+  }
+  function batchCategory(root){const selected=[...root.querySelectorAll('[role="tab"]')].filter(el=>rendered(el)&&el.getAttribute('aria-selected')==='true');return selected.length===1?labelOf(selected[0]):null;}
+  function rewardTargetsDone(root,targets){
+    const cards=rewardCards(root),daily=PAGE_WINDOW.__world?.daily;
+    return targets.length>0&&targets.every(target=>{
+      const current=cards.filter(card=>card.title===target.title&&(!target.id||card.id===target.id));
+      if(current.length===1&&current[0].claimed)return true;
+      return Boolean(target.id&&/^D\d+$/.test(target.id)&&daily?.day===taskDayKey()&&daily.claimed?.[target.id]===true);
+    });
+  }
+  function nativeBattlepassState(root){
+    if(!batchCategory(root)?.startsWith('戰令獎勵'))return null;
+    const button=uniqueControl(root,/^一鍵領取(?:\s*\d+)?$/,true),section=button?.closest('section');if(!section)return null;
+    const states=[...section.querySelectorAll('div,button')].filter(el=>!el.children.length&&/^(?:已領取|未解鎖|鎖定|領取)$/.test(controlText(el))).map(controlText);
+    const level=Number(controlText(section).match(/^Lv\s*(\d+)\s*\/\s*30/)?.[1]);
+    if(states.length!==60||!Number.isInteger(level)||level<1||level>30)return null;
+    const complete=states.every(state=>state==='已領取'||state==='未解鎖'||state==='鎖定')&&states.slice(0,level).every(state=>state==='已領取');
+    return {states,complete,level};
+  }
+  async function batchClaim(root,pattern,done){
+    const nativeState=nativeBattlepassState(root());
+    if(nativeState?.complete){
+      for(const [pendingKey,record] of Object.entries(ledger())){
+        const level=pendingKey.match(/^批次(?:領獎|確認)交易:戰令獎勵\s+Lv\s*(\d+)\/30$/)?.[1];
+        if(record.state==='pending'&&level&&Number(level)<=nativeState.level)saveStep(pendingKey,'done','本日戰令升級後逐格確認已領取；舊等級批次已對帳');
+      }
+    }
+    const category=batchCategory(root());if(!category)throw new Error('批次領獎分類identity未確認，未領取');const key='批次領獎交易:'+category,confirmationKey='批次確認交易:'+category,old=ledger()[key];
+    const complete=targets=>batchCategory(root())===category&&rewardTargetsDone(root(),targets)&&(!done||done(root()));
+    if(old?.state==='pending'){
+      const kind=category.startsWith('每日任務')?'每日任務':'戰令獎勵';
+      const summaryDone=old.summary&&Number.isInteger(old.count)&&old.count>0&&new RegExp('已領取\\s*'+old.count+'\\s*'+(kind==='每日任務'?'個每日任務':'筆戰令獎勵')).test(controlText(root()));
+      if(complete(old.targets||[])||summaryDone||nativeBattlepassState(root())?.complete){saveStep(key,'done','相同獎勵結果已對帳');if(ledger()[confirmationKey]?.state==='pending')saveStep(confirmationKey,'done','同批次結果已確認');return '可領獎勵已確認更新';}throw new Error('批次領獎前次結果未明，未重送');
+    }
+    const cards=rewardCards(root()),targets=cards.filter(card=>card.claim).map(({title,id})=>({title,id})),button=uniqueControl(root(),pattern,true);
+    if(!targets.length){
+      if(nativeBattlepassState(root())?.complete)return '戰令已解鎖獎勵已確認逐格領取';
+      if(cards.length&&cards.every(card=>card.claimed||card.incomplete))return '目前沒有可領獎勵';
+      // 已記載的正式介面以分類可領數量及批次成功摘要回報，未必有 h4 卡片。
+      if(/^(?:每日任務|戰令獎勵)(?:\s|$)/.test(category))return batchClaimSummary(root,pattern,category,key,confirmationKey);
+      throw new Error('可領獎勵／逐筆identity資料不足，不以按鈕停用或消失認定完成');
+    }
+    if(!button||!enabled(button))throw new Error('批次領取控制項不可用');
+    if(new Set(targets.map(item=>item.id||item.title)).size!==targets.length)throw new Error('獎勵身份重複，未批次領取');
+    await recordedTap(key,()=>{if(batchCategory(root())!==category)throw new Error('送出前批次分類已變更');const fresh=rewardCards(root()).filter(card=>card.claim).map(({title,id})=>({title,id}));if(JSON.stringify(fresh)!==JSON.stringify(targets))throw new Error('送出前可領獎勵身份／狀態已變更');return uniqueControl(root(),pattern);},'領取目前可領獎勵',category+'；逐筆等待claimed',{category,targets});
+    await until(()=>{
+      if(complete(targets))return true;
+      const confirm=visible('.game-confirm-box[role="dialog"]').filter(dialog=>/全部領取/.test(controlText(dialog))&&!/購買|付款|花費|消耗/.test(controlText(dialog))&&(controlText(dialog).includes(category)||targets.every(target=>controlText(dialog).includes(target.title))));
+      if(confirm.length===1&&!ledger()[confirmationKey]){const yes=uniqueControl(confirm[0],/^全部領取$/);if(yes)dispatchRecordedClick(yes,'確認免費獎勵全部領取',ledger(),confirmationKey,'同一分類／獎勵明細確認',{category,targets});}
+      return false;
+    },'同批次逐筆claimed尚未更新，不按消失／停用當完成、不重送',20000);
+    saveStep(key,'done',category+'；逐筆claimed已確認');if(ledger()[confirmationKey]?.state==='pending')saveStep(confirmationKey,'done','同批次結果已確認');return '可領獎勵已確認更新';
+  }
+
+  async function batchClaimSummary(root,pattern,category,key,confirmationKey){
+    const kind=category.startsWith('每日任務')?'每日任務':'戰令獎勵';
+    const button=()=>uniqueControl(root(),pattern,true);
+    const native=nativeBattlepassState(root());
+    const nativeCount=native?.states.filter(state=>state==='領取').length;
+    const count=nativeCount||Number(labelOf(button()).match(/一鍵領取\s+(\d+)/)?.[1]);
+    const text=controlText(root()),available=text.match(new RegExp(kind+'可領\\s+(\\d+)'));
+    if(available&&Number(available[1])===0)return '目前沒有可領獎勵';
+    if(!Number.isInteger(count)||count<=0||(!nativeCount&&(!available||Number(available[1])!==count))||!enabled(button()))throw new Error('分類可領數量與按鈕不一致，未領取');
+    const resultPattern=new RegExp('已領取\\s*'+count+'\\s*'+(kind==='每日任務'?'個每日任務':'筆戰令獎勵'));
+    if(resultPattern.test(text))throw new Error('已有相同批次摘要，不能確認新批次，未送出');
+    await recordedTap(key,()=>{
+      if(batchCategory(root())!==category||(nativeCount?nativeBattlepassState(root())?.states.filter(state=>state==='領取').length:Number(labelOf(button()).match(/一鍵領取\s+(\d+)/)?.[1]))!==count)throw new Error('送出前分類／數量改變');
+      return button();
+    },'領取目前可領獎勵',kind+'；等待原生批次成功摘要',{category,count,summary:true});
+    await until(()=>{
+      if(batchCategory(root())!==category)return false;
+      if(native&&nativeBattlepassState(root())?.complete)return true;
+      if(resultPattern.test(controlText(root())))return true;
+      const dialogs=visible('.game-confirm-box[role="dialog"]').filter(el=>/全部領取/.test(controlText(el))&&!/購買|付款|花費|消耗|鑽石/.test(controlText(el)));
+      if(dialogs.length===1&&!ledger()[confirmationKey]){
+        const yes=uniqueControl(dialogs[0],/^全部領取$/);if(yes)dispatchRecordedClick(yes,'確認免費獎勵全部領取',ledger(),confirmationKey,kind+'；批次確認',{category,count});
+      }
+      return false;
+    },'原生批次成功摘要尚未確認，不重送',30000);
+    saveStep(key,'done',kind+'；原生摘要確認已領取 '+count);if(ledger()[confirmationKey]?.state==='pending')saveStep(confirmationKey,'done','批次摘要已確認');return '可領獎勵已確認更新';
+  }
+
+  async function handleAdventure() {
+    await step('每日任務獎勵',async()=>{
+      const root=await rewardTab('每日任務');await batchClaim(root,/^一鍵領取(?:\s*\d+)?$/);
+      await until(()=>adventureRewardsClear(root(),'每日任務'),'每日任務仍有可領獎勵或狀態未確認');
+      return '每日任務當下可領獎勵已全部領取';
+    },{repeat:true});
+    await step('三個活躍寶箱',async()=>{
+      const root=await rewardTab('活躍寶箱');
+      return claimActivityChests(root);
+    },{repeat:true});
+    await step('戰令獎勵',async()=>{
+      const root=await rewardTab('戰令獎勵');await batchClaim(root,/^一鍵領取(?:\s*\d+)?$/);
+      await until(()=>adventureRewardsClear(root(),'戰令獎勵'),'已解鎖戰令獎勵仍可領或狀態未確認');
+      return '已解鎖戰令獎勵已全部領取';
+    },{repeat:true});
+    await closeWindows();finishRecipe();
+  }
+
+  function adventureRewardsClear(root,kind){
+    if(!batchCategory(root)?.startsWith(kind))return false;
+    const count=controlText(root).match(new RegExp(kind+'可領\\s*(\\d+)'));
+    if(count&&Number(count[1])>0)return false;
+    if(kind==='戰令獎勵')return nativeBattlepassState(root)?.complete===true;
+    const cards=rewardCards(root);
+    return cards.length>0&&cards.every(card=>!card.claim&&(card.claimed||card.incomplete));
+  }
+
+  function certificateShop(){return panel(/^阿丸\s*[・·．]?\s*討伐(?:見證|憑證)處/);}
+  function certificateQuota(root,kind){
+    const text=controlText(root),match=text.match(kind==='auto'?/今日剩餘\s*(\d+)\s*\/\s*3/:/今日共用次數\s*(\d+)\s*\/\s*3/);
+    if(!match||Number(match[1])>3)return null;
+    // 原生「今日共用次數」顯示剩餘次數，兌換後由 3 遞減至 0。
+    return Number(match[1]);
+  }
+  function certificateHolding(root){
+    const match=controlText(root).match(/持有\s*([\d,]+)\s*枚?\s*討伐憑證/);
+    return match?Number(match[1].replace(/,/g,'')):null;
+  }
+  function certificateSupplyCard(root,kind,material){
+    const pattern=kind==='auto'?/^自動戰鬥補充[卷券]\s*[（(]\s*60\s*分\s*[）)]$/:new RegExp('^'+material+'$');
+    return uniqueNamedCard(root,pattern,card=>Boolean(uniqueControl(card,kind==='auto'?/^兌換\s*\+\s*60\s*分$/:/^兌換(?:\s|$)/,true)));
+  }
   async function openCertificateShop(){
-    if(nativeActions.readCertificateShop())return;
-    if(PAGE_WINDOW.__world?.regionId!=='holy_city')await travelTo('王都聖輝城');
-    nativeNavigator.reset();
-    await until(()=>{requireRunOwner();const result=nativeNavigator.tick(CERTIFICATE_TARGET,()=>Boolean(nativeActions.readCertificateNpc(CERTIFICATE_TARGET)));if(result.state==='blocked')throw new Error(result.message);runtime.message=result.message||'等待阿丸原生對話';return result.state==='opened';},'等待阿丸原生對話',90000);
-    await until(()=>nativeActions.openCertificateNpc(CERTIFICATE_TARGET),'開啟阿丸原生商店',12000);
-    await until(()=>nativeActions.readCertificateShop(),'等待阿丸原生商品目錄',12000);
+    if(certificateShop())return;
+    if(!atLocation('王都聖輝城'))await travelTo('王都聖輝城');
+    await closeWindows();await talkTo(CERTIFICATE_TARGET,/^阿丸\s*傳奇冒險者/);
+    const dialog=()=>visible('[role="dialog"][aria-label="阿丸"]')[0];
+    await tapSingleClick(()=>uniqueControl(dialog(),/^(?:›\s*)?交付討伐憑證(?:\s|[（(]|$)/,true),'交付討伐憑證');
+    await until(certificateShop,'等待阿丸討伐見證處');
+  }
+  async function certificateShopTab(name){
+    await openCertificateShop();
+    const selected=()=>controlText(certificateShop()?.querySelector('.inv-tabs .on'))===name;
+    if(!selected())await tapSingleClick(()=>uniqueControl(certificateShop(),new RegExp('^'+name+'$'),true),name);
+    await until(()=>name==='討伐補給'?certificateQuota(certificateShop(),'auto')!==null:certificateSaleState(certificateShop()),'等待'+name+'額度');
+  }
+  function certificateSupplyResult(record,kind){
+    if(kind==='material'&&certificateQuota(certificateShop(),kind)===0)return true;
+    const before=kind==='material'&&record.certificateQuotaMode!=='remaining'?3-record.remaining:record.remaining;
+    return certificateQuota(certificateShop(),kind)===before-1&&certificateHolding(certificateShop())===record.holding-record.cost;
+  }
+  async function reconcileCertificateSupplies(kind){
+    if(kind==='material'&&certificateQuota(certificateShop(),kind)===0){
+      // 原生共用額度已歸零即為本日材料完成，不再等待過期的逐筆庫存證據。
+      for(const [key,record] of Object.entries(ledger()).filter(([,record])=>record.certificateKind===kind&&record.state==='pending')){
+        saveStep(key,'done','材料共用剩餘0/3；原生確認本日兌換已完成');
+      }
+      return;
+    }
+    for(const [key,record] of Object.entries(ledger()).filter(([,record])=>record.certificateKind===kind&&record.state==='pending')){
+      await until(()=>certificateSupplyResult(record,kind),'討伐兌換前次結果未確認，保留紀錄，不重送',12000);
+      saveStep(key,'done',record.material+'；額度減一及憑證扣除已確認');
+    }
+  }
+  async function exchangeCertificateSupply(kind,material,key){
+    await reconcileCertificateSupplies(kind);
+    if(kind==='material'&&certificateQuota(certificateShop(),kind)===0)return '材料共用剩餘0/3；本日兌換已完成';
+    if(ledger()[key]?.state==='done')return ledger()[key].detail;
+    const remaining=certificateQuota(certificateShop(),kind),holding=certificateHolding(certificateShop());
+    if(remaining===0)return '本日'+(kind==='auto'?'補充卷':'材料共用')+'額度已用完';
+    if(remaining===null||holding===null)throw new Error('討伐補給額度／憑證持有量未確認');
+    const get=()=>certificateSupplyCard(certificateShop(),kind,material),card=get();
+    const costMatch=controlText(card).match(/(\d+)\s*枚憑證/),cost=costMatch?Number(costMatch[1]):null;
+    if(!card||!cost||holding<cost)throw new Error(material+'憑證不足或品項成本未確認');
+    const pattern=kind==='auto'?/^兌換\s*\+\s*60\s*分$/:/^兌換(?:\s|$)/;
+    await recordedTap(key,()=>{
+      const button=uniqueControl(get(),pattern,true);button?.scrollIntoView?.({block:'nearest',inline:'nearest'});
+      if(certificateQuota(certificateShop(),kind)!==remaining||certificateHolding(certificateShop())!==holding)throw new Error('兌換前討伐額度／憑證持有量已變更');
+      if(Number(controlText(get()).match(/(\d+)\s*枚憑證/)?.[1])!==cost)throw new Error('兌換前品項成本已變更');
+      return button;
+    },material+'兌換',material+'；等待憑證及額度更新',{certificateKind:kind,certificateQuotaMode:'remaining',material,remaining,holding,cost});
+    await until(()=>certificateSupplyResult(ledger()[key],kind),material+'兌換結果未確認，不重送',20000);
+    saveStep(key,'done',kind==='material'&&certificateQuota(certificateShop(),kind)===0?'材料共用剩餘0/3；原生確認本日兌換已完成':material+'；額度減一及憑證扣除已確認');return ledger()[key].detail;
+  }
+  async function exchangeCertificateAuto(){
+    await certificateShopTab('討伐補給');await reconcileCertificateSupplies('auto');
+    while(certificateQuota(certificateShop(),'auto')>0){
+      const remaining=certificateQuota(certificateShop(),'auto');
+      await exchangeCertificateSupply('auto','自動戰鬥補充卷（60分）','討伐補充卷交易:'+(4-remaining));
+      if(certificateQuota(certificateShop(),'auto')>=remaining)throw new Error('討伐補充卷次數未減少，停止兌換');
+    }
+    if(certificateQuota(certificateShop(),'auto')!==0)throw new Error('討伐補充卷本日完成狀態未確認');
+    return '自動戰鬥補充卷今日三次額度已用完';
+  }
+  function certificateSaleState(root){
+    if(!root||!root.querySelector('.inv-tabs .on')||controlText(root.querySelector('.inv-tabs .on'))!=='兌換討伐憑證')return null;
+    const stacks=certificateSaleChoices(root),quantities=stacks.map(el=>{
+      const labels=[...el.querySelectorAll('span')].map(controlText).filter(text=>/^數量\s*[：:]\s*[\d,]+$/.test(text));
+      return labels.length===1?Number(labels[0].match(/[\d,]+$/)[0].replace(/,/g,'')):NaN;
+    });
+    if(!stacks.length&&controlText(root).includes('點左側物品加入待出售區')&&uniqueControl(root,/^確定出售$/,true))return {holding:0};
+    return quantities.length&&quantities.every(n=>Number.isSafeInteger(n)&&n>0)?{holding:quantities.reduce((a,b)=>a+b,0)}:null;
+  }
+  function certificateSaleChoices(root){
+    return [...(root?.querySelectorAll('button,[role="button"]')||[])].filter(el=>rendered(el)&&/^討伐憑證\s*材料\s*數量\s*[：:]\s*[\d,]+/.test(controlText(el)));
+  }
+  function certificateSaleSelection(root){
+    const choices=certificateSaleChoices(root);
+    // 使用者指定左側最上方的一組；依可見位置排序，不拿導覽頁籤當物品。
+    return choices.sort((a,b)=>a.getBoundingClientRect().top-b.getBoundingClientRect().top||a.getBoundingClientRect().left-b.getBoundingClientRect().left)[0]||null;
+  }
+  function certificateSalePreview(root){
+    const button=uniqueControl(root,/^確定出售$/,true);if(!button)return null;
+    for(let card=button.parentElement;card&&card!==root;card=card.parentElement){
+      const text=controlText(card),inputs=[...card.querySelectorAll('input')];
+      const quantity=inputs.length===1?Number(inputs[0].value):NaN;
+      const gold=Number(text.match(/預計(?:金額|獲得)(?:金幣)?\s*[：:]?\s*([\d,]+)/)?.[1]?.replace(/,/g,''));
+      if(Number.isSafeInteger(quantity)&&quantity>0&&quantity<=60&&gold===quantity*200&&/^待出售/.test(text)&&/討伐憑證/.test(text))return {button,quantity,gold};
+    }
+    return null;
   }
   function certificateSaleAllowed(){return certificateCalendar().monday||((runtime.mode==='single'||runtime.rerunAll)&&TASKS[runtime.taskIndex]?.id==='certificates');}
+  function certificateWeeklyQuotaMessage(){
+    if(!certificateSaleState(certificateShop()))return '';
+    // 阿丸出售的原生 error toast；不讀聊天或腳本紀錄，避免把歷史文字當成本週狀態。
+    return [...document.querySelectorAll('.toasts .toast.error .toast-text')].filter(rendered).map(controlText).find(text=>/^(?:本週討伐憑證還可兌換|本週還可以兌換)\s*0\s*枚[。！!]?$/u.test(text))||'';
+  }
+  async function sellWeeklyCertificates(){
+    const calendar=certificateCalendar();if(!certificateSaleAllowed())return '非週一任務日，未售出';
+    const key='討伐售出交易:'+calendar.week,previous=readCertificateWeek();
+    if(previous?.week===calendar.week&&previous.state==='done')return previous.completionReason==='quota-exhausted'?'本週討伐憑證兌換額度已用完；不再售出':'本週售出已完成；'+previous.quantity+'枚／'+previous.gold+'金幣';
+    await certificateShopTab('兌換討伐憑證');
+    let quotaMessage='';
+    const capture=()=>{if(certificateCalendar().week===calendar.week)quotaMessage ||= certificateWeeklyQuotaMessage();};
+    const completeQuota=record=>{
+      const detail='本週討伐憑證兌換額度已用完；原生提示：'+quotaMessage;
+      saveCertificateWeek({...record,week:calendar.week,day:calendar.day,state:'done',completionReason:'quota-exhausted',nativeMessage:quotaMessage,completedAt:now()});
+      saveStep(key,'done',detail);return detail;
+    };
+    const result=record=>{capture();const fresh=certificateSaleState(certificateShop());return Boolean(quotaMessage)||(fresh&&fresh.holding===record.holding-record.quantity);};
+    const observer=typeof MutationObserver==='function'?new MutationObserver(capture):null;
+    observer?.observe(document.body,{childList:true,subtree:true,characterData:true});
+    try{
+      capture();if(quotaMessage)return completeQuota(previous?.week===calendar.week?previous:{});
+      if(previous?.week===calendar.week&&previous.state==='pending'&&ledger()[key]?.state!=='retry-approved'){
+        await until(()=>result(previous),'本週憑證售出前次結果未確認，不重送',12000);
+        if(quotaMessage)return completeQuota(previous);
+        saveCertificateWeek({...previous,state:'done',completedAt:now()});saveStep(key,'done','本週售出結果已對帳');return '本週售出結果已對帳';
+      }
+      const before=certificateSaleState(certificateShop());
+      if(!before)throw new Error('憑證持有量未確認，未售出');
+      if(!before.holding)throw new Error('沒有可售出的討伐憑證');
+      // 不沿用使用者預先放入的待出售物品，先清空，再選指定的第一組。
+      if(enabled(uniqueControl(certificateShop(),/^清空$/,true)))await tapSingleClick(()=>uniqueControl(certificateShop(),/^清空$/),'清空待出售憑證');
+      await tapSingleClick(()=>certificateSaleSelection(certificateShop()),'選擇左側最上方討伐憑證');
+      const preview=certificateSalePreview(certificateShop()),quantity=preview?.quantity;
+      if(!preview||quantity>before.holding)throw new Error('憑證售出數量／每枚200金幣預覽未一致，未售出');
+      const record={week:calendar.week,day:calendar.day,state:'pending',holding:before.holding,quantity,gold:preview.gold,at:now()};
+      await recordedTap(key,()=>{
+        const fresh=certificateSaleState(certificateShop()),next=certificateSalePreview(certificateShop());next?.button?.scrollIntoView?.({block:'nearest',inline:'nearest'});
+        if(!certificateSaleAllowed()||certificateCalendar().week!==calendar.week||fresh?.holding!==before.holding||next?.quantity!==quantity||next?.gold!==record.gold)throw new Error('售出前日期、持有量或數量金額已變更');
+        if(!enabled(next.button)||now()<runtime.nextActionAt||now()-lastActionAt<actionDelay('售出討伐憑證'))return null;
+        saveCertificateWeek(record);return next.button;
+      },'售出討伐憑證',quantity+'枚／'+record.gold+'金幣；等待憑證扣除',{holding:before.holding,quantity,gold:record.gold,week:calendar.week});
+      await until(()=>result(record),'討伐憑證售出結果未確認，不重送',20000);
+      if(quotaMessage)return completeQuota(record);
+      saveCertificateWeek({...record,state:'done',completedAt:now()});saveStep(key,'done','本週已售出'+quantity+'枚／'+record.gold+'金幣');return '本週已售出'+quantity+'枚／'+record.gold+'金幣';
+    }finally{observer?.disconnect();}
+  }
   async function handleCertificates(){
     const opened=await step('阿丸討伐補給介面',openCertificateShop,{repeat:true,closeOnError:false});
     if(!opened){finishRecipe();return;}
-    await nativeOperationStep('討伐自動戰鬥補充卷',()=>nativeActions.runCertificateAuto(),result=>'自動戰鬥補充卷今日三次額度已用完（原生 '+result.used+'/3）');
+    await step('討伐自動戰鬥補充卷',exchangeCertificateAuto,{repeat:true,closeOnError:false});
     for(let slot=1;slot<=3;slot++){
-      if(!runtime.running)break;const material=userOptions()['certificateMaterial'+slot],label='討伐材料'+['','一','二','三'][slot];
-      if(!material){saveStep(label,'done','未選擇材料');continue;}
-      await nativeOperationStep(label,()=>nativeActions.runCertificateMaterial(material,slot),result=>result.exhausted?'材料共用剩餘0/3；本日兌換已完成':material+'；原生共用額度已用 '+result.used+'/3');
+      const material=userOptions()['certificateMaterial'+slot];
+      await step('討伐材料'+['','一','二','三'][slot],async()=>{
+        if(!material)return '未選擇材料';
+        if(!CERTIFICATE_MATERIALS.includes(material))throw new Error('討伐材料設定不在已確認八項清單');
+        await certificateShopTab('討伐補給');
+        return exchangeCertificateSupply('material',material,'討伐材料交易:選單'+slot);
+      },{repeat:true,closeOnError:false});
     }
-    if(runtime.running){const label='週一售出討伐憑證';if(!userOptions().sellCertificates||!certificateSaleAllowed())saveStep(label,'done',!userOptions().sellCertificates?'未勾選自動賣出憑證':'非週一任務日，未售出');else await nativeOperationStep(label,()=>nativeActions.runCertificateSale(true),result=>result.quotaExhausted?'本週原生出售接口確認額度已用完':'本週售出已確認；'+result.quantity+'枚／'+(result.gold??result.quantity*200)+'金幣');}
-    if(runtime.running){await until(()=>nativeActions.closeCertificateShop(),'關閉阿丸原生商店',12000);finishRecipe();}
+    await step('週一售出討伐憑證',async()=>{
+      if(!userOptions().sellCertificates)return '未勾選自動賣出憑證';
+      if(!certificateSaleAllowed())return '非週一任務日，未售出';
+      return sellWeeklyCertificates();
+    },{repeat:true,closeOnError:false});
+    await closeWindows();finishRecipe();
   }
 
   async function nativeOperationStep(label,perform,describe){
@@ -8987,15 +10503,158 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     catch(error){if(host.storageError){nativeActions.cancel();host.cancelAll();runtime.running=false;runtime.paused=false;runtime.warning='操作紀錄保存失敗，已停止；未明紀錄保留';const task=currentTask();if(task){dayState.tasks[task.id].status='警示';dayState.tasks[task.id].message=runtime.warning;}syncIntegratedPending();updatePanel();return null;}if((error instanceof RunCancelled||isNativeRateLimit(error))||error instanceof NativeTradePrivilegeExpired)throw error;saveStep(label,'warn',error.message);runtime.warning=label+'：'+error.message;updatePanel();return null;}
   }
   const nativeRewardStep=(label,config)=>nativeOperationStep(label,()=>nativeActions.run(config),result=>'原生結果已確認；本次領取 '+result.claimed+'、已領取 '+result.alreadyClaimed);
-  async function handleActivity(){
-    await nativeRewardStep('每日活動獎勵',{scope:'events',types:['daily_activity'],requiredTypes:['daily_activity'],requiredEventTypes:['daily_activity']});
-    if(runtime.running)await nativeRewardStep('累積目標獎勵',{scope:'events',types:['online_time_accum'],requiredEventTypes:['online_time_accum']});
-    if(runtime.running)finishRecipe();
+  function dailyActivityProgress(root) {
+    const text=controlText(root);
+    return [
+      ['擊殺怪物',30],['成功採集',10],['任意副本',1]
+    ].map(([label,target])=>{
+      const match=text.match(new RegExp(`${label}[^\\d]{0,80}(\\d+)\\s*\\/\\s*${target}(?!\\d)`));
+      return {label,current:match?Number(match[1]):null,target};
+    });
   }
-  async function handleWelfare(){
-    await nativeRewardStep('每日簽到',{scope:'welfare',types:['daily_login_streak'],requiredTypes:['daily_login_streak'],requiredEventTypes:['daily_login_streak']});
-    if(runtime.running&&userOptions().legendary)await nativeRewardStep('傳奇津貼',{scope:'welfare',types:['legendary_pass_daily'],requiredEventTypes:['legendary_pass_daily']});
-    if(runtime.running)finishRecipe();
+
+  const dailyActivityCard=root=>textCard(root,/^每日冒險委託$/,el=>['擊殺怪物','成功採集','任意副本'].every(label=>controlText(el).includes(label))&&Boolean(scopedButton(el,/^(?:領取獎勵|今日獎勵已領取|已領取|尚未完成)$/,true)||/今日獎勵已領取/.test(controlText(el))));
+  const dailyActivityClaimButton=root=>scopedButton(dailyActivityCard(root),/^領取獎勵$/);
+  const dailyActivityClaimed=root=>/今日獎勵已領取/.test(controlText(dailyActivityCard(root)));
+
+  function accumulatedRewardRows(root){
+    const content=root?.querySelector('.event-window-content')||root;
+    if(!content||!controlText(content).includes('每日在線補給'))return [];
+    const pattern=/^在線\s*\d+\s*(?:分鐘|小時)$/;
+    const titles=[...content.querySelectorAll('div,span,h4')].map(controlText).filter(text=>pattern.test(text));
+    return [...new Set(titles)].map(title=>{
+      const card=uniqueNamedCard(content,new RegExp('^'+title.replace(/\s+/g,'\\s*')+'$'),el=>Boolean(scopedButton(el,/^(?:領取|已領取|處理中…|尚未達成)$/,true)||scopedStatus(el,/^(?:[✓✔]\s*)?已領取$/)));
+      return card?{card,button:scopedButton(card,/^領取$/,true),title}:null;
+    }).filter(Boolean);
+  }
+  async function claimAccumulatedRewards(){
+    await openPanel(/^活動$/, /活動/);const root=()=>panel(/活動\s*EVENT/);
+    await tap(()=>scopedButton(root(),/^累積目標$/),'累積目標');
+    await until(()=>controlText(root()?.querySelector('.event-window-content')||root()).includes('每日在線補給'),'等待累積目標');
+    const titles=accumulatedRewardRows(root()).filter(row=>labelOf(row.button)==='領取'&&enabled(row.button)).map(row=>row.title);
+    for(const title of titles){
+      const row=()=>accumulatedRewardRows(root()).find(item=>item.title===title),key='累積目標交易:'+title+':'+taskDayKey();
+      const done=()=>row()&&/已領取/.test(controlText(row().card));
+      if(done()){saveStep(key,'done','已領取');continue;}
+      if(ledger()[key]?.state==='pending')throw new Error(title+'前次領取未確認');
+      await recordedTap(key,()=>row()?.button,title+'領取',title);
+      await until(done,title+'領取結果未確認');saveStep(key,'done','已領取');
+    }
+    return `累積目標已領取${titles.length}筆可領獎勵`;
+  }
+
+  function activityChestState(root){
+    if(!root||!batchCategory(root)?.startsWith('活躍寶箱'))return null;
+    const cards=[30,60,100].map(n=>{
+      const card=textCard(root,new RegExp(`^${n}\\s*活躍寶箱(?:\\s|$)`),el=>/已領取|可領取|還差/.test(controlText(el)));
+      const text=controlText(card);
+      // 不允許跨到同時包含其他箱子的父容器借用「已領取」。
+      if(!card||(text.match(/(?:30|60|100)\s*活躍寶箱/g)||[]).length!==1)return {n,card:null,state:'未知'};
+      const states=[...card.querySelectorAll('span,div,p,button'),card].filter(el=>rendered(el)&&/^(?:已領取|可領取|還差.*)$/.test(controlText(el))).map(controlText);
+      const distinct=[...new Set(states)];
+      return {n,card,state:distinct.length===1?distinct[0]:'未知'};
+    });
+    const activity=readAdventureActivity(controlText(root));
+    const count=controlText(root).match(/每日活躍寶箱可領\s*(\d+)/);
+    return {activity,cards,count:count?Number(count[1]):null,complete:activity===100&&cards.every(c=>c.state==='已領取')&&(!count||Number(count[1])===0)};
+  }
+
+  async function claimActivityChests(root){
+    const read=()=>activityChestState(root());
+    let state=read();
+    if(!state||state.activity===null||state.cards.some(c=>c.state==='未知'))throw new Error('活躍值或三箱個別狀態未確認');
+    const prefix='活躍寶箱交易:'+taskDayKey();
+    // 舊版無目標清單的未明交易，只有三箱都已領取才可對帳。
+    for(const [key,record] of Object.entries(ledger()).filter(([key,r])=>key.startsWith(prefix)&&r.state==='pending')){
+      const targets=Array.isArray(record.targets)&&record.targets.length?record.targets:[30,60,100];
+      if(!targets.every(n=>state.cards.find(c=>c.n===n)?.state==='已領取'))throw new Error('活躍寶箱前次結果未確認，保留紀錄不重送');
+      saveStep(key,'done','原交易目標逐箱確認已領取');
+    }
+    const targets=state.cards.filter(c=>c.state==='可領取').map(c=>c.n);
+    if(state.count!==null&&state.count!==targets.length)throw new Error('可領數量與三箱狀態不一致，等待重新核對');
+    const allButton=()=>uniqueControl(root(),/^(?:全部領取|一鍵領取)(?:\s*\d+)?$/);
+    const claim=async(ns,get)=>{
+      const key=prefix+':'+ns.join(','),confirmKey=key+':確認';
+      if(ledger()[key]?.state==='done')throw new Error('寶箱畫面與本日已確認交易矛盾，未重送');
+      const done=()=>{const fresh=read();return fresh&&ns.every(n=>fresh.cards.find(c=>c.n===n)?.state==='已領取');};
+      await recordedTap(key,()=>{
+        const fresh=read();if(!fresh||!ns.every(n=>fresh.cards.find(c=>c.n===n)?.state==='可領取'))throw new Error('送出前寶箱狀態改變，未重送');
+        const button=get();button?.scrollIntoView({block:'nearest'});return button;
+      },'活躍寶箱領取','等待 '+ns.join('、')+' 寶箱逐箱確認',{targets:ns});
+      await until(()=>{
+        if(done())return true;
+        const dialogs=visible('.game-confirm-box[role="dialog"]').filter(el=>/全部領取/.test(controlText(el))&&!/購買|消耗|花費|付款|鑽石/.test(controlText(el)));
+        if(dialogs.length===1&&!ledger()[confirmKey])dispatchRecordedClick(uniqueControl(dialogs[0],/^全部領取$/),'確認寶箱全部領取',ledger(),confirmKey,'免費寶箱',{targets:ns});
+        return false;
+      },ns.join('、')+' 活躍寶箱領取未確認，保留交易不重送');
+      saveStep(key,'done','已逐箱確認 '+ns.join('、'));if(ledger()[confirmKey]?.state==='pending')saveStep(confirmKey,'done','同批次逐箱已確認');
+    };
+    if(targets.length){
+      if(allButton())await claim(targets,allButton);
+      else for(const n of targets)await claim([n],()=>{const card=read()?.cards.find(c=>c.n===n)?.card;return card?.matches('button,[role="button"]')&&enabled(card)?card:scopedButton(card,/^領取$/);});
+    }
+    state=read();
+    if(!state?.complete){
+      const missing=state?.cards.filter(c=>c.state!=='已領取').map(c=>`${c.n}（${c.state}）`).join('、')||'三箱狀態未確認';
+      throw new Error(`未完成：活躍 ${state?.activity??'未知'}/100；未領寶箱：${missing}`);
+    }
+    return '活躍 100/100；30、60、100 三箱均已領取';
+  }
+
+  async function handleActivity() {
+    await step('每日活動獎勵',async()=>{
+      await openPanel(/^活動$/, /活動/);
+      const root=()=>panel(/活動\s*EVENT/);
+      await tap(()=>scopedButton(root(),/^每日活動/),'每日活動');
+      const card=()=>dailyActivityCard(root());
+      await until(card,'等待每日活動');
+      if(dailyActivityClaimed(root())){
+        if(ledger()['每日活動領取交易']?.state==='pending')saveStep('每日活動領取交易','done','重開確認今日已領取');
+        return '今日獎勵已領取';
+      }
+      const incomplete=dailyActivityProgress(card()).filter(item=>item.current===null || item.current<item.target);
+      if(incomplete.length)throw new Error(`每日活動未完成：${incomplete.map(item=>`${item.label} ${item.current??'?'}／${item.target}`).join('、')}`);
+      const key='每日活動領取交易';
+      if(ledger()[key]?.state==='pending')throw new Error('每日活動前次領取未確認，不重送');
+      saveStep(key,'pending',controlText(card()));
+      await tapSingleClick(()=>dailyActivityClaimButton(root()),'每日活動領取獎勵');
+      await until(()=>dailyActivityClaimed(root()),'每日活動領取未確認');
+      saveStep(key,'done',controlText(card()));
+      return '擊殺30、採集10、副本1；獎勵已領取';
+    },{repeat:true});
+    await step('累積目標獎勵',claimAccumulatedRewards,{repeat:true});
+    await closeWindows();finishRecipe();
+  }
+
+  function welfareCard(root,tab){
+    if(tab==='每日簽到')return uniqueNamedCard(root,/^Day\s*\d+\s*[·・]\s*今日$/,card=>Boolean(uniqueControl(card,/^(?:領取|已領取)$/,true)||welfareDone(card,'每日簽到')));
+    const byId=[...root.querySelectorAll('[id],[data-id],[data-task-id]')].filter(el=>rendered(el)&&nativeCardKey(el)==='event_legendary_daily');
+    if(byId.length===1)return byId[0];if(byId.length>1)return null;
+    const actual=root.querySelector('.welfare-window-content');
+    if(actual&&/傳奇冒險者每日鑽石/.test(controlText(actual)))return actual;
+    return uniqueNamedCard(root,/^傳奇津貼$/,card=>Boolean(uniqueControl(card,/^(?:領取|已領取|已領完)$/,true)||scopedStatus(card,/^(?:已領取|已領完)$/)));
+  }
+  function welfareIdentity(card,tab){
+    if(!card)return null;if(tab==='傳奇津貼')return 'event_legendary_daily';
+    const today=[...card.querySelectorAll('h2,h3,h4,strong,span,p,div')].map(controlText).filter(text=>/^Day\s*\d+\s*[·・]\s*今日$/.test(text));return today.length===1?'event_live_daily_login_v1:'+today[0]:null;
+  }
+  function welfareDone(card,tab){return scopedStatus(card,tab==='每日簽到'?/^(?:✓|✔|已領取)$/:/^(?:[✓✔]\s*)?(?:已領取|已領完)$/)||tab==='每日簽到'&&[...(card?.childNodes||[])].some(node=>node.nodeType===3&&/^(?:✓|✔)$/.test(normalize(node.textContent)));}
+  async function welfareClaim(tab){
+    await openPanel(/^福利$/, /冒險福利/);const get=()=>panel(/冒險福利/),tabButton=()=>uniqueControl(get(),new RegExp('^'+tab+'(?:\\s|$)'),true);
+    const selected=()=>selectionConfirmed(tabButton())||Boolean(welfareCard(get(),tab)&&!['aria-selected','aria-pressed'].some(key=>tabButton()?.getAttribute(key)==='false'));
+    if(!selected())await tapSingleClick(tabButton,tab);
+    await until(selected,'指定福利頁籤實際選中未確認');
+    const card=()=>welfareCard(get(),tab);await until(card,'指定福利區塊identity不足／不唯一');const identity=welfareIdentity(card(),tab);if(!identity)throw new Error('福利識別不足，未領取');
+    const key='福利交易:'+identity+':'+taskDayKey(),done=()=>welfareIdentity(card(),tab)===identity&&welfareDone(card(),tab);
+    if(done()){if(ledger()[key]?.state==='pending')saveStep(key,'done','同一福利重開確認已領取');return '今日已領取';}
+    if(ledger()[key]?.state==='pending')throw new Error('同一福利前次領取未確認，不重送');
+    await recordedTap(key,()=>{if(!selected()||welfareIdentity(card(),tab)!==identity||done())throw new Error('送出前福利區塊／identity／狀態改變，未送出');return uniqueControl(card(),/^領取$/);},tab+'領取','指定福利 '+identity,{identity});
+    await until(done,tab+'相同福利結果未確認');saveStep(key,'done',identity+'；已領取');return '已領取';
+  }
+  async function handleWelfare() {
+    await step('每日簽到',()=>welfareClaim('每日簽到'),{repeat:true});
+    if(userOptions().legendary)await step('傳奇津貼',()=>welfareClaim('傳奇津貼'),{repeat:true});
+    await closeWindows();finishRecipe();
   }
 
   // </調查流程>
@@ -9112,6 +10771,9 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     queueOwnedCleanup(message);
   }
 
+  function originalGuildPending(){
+    return pendingEntries().some(record=>record.state==='pending'&&record.key?.startsWith('native-daily:')&&['guild','kingdom'].includes(record.scope));
+  }
   async function scan() {
     if(!host.canOperate(integratedContext))return;
     if (scanBusy || worldRecoveryBooting || completeRunBusy) return;
@@ -9123,12 +10785,22 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       readMinimapContext();
       if (!runtime.running || runtime.paused) return updatePanel();
       requireRunOwner();
+      if(dayState.travelPending?.kind==='native-map-travel'||currentTask()?.id==='transport'&&pendingEntries().some(record=>record.state==='pending'&&record.key?.startsWith('native-escort:'))){
+        runtime.paused=true;runtime.warning='原每日入口前仍有整合版傳送或護送未明，請先唯讀核對；保留紀錄不重送';runtime.message=runtime.warning;syncPauseClock();persist();syncIntegratedPending();updatePanel();return;
+      }
       if (runtime.phase === 'final-return') return await handleFinalReturn();
       if (runtime.phase === 'start') return await startTaskIfNeeded();
       const task = currentTask();
       if (!task) return stopRun('本輪每日流程完成');
       const actualRole=PAGE_WINDOW.__world?.player?.name;
       if(actualRole && actualRole!==role)return stopRun(`角色已切換：執行中${role}，目前${actualRole}`);
+      if(['guild','hunting','kingdom'].includes(task.id)&&originalGuildPending()){
+        runtime.paused=true;runtime.warning='原每日入口前仍有整合版未確認交易，請先唯讀核對；保留紀錄不重送';runtime.message=runtime.warning;syncPauseClock();persist();syncIntegratedPending();updatePanel();return;
+      }
+      const originalPendingPrefixes={trial:['native-sweep:','native-dungeon-entry:','native-dungeon-result:','native-party:'],recharge:['native-supply:'],vitality:['native-vigor:'],gathering:['native-gather-start:','native-gather-stop','native-craft:','native-guild-skill:','native-channel:'],adventure:['native-reward:'],activity:['native-reward:'],welfare:['native-reward:'],certificates:['native-certificate:']};
+      if(pendingEntries().some(record=>record.state==='pending'&&originalPendingPrefixes[task.id]?.some(prefix=>record.key?.startsWith(prefix)))){
+        runtime.paused=true;runtime.warning='原每日入口前仍有該功能整合版未確認交易，請先唯讀核對；保留紀錄不重送';runtime.message=runtime.warning;syncPauseClock();persist();syncIntegratedPending();updatePanel();return;
+      }
       await HANDLERS[task.id]?.();
       updatePanel();
     } catch (error) {
@@ -9302,7 +10974,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
         ${TASKS.map(task=>`<label><span>${escapeHtml(task.label)}</span><input type="checkbox" name="enabledTask" value="${task.id}"></label>`).join('')}
       </fieldset>
       <p>目前角色（自動偵測）：${escapeHtml(role)}</p>
-      <p style="color:#cbd5e1;font-size:12px">設定依目前登入角色保存，所有角色皆可使用。白名單互讚只供原固定九角色使用，先查好友，再查人氣榜；排除本人，名單固定不能修改。</p>
+      <p style="color:#cbd5e1;font-size:12px">設定依目前登入角色保存，所有角色皆可使用。對固定九人互讚並排除本人；先確認好友清單，好友找不到的目標再查人氣榜，名單固定不能修改。</p>
       <label><span>每日種植作物</span><select name="farmingCrop">${FARM_CROPS.map(crop=>`<option value="${crop.name}">${crop.name}</option>`).join('')}</select></label>
       <p style="color:#cbd5e1;font-size:12px">開場固定種六格曙光小麥；全部任務結束後收成，補種此作物並澆水，再領家園特產。固定一般培育，缺料或漏格補小麥。</p>
       <label><span>公會捐副本物品</span><input name="guildDungeonDonation" type="checkbox"></label>
@@ -9427,6 +11099,43 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
     return true;
   }
   let integratedPendingKnown=false;
+  function originalTaskReceipt(key,record){
+    if(/^狩獵(?:接取|回報):/.test(key)){
+      const name=key.slice(key.indexOf(':')+1);if(!HUNTS.includes(name))return false;
+      const sync=syncedHunt(name),text=controlText(guildTaskCard(name));
+      return key.startsWith('狩獵回報:')?sync?.claimed===true||/已回報|已領取/.test(text):sync?.claimed===true||/已接取|進行中|回報|已回報|已領取/.test(text);
+    }
+    const order=key.match(/^繳交交易:(freya|silvana|ogron):id:(mko_[A-Za-z0-9_-]+)$/);
+    if(order){const matches=orderCards(kingdomOrderWindow()).filter(card=>reliableOrderId(card)===order[2]);return matches.length===1&&/已繳交|已完成/.test(controlText(matches[0]));}
+    if(key==='每日活動領取交易')return dailyActivityClaimed(panel(/活動\s*EVENT/));
+    if(key.startsWith('福利交易:')&&typeof record.identity==='string'&&key==='福利交易:'+record.identity+':'+dayState.day){
+      const tab=record.identity==='event_legendary_daily'?'傳奇津貼':record.identity.startsWith('event_live_daily_login_v1:')?'每日簽到':null;if(!tab)return false;
+      const card=welfareCard(panel(/冒險福利/),tab);return welfareIdentity(card,tab)===record.identity&&welfareDone(card,tab);
+    }
+    if(key.startsWith('累積目標交易:')&&key.endsWith(':'+dayState.day)){
+      const title=key.slice('累積目標交易:'.length,-dayState.day.length-1),rows=accumulatedRewardRows(panel(/活動\s*EVENT/)).filter(row=>row.title===title);return rows.length===1&&/已領取/.test(controlText(rows[0].card));
+    }
+    if(key.startsWith('活躍寶箱交易:'+dayState.day)){
+      const state=activityChestState(panel(/冒險大廳|冒險戰令/)),targets=Array.isArray(record.targets)&&record.targets.length?record.targets:[30,60,100];
+      return Boolean(state&&targets.every(n=>[30,60,100].includes(n)&&state.cards.find(card=>card.n===n)?.state==='已領取'));
+    }
+    if(/^批次(?:領獎|確認)交易:/.test(key)){
+      const root=panel(/冒險大廳|冒險戰令/);if(!root)return false;const category=key.slice(key.indexOf(':')+1),current=batchCategory(root),battle=nativeBattlepassState(root),oldLevel=category.match(/^戰令獎勵\s+Lv\s*(\d+)\/30$/)?.[1];
+      if(battle?.complete&&oldLevel&&Number(oldLevel)<=battle.level)return true;if(category!==current)return false;
+      if(Array.isArray(record.targets)&&record.targets.length&&record.targets.every(target=>typeof target?.title==='string'&&target.title))return rewardTargetsDone(root,record.targets);
+      const kind=category.startsWith('每日任務')?'每日任務':category.startsWith('戰令獎勵')?'戰令獎勵':null;
+      return Boolean(kind&&record.summary===true&&Number.isSafeInteger(record.count)&&record.count>0&&new RegExp('已領取\\s*'+record.count+'\\s*'+(kind==='每日任務'?'個每日任務':'筆戰令獎勵')).test(controlText(root)));
+    }
+    if(key.startsWith('護送領獎:')){const escort=PAGE_WINDOW.__world?.caravanEscort;return Boolean(escort?.runId&&key==='護送領獎:'+escort.runId&&escort.result?.claimed===true);}
+    if(key.startsWith('補製採集工具 ')&&/^tool_(pickaxe|axe|sickle|rod)_t[1-7]$/.test(record.itemId)&&record.quantity===2&&Number.isSafeInteger(record.beforeCount)&&record.beforeCount>=0){
+      const count=(PAGE_WINDOW.__world?.player?.inv||[]).filter(item=>item.itemId===record.itemId).reduce((sum,item)=>sum+Number(item.qty||0),0);return Number.isSafeInteger(count)&&count>=record.beforeCount+2;
+    }
+    if(key==='掃蕩交易'){
+      const root=panel(/試煉之門\s*DUNGEON/),done=Boolean(root&&!sweepConfirmPanel()&&!sweepBusy()&&(sweepResultEvidence(root)||sweepSelectionReady(root)&&!uniqueControl(root,/^一鍵掃蕩\s*×\s*[1-9]\d*$/,true)));
+      if(done){dayState.sweepCompleted=true;dayState.sweepConfirmSent=false;}return done;
+    }
+    return false;
+  }
   async function reconcileVisibleRewards(){
     const expectedRole=role,expectedDay=dayState.day;
     const sameOwner=()=>PAGE_WINDOW.__world?.charId===host.characterId&&readCurrentRole()===expectedRole&&role===expectedRole;
@@ -9439,7 +11148,78 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
       if(!fresh)return false;
       if(fresh.schema!==2||fresh.role!==expectedRole||fresh.day!==expectedDay||!fresh.tasks||TASKS.some(task=>!fresh.tasks[task.id]||typeof fresh.tasks[task.id]!=='object'||Array.isArray(fresh.tasks[task.id])))throw new Error('來源日誌結構或任務日不足，保留未明交易');
       before=dayState;dayState=structuredClone(fresh);
-      let changed=await nativeActions.reconcileGather();changed=await nativeActions.reconcileTravel()||changed;changed=await nativeActions.reconcile()||changed;
+      let changed=false;
+      const vitality=dayState.vitalityGoal,dialog=currentVitalityDialog();
+      if(vitality?.pending!==undefined&&dialog){
+        const counts=controlText(dialog).match(/(?:已補|購買次數)\s*(\d+)\s*\/\s*(\d+)/);
+        const used=counts?Number(counts[1]):null,limit=counts?Number(counts[2]):null;
+        if(Number.isSafeInteger(vitality.start)&&vitality.start>=0&&Number.isSafeInteger(vitality.pending)&&vitality.pending>=vitality.start&&vitality.pending<3&&Number.isSafeInteger(used)&&used>vitality.pending&&used<=3&&Number.isSafeInteger(limit)&&limit>=used){
+          delete vitality.pending;vitality.confirmedAt=now();changed=true;
+        }
+      }
+      for(const task of Object.entries(dayState.tasks).filter(([id])=>!['farming','friends'].includes(id)).map(([,task])=>task))for(const [key,record]of Object.entries(task.steps||{})){
+        if(record?.state!=='pending'||record.role&&record.role!==expectedRole||record.day&&record.day!==expectedDay||record.charId&&record.charId!==host.characterId||record.characterId&&record.characterId!==host.characterId)continue;
+        let done=false;
+        if(key.startsWith('捐獻交易:')){
+          const name=key.slice('捐獻交易:'.length),row=donationRow(name),data=row&&parseDonation(controlText(row),row.querySelector('input[type="number"]'));
+          if(data&&Number.isSafeInteger(record.used)&&record.used>=0&&Number.isSafeInteger(record.quantity)&&record.quantity>0&&record.quantity%data.unit===0&&(!record.role||record.role===expectedRole)&&(!record.day||record.day===expectedDay)&&(!record.charId||record.charId===host.characterId)&&(record.unit===undefined||record.unit===data.unit)&&(record.limit===undefined||record.limit===data.limit)){
+            const expected=record.used+record.quantity/data.unit;done=expected<=data.limit&&data.used>=expected;
+          }
+        }
+        else if(originalTaskReceipt(key,record))done=true;
+        else if(key.startsWith('討伐售出交易:')&&certificateShop()){
+          const calendar=certificateCalendar(),weekly=readCertificateWeek(),fresh=certificateSaleState(certificateShop());
+          if(key==='討伐售出交易:'+calendar.week&&record.week===calendar.week&&weekly?.week===calendar.week&&weekly.day===expectedDay&&['pending','done'].includes(weekly.state)&&Number.isSafeInteger(record.quantity)&&record.quantity>0&&record.quantity<=60&&Number.isSafeInteger(record.holding)&&record.holding>=record.quantity&&record.gold===record.quantity*200&&weekly.holding===record.holding&&weekly.quantity===record.quantity&&weekly.gold===record.gold){
+            const quota=certificateWeeklyQuotaMessage();
+            if(fresh&&(quota||fresh.holding===record.holding-record.quantity)){
+              saveCertificateWeek({...weekly,state:'done',completedAt:now(),...(quota?{completionReason:'quota-exhausted',nativeMessage:quota}:{})},()=>sameOwner()&&expectedDay===taskDayKey());done=true;
+            }
+          }
+        }
+        else if(/^討伐(?:補充卷交易:[1-3]|材料交易:選單[1-3])$/.test(key)&&certificateShop()){
+          const kind=key.startsWith('討伐補充卷交易:')?'auto':'material';
+          const known=kind==='auto'?record.material==='自動戰鬥補充卷（60分）':CERTIFICATE_MATERIALS.includes(record.material);
+          if(record.certificateKind===kind&&known){
+            if(kind==='material'&&certificateQuota(certificateShop(),kind)===0)done=true;
+            else if(Number.isSafeInteger(record.remaining)&&record.remaining>=0&&record.remaining<=3&&Number.isSafeInteger(record.holding)&&Number.isSafeInteger(record.cost)&&record.cost>0&&record.holding>=record.cost)done=certificateSupplyResult(record,kind);
+          }
+        }
+        else if(/^庭院(?:收成交易|指定作物交易|小麥補格交易|灌溉交易)(?::(?:initial|final))?(?::補跑:[1-9]\d*)?$/.test(key)&&PAGE_WINDOW.__world?.regionId==='player_home_garden'&&homeHud()){
+          const identity=controlText(homeHud()?.querySelector('.home-v1-identity'));
+          if(identity.includes('庭院')&&!/拜訪中/.test(identity)){
+            const plots=gardenPlots();
+            if(key.startsWith('庭院收成交易')){
+              const before=record.plots;
+              if(Array.isArray(before)&&before.length>0&&before.length<=6&&before.every(p=>p&&typeof p.plotId==='string'&&p.plotId)&&new Set(before.map(p=>p.plotId)).size===before.length)done=before.every(p=>plots.some(current=>current.plotId===p.plotId&&(current.plotStage==='empty'||Number.isFinite(p.readyAt)&&Number.isFinite(current.readyAt)&&current.readyAt!==p.readyAt)));
+            }else if(key.startsWith('庭院灌溉交易'))done=plots.every(p=>p.plotStage!=='empty'&&(p.plotStage!=='sprout'||p.watered===true));
+            else{
+              const empty=record.emptyPlots;
+              if(Array.isArray(empty)&&empty.length>0&&empty.length<=6&&empty.every(id=>typeof id==='string'&&id)&&new Set(empty).size===empty.length&&FARM_CROPS.some(crop=>crop.id===record.cropId))done=empty.some(id=>plots.some(p=>p.plotId===id&&p.plotStage!=='empty'&&p.cropId===record.cropId));
+            }
+          }
+        }
+        else if(key==='家園特產交易'&&PAGE_WINDOW.__world?.regionId==='player_home_garden'&&homeHud()){
+          const identity=controlText(homeHud()?.querySelector('.home-v1-identity'));
+          if(identity.includes('庭院')&&!/拜訪中/.test(identity))done=homeYieldClaimed();
+        }
+        else if(key.startsWith('家園收購交易:')){
+          const root=homeSupplyPanel(),kingdom=controlText(root?.querySelector('.kingdom-supply-card h3'));
+          if(root&&kingdom&&['今日','本週'].includes(record.period)&&Number.isSafeInteger(record.used)&&record.used>=0&&Number.isSafeInteger(record.quantity)&&record.quantity>0){
+            const orders=homeSupplyOrders(kingdom),matches=orders.filter(order=>key==='家園收購交易:'+kingdom+':'+order.name+':'+record.period+':'+record.used);
+            if(matches.length===1){const order=matches[0],expected=record.used+record.quantity;done=Number.isSafeInteger(expected)&&Number.isSafeInteger(order.used)&&Number.isSafeInteger(order.limit)&&expected<=order.limit&&order.used===expected&&order.period===record.period&&(record.limit===undefined||record.limit===order.limit);}
+          }
+        }
+        else if(key==='成品補給交易'||key==='成品補給交易:進階'){
+          const tier=key==='成品補給交易:進階'?2:1,materials=tier===2?ADVANCED_SUPPLIES:SUPPLIES;
+          const card=record.resourceTier===tier&&materials.includes(record.material)?supplyCard(panel(/儲值中心/)):null;
+          if(card&&supplyClaimed(card)===true)done=Boolean(scopedStatus(card,new RegExp('^今日已領'+(tier===2?'進階':'初階')+'成品[：:]\\s*'+record.material+'$')));
+        }
+        if(done){record.state='done';record.detail='只讀同一任務日及目標的原生結果證據';record.at=now();changed=true;}
+      }
+      const legacyReadonly=record=>record.taskId==='gathering'&&(['採集公會技能:採集號子','採集公會技能:安全歸途'].includes(record.key)||record.key?.startsWith('補製採集工具 '))||record.taskId==='recharge'&&['成品補給交易','成品補給交易:進階'].includes(record.key)||record.taskId==='certificates'&&/^討伐(?:補充卷交易:[1-3]|材料交易:選單[1-3])$/.test(record.key??'');
+      const retained=pendingEntries().some(record=>record.key?.startsWith('native-')||['farming','friends'].includes(record.taskId)||['native-gathering','native-map-travel'].includes(record.kind)||legacyReadonly(record));
+      if(retained){changed=await nativeActions.reconcileGather()||changed;changed=await nativeActions.reconcileTravel()||changed;changed=await nativeActions.reconcile()||changed;}
+      const oldTravel=dayState.travelPending;settleTravelPending();changed=Boolean(oldTravel&&!dayState.travelPending)||changed;
       if(changed)reconcileSafetyBlock();
       if(changed&&!persist())throw new Error('對帳保存未確認');
       return changed;
@@ -9474,7 +11254,7 @@ function 嘗試技能閃避(args){return 統一嘗試技能閃避({...args,optio
   function beginDriver(){if(driverTimer)host.cancel(driverTimer);driverTimer=host.interval(()=>{void scan().then(()=>{syncIntegratedPending();host.observed(observeIntegrated());}).catch(error=>{runtime.warning='每日掃描核對失敗：'+error.message;});},SCAN_MS);}
   loadData();syncIntegratedPending();
   return {
-    kind:'daily',sourceVersion:'2.21.13',selfDriven:true,observe:observeIntegrated,validate,settings:openSettings,records:showTaskLog,getSettings:()=>{const {legacy,...options}=permanentDailyOptions();return structuredClone({...options,friendTargets:FRIEND_TARGETS.includes(role)&&readCurrentRole()===role?FRIEND_TARGETS.filter(name=>name!==role):[]});},
+    kind:'daily',sourceVersion:'2.21.13',selfDriven:true,observe:observeIntegrated,validate,settings:openSettings,records:showTaskLog,getSettings:()=>{const {legacy,...options}=permanentDailyOptions();return structuredClone({...options,friendTargets:readCurrentRole()===role?FRIEND_TARGETS.filter(name=>name!==role):[]});},
     async start(context){
       validate(context.settings);const restarting=runtime.running&&runtime.paused,previousContext=integratedContext,expectedRole=role;
       const verify=()=>{host.assert(context,{allowPending:!restarting});if(!expectedRole||role!==expectedRole||readCurrentRole()!==expectedRole)throw new Error('每日開始角色已改變');if(restarting&&(pendingEntries().length||missingSourcePending()))throw new Error('每日未明操作尚未核對，不能重新開始');};
@@ -13524,8 +15304,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.96.5';
-const RUNTIME_VERSION='0.96.5';
+const SCRIPT_VERSION='0.96.9';
+const RUNTIME_VERSION='0.96.9';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
