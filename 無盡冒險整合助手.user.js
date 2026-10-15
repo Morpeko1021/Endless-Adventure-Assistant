@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.97.0
+// @version      0.97.1
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -3529,7 +3529,14 @@ class LocalRoutine {
   resetPrimaryTeam(){this.state.activeTeam=this.teamFor(this.state.options.primaryKind);this.state.teamStage=this.state.activeTeam?'ensure':null;}
   activeTeam(){return this.state.activeTeam??this.teamFor(this.state.options?.primaryKind);}
   expectedKind(){return this.state.phase==='primary'?this.state.options.primaryKind:['team','farm-return'].includes(this.state.phase)?'party':this.state.phase==='garden-check'?'farm':this.state.phase;}
-  needsFarmReturn(kind,settings){return ['daily','boss'].includes(kind)||kind==='battle'&&(settings?.manualAuto===true||settings?.role!=='member');}
+  needsFarmReturn(kind,settings){return kind==='daily'||kind==='battle'&&(settings?.manualAuto===true||settings?.role!=='member');}
+  normalizeBossFarmReturn(){
+    const s=this.state,c=this.controller(),cp=s.checkpoint,run=s.currentRun;
+    // 舊版尚未發出返場任務的野王快照，由原引擎自行回王都及專屬入口。
+    // 已有 party 或未明操作仍走原核對，不能藉政策遷移取消既有作業。
+    if(!s.farmReturnRequired||s.phase!=='primary'||cp?.kind!=='boss'||cp.safe!==true||cp.sourceVersion!=='2.8.4'||typeof cp.sourceCheckpoint?.phase!=='string'||!Number.isSafeInteger(cp.sourceCheckpoint?.huntCount)||cp.sourceCheckpoint.huntCount<0||cp.context?.characterId!==c.identity().characterId||typeof cp.context?.runId!=='string'||!cp.context.runId||run&&(run.kind!==cp.kind||run.runId!==cp.context.runId||run.characterId!==cp.context.characterId)||c.active||c.pending||c.cleanup||c.settlement||c.checkpoint?.kind==='party')return false;
+    s.farmReturnRequired=false;s.farmReturnLocation=null;delete cp.returnLocationConfirmed;this.persist();return true;
+  }
   rememberInterruptedRun(){const cp=this.state.checkpoint;if(cp)this.state.currentRun={kind:cp.kind,runId:cp.context.runId,characterId:cp.context.characterId};}
   prepareFarmReturn(){const s=this.state,cp=s.checkpoint;if(!cp||!this.needsFarmReturn(cp.kind,cp.context.settings))return;if(!s.farmReturnLocation||typeof this.returnFarmLocation!=='function')throw new ControlError('unknown_location','種植插隊尚未確認原地圖／分線／房間');s.farmReturnRequired=true;}
   confirmFarmReturn(){const s=this.state,c=this.controller();if(!s.checkpoint||!s.farmReturnLocation)throw new ControlError('unknown_location','原主任務返回位置未確認');if(c.identity().characterId!==s.checkpoint.context.characterId||c.manualPause||c.pending)throw new ControlError('task_busy','返場完成時角色或操作已變');s.checkpoint.returnLocationConfirmed=structuredClone(s.farmReturnLocation);s.farmReturnRequired=false;s.farmReturnLocation=null;s.phase=s.farmResumePhase??'primary';this.rememberInterruptedRun();}
@@ -3577,6 +3584,7 @@ class LocalRoutine {
   adoptAutomaticResume(){if(!this.restoredWasEnabled||this.controller().manualPause||!this.matchesCurrent(this.controller().active))return false;this.state.enabled=true;this.state.message='重整後已核對原執行，接續日常安排';this.restoredWasEnabled=false;this.persist();return true;}
   async resumeSaved(){const c=this.controller();if(c.mode!=='standalone')throw new ControlError('managed_routine','核心模式由核心安排接續');if(c.pending)throw new ControlError('unknown_result','先核對未明操作再接續日常流程');this.validate(this.state.options);this.validateTeam(this.state.options.team);
     for(const [kind,value]of Object.entries(this.state.settings??{})){const adapter=c.adapters.get(kind);if(!adapter)throw new ControlError('unsupported_task','日常快照含未接入任務');adapter.validate(value);}
+    this.normalizeBossFarmReturn();
     if(c.active){if(!this.matchesCurrent(c.active))throw new ControlError('task_busy','目前任務不是已保存的日常執行');}
     else if(this.state.phase==='primary'&&this.state.options.primaryKind==='idle'&&!this.state.currentRun){c.manualPause=false;c.persist();}
     else if((this.state.phase==='primary'||this.state.phase===this.state.farmResumePhase)&&this.state.checkpoint&&this.state.farmReturnRequired){const cp=this.state.checkpoint,run=this.state.currentRun;if(cp.context.characterId!==c.identity().characterId||run&&(run.runId!==cp.context.runId||run.kind!==cp.kind||run.characterId!==cp.context.characterId))throw new ControlError('no_checkpoint','原主任務快照角色或執行不符');c.manualPause=false;c.persist();this.state.enabled=true;this.state.resumeCheckpoint=null;this.persist();await this.tick();return;}
@@ -3604,7 +3612,7 @@ class LocalRoutine {
     if(['daily','farm'].includes(kind)&&this.state.phase==='primary'){this.rememberInterruptedRun();if(kind==='daily'&&this.state.checkpoint&&this.activeTeam()?.ensure.action==='ensure')this.state.teamStage='ensure';}this.persist();
   }
   async tick(){if(this.busy||!this.state.enabled)return;this.busy=true;try{const c=this.controller();if(c.mode!=='standalone'||c.manualPause){this.suspend(c.manualPause?'人工停止':'核心模式接管日常安排');return;}if(c.cleanup){this.state.message='等待原執行收尾';return;}if(c.pending&&!canPauseOwnedWork(c)){this.state.message='等待未明操作核對';return;}
-    const s=this.state,day=taskDay(this.now());
+    this.normalizeBossFarmReturn();const s=this.state,day=taskDay(this.now());
     const nextDaily=s.options.dailyEnabled&&s.lastDailyDay!==day;
     const interruptedKind=s.phase==='daily'?'daily':s.options.primaryKind;
     const farmDue=this.allowsFarm(interruptedKind)&&(s.requiresInitialGardenCheck===true||Number.isFinite(s.farmDueAt)&&s.farmDueAt<=this.now());
@@ -14549,7 +14557,7 @@ function 建立副本流程({ now = Date.now, onCount = () => {}, onStop = () =>
       verification:nativeSecurityChallenge(document,()=>PAGE.__world),dead:!!w?.dead || w?.player?.hp<=0,
       combat,bossDead:nativeBosses.length===1&&Number.isFinite(nativeBosses[0].hp)&&nativeBosses[0].hp<=0,reward:!!nativeResult,success:nativeResult?.success===true,
       rewardMatches:!!nativeResult&&nativeResults.session()?.level===Number(targets[targetIndex]??options.levels[0]),restartReady:pendingTarget?nativeResult?.ready===true:nativeResult?.restartReady===true,
-      targetReady:targetReady && !initialSelection,settingsReady,arrived,invitationPresent:preparation?.invitationPresent===true,invitationAll:preparation?.invitationAll===true,
+      targetReady:targetReady && !initialSelection && w?.mode==='open' && w.regionId==='village' && !w.instanceId && !nativeReturnRequested,settingsReady,arrived,invitationPresent:preparation?.invitationPresent===true,invitationAll:preparation?.invitationAll===true,
       enterReady:preparation?.arrived===true&&!preparation.invitationPresent&&typeof preparation.entry.props.onLaunchDungeon==='function',autoKnown:typeof w?.autoBattle==='boolean',autoOn:w?.autoBattle===true,autoReady:typeof w?.toggleAutoBattle==='function'&&!w.autoBattlePendingAction,wantAuto:options.auto,
       teamReason:members.some(m=>!m.online)?'隊友離線':!arrived?'隊友未到場':preparation?.invitationPresent&&!preparation.invitationAll?'隊友未同意':'等待進場',
       revive,reviveReady:revive?.usable===true,reviveRemaining:revive?.remaining??null,reviveTotal:revive?.total??null,
@@ -15654,8 +15662,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.97.0';
-const RUNTIME_VERSION='0.97.0';
+const SCRIPT_VERSION='0.97.1';
+const RUNTIME_VERSION='0.97.1';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
