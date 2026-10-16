@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         無盡冒險整合助手（開發版）
 // @namespace    local.endless-integrated-assistant
-// @version      0.97.2
+// @version      0.97.3
 // @description  公開發行版：每日、種植、戰鬥、野王、副本、隊伍、AUTO及固定角色互讚；獨立使用或私人擴充授權核心模式。
 // @homepageURL  https://github.com/Morpeko1021/Endless-Adventure-Assistant
 // @updateURL    https://raw.githubusercontent.com/Morpeko1021/Endless-Adventure-Assistant/main/%E7%84%A1%E7%9B%A1%E5%86%92%E9%9A%AA%E6%95%B4%E5%90%88%E5%8A%A9%E6%89%8B.meta.js
@@ -3319,6 +3319,12 @@ function canPauseOwnedWork(controller){
   if(active?.kind!=='daily'||!context||pending?.kind!=='daily-journal'||pending.taskKind!=='daily'||pending.characterId!==context.characterId||pending.runId!==context.runId||pending.pageEpoch!==context.pageEpoch||pending.taskDay!==context.taskDay||!Array.isArray(pending.entries)||pending.entries.length!==1||pending.entries[0]?.key!=='owned-gathering')return false;
   try{controller.assertAuthority(context,{allowPending:true});return active.adapter.canPauseOwnedWork?.(context,pending)===true&&controller.active===active&&controller.pending===pending;}catch{return false;}
 }
+/** 只接收同一每日執行的安全暫停意圖；交易清除前仍不得呼叫來源暫停。 */
+function canQueueDailySafePause(controller,runId){
+  const active=controller?.active,pending=controller?.pending,context=active?.context;
+  if(active?.kind!=='daily'||!context||context.signal?.aborted||runId!==context.runId||pending?.kind!=='daily-journal'||pending.taskKind!=='daily'||pending.characterId!==context.characterId||pending.runId!==context.runId||pending.pageEpoch!==context.pageEpoch||pending.taskDay!==context.taskDay||!Array.isArray(pending.entries)||pending.entries.length===0||pending.entries.some(entry=>!entry||typeof entry.key!=='string'||!entry.key.trim()||entry.key.startsWith('owned-')||entry.key==='safetyBlock'||entry.taskId==='cleanup'))return false;
+  try{controller.assertAuthority(context,{allowPending:true});return controller.active===active&&controller.pending===pending;}catch{return false;}
+}
 class TaskController {
   constructor({identity, clock = () => performance.now(), wallClock = Date.now, save = () => {}, release = () => {}, onResult=()=>{}, epoch, restored = null}) {
     this.identity = identity; this.clock = clock; this.wallClock = wallClock; this.save = save; this.release = release;this.onResult=onResult;
@@ -3717,7 +3723,7 @@ function validateCommand(command, controller, {now=Date.now(), capabilities=COMM
   if(command.leaseId !== controller.lease?.leaseId) throw new ControlError('wrong_lease','指令操作權不符');
   const readonly=controller.lease?.purpose==='reconcile';
   if(readonly||command.payload.readOnly!==undefined){if(!readonly||command.type!=='task.reconcile'||!capabilities.includes(READONLY_RECONCILE_CAPABILITY)||command.payload.readOnly!==true||Object.keys(command.payload).some(key=>!['readOnly','pendingHash'].includes(key))||command.commandId!==controller.lease.commandId||command.runId!==controller.lease.runId||command.payload.pendingHash!==controller.lease.pendingHash||!controller.pending||controller.pending.characterId!==controller.identity()?.characterId||controller.active||controller.cleanup||controller.settlement)throw new ControlError('readonly_lease','唯讀權限僅供指定未明紀錄核對');}
-  controller.assertAuthority(null,{allowPending:command.type==='task.reconcile' || command.type==='task.stop'||command.type==='task.pause'&&command.payload.boundary==='safe'&&capabilities.includes('task.pause:daily.owned-gathering:v1')&&canPauseOwnedWork(controller),allowSettlement:!readonly&&(command.type==='task.stop'||command.type==='task.reconcile'),allowCleanup:!readonly&&['task.stop','task.reconcile','config.apply'].includes(command.type),allowManualPause:manualAutoStart||manualTask||['task.resume','task.reconcile','config.apply','task.stop'].includes(command.type),allowReadOnlyLease:readonly&&command.type==='task.reconcile'});
+  controller.assertAuthority(null,{allowPending:command.type==='task.reconcile' || command.type==='task.stop'||command.type==='task.pause'&&command.payload.boundary==='safe'&&(capabilities.includes('task.pause:daily.owned-gathering:v1')&&canPauseOwnedWork(controller)||canQueueDailySafePause(controller,command.runId)),allowSettlement:!readonly&&(command.type==='task.stop'||command.type==='task.reconcile'),allowCleanup:!readonly&&['task.stop','task.reconcile','config.apply'].includes(command.type),allowManualPause:manualAutoStart||manualTask||['task.resume','task.reconcile','config.apply','task.stop'].includes(command.type),allowReadOnlyLease:readonly&&command.type==='task.reconcile'});
   if(scenarioRevision !== undefined && (command.type==='config.apply'?command.scenarioRevision<scenarioRevision:command.scenarioRevision!==scenarioRevision)) throw new ControlError('stale_scenario','情境版本不符');
   if(command.type === 'task.start' && (!TASK_KINDS.includes(command.payload.taskKind) || command.payload.taskKind==='idle')) throw new ControlError('unsupported_task','任務種類無效');
   if(command.type === 'task.start' && command.payload.configRevision !== configRevision) throw new ControlError('stale_config','設定版本不符');
@@ -15696,8 +15702,8 @@ function createDungeonAdapter({leaderHost,memberHost}) {
 }
 
 
-const SCRIPT_VERSION='0.97.2';
-const RUNTIME_VERSION='0.97.2';
+const SCRIPT_VERSION='0.97.3';
+const RUNTIME_VERSION='0.97.3';
 const PAGE=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
 if(window.top!==window || document.documentElement.hasAttribute('data-endless-integrated-assistant'))return;
 document.documentElement.setAttribute('data-endless-integrated-assistant',RUNTIME_VERSION);
